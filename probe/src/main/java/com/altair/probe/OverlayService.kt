@@ -139,13 +139,8 @@ class OverlayService : Service() {
     private val ui = Handler(Looper.getMainLooper())
     private val recent = ArrayDeque<String>()
 
-    private val logListener: (String) -> Unit = { line ->
-        ui.post {
-            recent.addLast(line)
-            while (recent.size > 4) recent.removeFirst()
-            logTv?.text = recent.joinToString("\n")
-        }
-    }
+    /** 悬浮窗不再显示日志（日志看主界面的日志页），这里只做启动提示，避免无谓刷新。 */
+    private val logListener: (String) -> Unit = { /* no-op */ }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -296,11 +291,15 @@ class OverlayService : Service() {
         }
         content.addView(statusTv)
 
-        // 5 行按钮（原来 7 行，横屏放不下）
+        // 面板只留「调试最常用」的两行：
+        //   ROI 显示 / 采点 / 清点 / 标定游戏
+        //   技能键 1-4 的模拟点击
+        // 其余（截图、诊断、键扫描、复制日志、申请Root）都移到主界面的日志页，
+        // 因为那些是排查时用的，不是挂在游戏上天天点的。
         content.addView(row(
+            "ROI显示" to { toggleRoi() },
             "★采点" to { togglePick() },
             "清点" to { clearPicks() },
-            "ROI" to { toggleRoi() },
             "标定" to { calibrateTarget() }
         ))
         content.addView(row(
@@ -310,40 +309,10 @@ class OverlayService : Service() {
             "点4" to { tapPick(3) }
         ))
         content.addView(row(
-            "点5" to { tapPick(4) },
-            "点6" to { tapPick(5) },
+            "菜单" to { tapPick(4) },
+            "自由市场" to { tapPick(5) },
             "按法" to { cyclePressMode() }
-        ).also { r ->
-            // 保存「按法」按钮引用，切换档位时更新它的文字
-            pressBtn = r.getChildAt(2) as? Button
-            updatePressBtn()
-        })
-        content.addView(row(
-            "键扫描" to { act("键扫描") { ShellCore.probe.keyScan(3) } },
-            "诊断" to { act("按键诊断") { ShellCore.probe.keyDiagnostics(3) } },
-            "申请Root" to { act("申请Root", guard = false) { ShellCore.probe.requestRoot() } }
         ))
-        content.addView(row(
-            // 截图是只读操作，不设门禁 —— 它正好用来确认「现在前台到底是谁」
-            "截图" to { act("截图", guard = false) { ShellCore.probe.quickCapture() } },
-            "复制日志" to { copyLog() },
-            "隐藏" to { hidePanel() }
-        ))
-
-        logTv = TextView(this).apply {
-            text = "（日志）"
-            setTextColor(Color.parseColor("#C9D4E0"))
-            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 7f)
-            typeface = Typeface.MONOSPACE
-            setPadding(dp(2), dp(3), dp(2), 0)
-            maxLines = 3
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(34)
-            )
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            setHorizontallyScrolling(false)
-        }
-        content.addView(logTv)
 
         contentBox = content
 
@@ -578,6 +547,7 @@ class OverlayService : Service() {
         pickView = null
         lastPicks = v.points.toList()      // 关掉后仍能用来「点N」
         runCatching { savePickedPointsOf(this, lastPicks) }   // 持久化，重启后仍在
+        if (roiEnabled) { removeRoi(); syncRoiWithForeground(lastFg) }   // ROI 立刻反映新点
         LogBus.emit("采点模式：已关闭，共 ${lastPicks.size} 个点")
         LogBus.emit(v.export())
         // 面板可能因为日志变长而需要重排，刷新一下状态
@@ -628,7 +598,8 @@ class OverlayService : Service() {
 
     private fun addRoi() {
         if (roiView != null) return
-        val v = RoiView(this)
+        // 把采集点传进去，ROI 上就会按语义标注「技能1..4 / 菜单 / 自由市场」
+        val v = RoiView(this, lastPicks)
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -668,29 +639,47 @@ class OverlayService : Service() {
 }
 
 /**
- * ROI 调试覆盖层。
+ * ROI 调试覆盖层
+ * ==============
  *
- * 把配置里的归一化 ROI 直接画在游戏画面上 —— 框对不对，一眼就能看出来。
- * 这比反复截图、分析、打印坐标高效得多。
+ * 把配置里的归一化 ROI 和采集到的按键位置**直接画在游戏画面上**，框对不对一眼可见。
+ *
+ * 所有数值都来自实机实测，不是推算：
+ *   · 小地图 / HUD 三柱：tools/analyze 从实机截图量出来的精确像素框
+ *   · 技能键 / 菜单 / 自由市场：用户用「采点」亲自点的
  */
-class RoiView(ctx: Context) : View(ctx) {
+class RoiView(
+    ctx: Context,
+    /** 采集到的点：0-3=技能键 4=菜单 5=自由市场（按采点顺序） */
+    private val picked: List<Pair<Float, Float>> = emptyList()
+) : View(ctx) {
+
+    /** 采集点的语义标签（按采点顺序）。 */
+    private val pickLabels = arrayOf("技能1", "技能2", "技能3", "技能4", "菜单", "自由市场", "传送点", "备用")
 
     private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 3f
     }
     private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        textSize = 26f
+        textSize = 24f
         typeface = Typeface.MONOSPACE
     }
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
 
-    // 来自 config/rules.example.json 的已验证数值
+    /**
+     * 静态 ROI —— 全部为实机实测值。
+     * HUD 三柱结构完全对称（每 22 行一组：2px 边框 + 12px 填充），实测于 1280x720。
+     */
     private val rois = listOf(
         Triple("小地图", floatArrayOf(0.0023f, 0.1097f, 0.1477f, 0.2958f), Color.parseColor("#FF3BD16F")),
-        Triple("HUD血条", floatArrayOf(0.4289f, 0.8958f, 0.5711f, 0.9125f), Color.parseColor("#FFFF4444")),
-        // 技能键带：边界由 v0.13 实机采点结果反推（不再是最初的推算值）
-        Triple("技能键带", floatArrayOf(0.7150f, 0.5350f, 0.9500f, 0.6150f), Color.parseColor("#FFFFC53D"))
+        Triple("血", floatArrayOf(0.4289f, 0.8958f, 0.5711f, 0.9125f), Color.parseColor("#FFFF4444")),
+        Triple("蓝", floatArrayOf(0.4289f, 0.9264f, 0.5711f, 0.9431f), Color.parseColor("#FF4A9BFF")),
+        Triple("经验", floatArrayOf(0.4289f, 0.9569f, 0.5711f, 0.9736f), Color.parseColor("#FFFFC53D")),
+        // 菜单面板：右侧整条竖排（对上两张截图做亮度补偿后相减得到，仅此一个连通域）
+        Triple("菜单面板", floatArrayOf(0.8008f, 0.0f, 1.0f, 1.0f), Color.parseColor("#FFB07CFF")),
+        // 技能键带：由采点结果反推的范围
+        Triple("技能带", floatArrayOf(0.7150f, 0.5350f, 0.9500f, 0.6150f), Color.parseColor("#FFFFC53D"))
     )
 
     override fun onDraw(canvas: Canvas) {
@@ -698,15 +687,7 @@ class RoiView(ctx: Context) : View(ctx) {
         val h = height.toFloat()
         if (w <= 0 || h <= 0) return
 
-        // 技能键 4 个位置 —— **实机采点实测值**（此前推算的偏左了约 0.06）
-        val skillPts = arrayOf(
-            0.7416f to 0.5673f,
-            0.8041f to 0.5756f,
-            0.8649f to 0.5673f,
-            0.9180f to 0.5728f
-        )
-
-        // 归一化 1/10 网格（细线，帮助读数）
+        // 1/10 归一化网格，方便肉眼读坐标
         stroke.strokeWidth = 1f
         stroke.color = Color.parseColor("#33FFFFFF")
         for (i in 1..9) {
@@ -714,37 +695,52 @@ class RoiView(ctx: Context) : View(ctx) {
             canvas.drawLine(0f, h * i / 10f, w, h * i / 10f, stroke)
         }
 
-        // 各 ROI
-        stroke.strokeWidth = 4f
+        // ---- 静态 ROI 框 ----
+        stroke.strokeWidth = 3f
         for ((name, r, c) in rois) {
             stroke.color = c
             val rect = RectF(r[0] * w, r[1] * h, r[2] * w, r[3] * h)
             canvas.drawRect(rect, stroke)
+            // 标签贴在框的左上角（超出屏幕就贴框内）
             fill.color = c
-            canvas.drawRect(rect.left, max(0f, rect.top - 30f), rect.left + text.measureText(name) + 10f, rect.top, fill)
+            val tw = text.measureText(name) + 10f
+            val ty = if (rect.top > 26f) rect.top else rect.top + 26f
+            canvas.drawRect(rect.left, ty - 24f, rect.left + tw, ty, fill)
             text.color = Color.BLACK
-            canvas.drawText(name, rect.left + 5f, max(24f, rect.top - 6f), text)
+            canvas.drawText(name, rect.left + 5f, ty - 6f, text)
         }
 
-        // 技能键位置点
-        stroke.color = Color.parseColor("#FFFFC53D")
-        stroke.strokeWidth = 3f
-        for ((x, y) in skillPts) {
-            val cx = x * w; val cy = y * h
-            canvas.drawCircle(cx, cy, 16f, stroke)
-            canvas.drawLine(cx - 26f, cy, cx + 26f, cy, stroke)
-            canvas.drawLine(cx, cy - 26f, cx, cy + 26f, stroke)
+        // ---- 采集点（技能键 / 菜单 / 自由市场 …）----
+        picked.forEachIndexed { i, (nx, ny) ->
+            val cx = nx * w
+            val cy = ny * h
+            val c = when (i) {
+                0, 1, 2, 3 -> Color.parseColor("#FFFFC53D")   // 技能键 = 黄
+                4 -> Color.parseColor("#FFB07CFF")            // 菜单 = 紫
+                5 -> Color.parseColor("#FF3BD16F")            // 自由市场 = 绿
+                else -> Color.parseColor("#FF3BC9D1")
+            }
+            stroke.color = c
+            stroke.strokeWidth = 4f
+            canvas.drawCircle(cx, cy, 26f, stroke)
+            canvas.drawLine(cx - 38f, cy, cx + 38f, cy, stroke)
+            canvas.drawLine(cx, cy - 38f, cx, cy + 38f, stroke)
+            val label = pickLabels.getOrElse(i) { "点${i + 1}" }
+            fill.color = c
+            val tw = text.measureText(label) + 10f
+            canvas.drawRect(cx + 30f, cy - 46f, cx + 30f + tw, cy - 20f, fill)
+            text.color = Color.BLACK
+            canvas.drawText(label, cx + 35f, cy - 28f, text)
         }
 
-        // 屏幕中心
+        // ---- 屏幕中心 ----
         stroke.color = Color.parseColor("#FF3BC9D1")
-        stroke.strokeWidth = 3f
-        canvas.drawCircle(w / 2f, h / 2f, 22f, stroke)
-        canvas.drawLine(w / 2f - 40f, h / 2f, w / 2f + 40f, h / 2f, stroke)
-        canvas.drawLine(w / 2f, h / 2f - 40f, w / 2f, h / 2f + 40f, stroke)
+        stroke.strokeWidth = 2f
+        canvas.drawCircle(w / 2f, h / 2f, 18f, stroke)
 
-        // 尺寸标注
+        // ---- 尺寸标注 ----
         text.color = Color.parseColor("#FF3BC9D1")
-        canvas.drawText("${width}x${height}  ${if (width > height) "横屏" else "竖屏"}", 12f, h - 14f, text)
+        canvas.drawText("${width}x${height} ${if (width > height) "横屏" else "竖屏"}  采集点 ${picked.size}",
+            12f, h - 14f, text)
     }
 }
