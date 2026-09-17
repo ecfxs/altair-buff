@@ -205,11 +205,17 @@ class OverlayService : Service() {
             "点4" to { tapPick(3) }
         ))
         root.addView(row(
-            "键扫描" to { act("键扫描") { ShellCore.probe.keyScan(3) } },
-            "点1长按" to { tapPick(0, 250) },
-            "复制日志" to { copyLog() }
+            "点5" to { tapPick(4) },
+            "点6" to { tapPick(5) },
+            "键扫描" to { act("键扫描") { ShellCore.probe.keyScan(3) } }
         ))
         root.addView(row(
+            "点1短按" to { tapPick(0, 50) },
+            "点1长按" to { tapPick(0, 250) },
+            "点1自绘" to { tapPick(0, 150, "motionevent") }
+        ))
+        root.addView(row(
+            "复制日志" to { copyLog() },
             "隐藏面板" to { hidePanel() }
         ))
 
@@ -368,7 +374,7 @@ class OverlayService : Service() {
     }
 
     /** 点击第 idx 个采集点（从 0 开始）。 */
-    private fun tapPick(idx: Int, pressMs: Int = 90) {
+    private fun tapPick(idx: Int, pressMs: Int = 90, method: String = "swipe") {
         val v = pickView
         // 采点层开着时也能点：先从它拿；关掉时从最后一次的副本拿
         val pts = v?.points ?: lastPicks
@@ -378,7 +384,7 @@ class OverlayService : Service() {
         }
         val (nx, ny) = pts[idx]
         act("点${idx + 1}") {
-            ShellCore.probe.tapNorm(nx.toDouble(), ny.toDouble(), "点${idx + 1}", pressMs)
+            ShellCore.probe.tapNorm(nx.toDouble(), ny.toDouble(), "点${idx + 1}", pressMs, method)
         }
     }
 

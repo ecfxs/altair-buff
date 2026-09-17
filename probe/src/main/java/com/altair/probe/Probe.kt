@@ -735,7 +735,12 @@ class Probe(
      * 这样归一化坐标换算永远正确，不会因方向变化而点偏。
      * 代价是每次多约 200ms —— 手动测试完全可接受。
      */
-    fun tapNorm(nx: Double, ny: Double, label: String = "", pressMs: Int = 90): String {
+    fun tapNorm(
+        nx: Double, ny: Double,
+        label: String = "",
+        pressMs: Int = 90,
+        method: String = "swipe"
+    ): String {
         if (!ensureShell()) return "无 root"
         val d = if (bestDisplayId >= 0) bestDisplayId else 0
         val ref = File(cache, "tapref.raw")
@@ -752,14 +757,22 @@ class Probe(
         // 会把这种 0ms 点击当成无效输入直接丢弃。
         // `input swipe x y x y D` 是同一个点出发再回到同一个点，能精确控制按住 D 毫秒，
         // 这才是游戏认得的「真实点击」。
-        val cmd = if (pressMs > 0) "input swipe $px $py $px $py $pressMs"
-                  else "input tap $px $py"
+        // 两种按压实现，任选：
+        //   swipe       —— 同点滑动，靠 duration 控制按压时长（默认）
+        //   motionevent —— 显式 DOWN / sleep / UP，控制最精确，
+        //                  但 input motionevent 只在较新 Android 上可用
+        val cmd = when (method) {
+            "motionevent" ->
+                "input motionevent DOWN $px $py; sleep ${"%.2f".format(pressMs / 1000.0)}; input motionevent UP $px $py"
+            "tap" -> "input tap $px $py"
+            else -> "input swipe $px $py $px $py $pressMs"
+        }
         val (ms, err) = sh.timedExec(cmd, 8000)
         val tag = if (label.isBlank()) "" else "[$label] "
         val nx4 = "%.4f".format(nx)
         val ny4 = "%.4f".format(ny)
         // 注意：Kotlin 允许中文作标识符，所以 "$tag点击" 会被当成变量名 —— 必须加花括号
-        return "${tag}点击 ($px, $py)  归一化($nx4, $ny4)  画面 ${w}x${h}  按压 ${pressMs}ms  ${ms}ms  ${err.take(40)}"
+        return "${tag}点击 ($px, $py)  归一化($nx4, $ny4)  画面 ${w}x${h}  方式=$method 按压 ${pressMs}ms  ${ms}ms  ${err.take(40)}"
     }
 
     // ------------------------------------------------------------ 按键通道诊断
