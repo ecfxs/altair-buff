@@ -8,6 +8,7 @@ build/
 local.properties
 captures/
 *.apk
+!dist/*.apk
 !probe/build/outputs/apk/release/probe-release.apk
 
 # ---- 签名密钥：不公开，否则任何人都能签出「同一个应用」的更新包 ----
