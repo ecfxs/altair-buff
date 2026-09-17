@@ -1,0 +1,541 @@
+{
+  "schemaVersion": 2,
+
+  "meta": {
+    "game": "冒险岛世界 - 阿尔泰",
+    "package": "com.nexon.mod",
+    "platform": "红手指云手机",
+    "android": { "targets": ["13", "11"], "minSdk": 26, "targetSdk": 30,
+                 "note": "targetSdk 取 30 以同时兼容 13/11 并规避两代权限收紧（POST_NOTIFICATIONS / SCHEDULE_EXACT_ALARM）" },
+    "refWidth": 1280,
+    "refHeight": 720,
+    "orientation": "landscape",
+    "configRevision": "r2-example",
+    "deviceId": "",
+    "calibratedAt": "2025-09-17T00:00:00+08:00",
+    "calibratedFrom": ["自由市场.png", "正常地图.png", "菜单.png"],
+    "confirmedFacts": {
+      "keyeventNative": true,
+      "arrowKeyRepeatWalk": true,
+      "rootToggleAvailable": true,
+      "buffIsSkillNotItem": true,
+      "characterCanDie": true,
+      "reconnectPolicy": "alertOnly",
+      "menuOpenBy": "tapTopRightButton"
+    },
+    "note": "v2.2 示例。输入走键盘通道，BUFF 纯定时，场景判定复用小地图，等待默认原地模式。所有坐标归一化 [0,1]。"
+  },
+
+  "runtime": {
+    "captureChannelPreference": ["rootShell", "mediaProjection", "adbTcp"],
+    "inputChannelPreference": ["keyevent", "rootShell", "accessibility"],
+
+    "captureFormat": "raw",
+    "_captureFormat_note": "P0 实测 PNG 路径中位 196ms（瓶颈在 PNG 编码）。raw 跳过编码，且只需 seek 读小地图/血条两个小 ROI，预估降到 30~70ms。待 probe v0.2 压测确认。",
+
+    "sampleRateHz": {
+      "freeMarket": 0.5,
+      "field": 1.5,
+      "loading": 0.5,
+      "unknown": 1.5,
+      "walking": 3.0
+    },
+    "_sampleRate_note": "按 P0 实测 196ms/帧 重排。走路 3Hz 需底层用 raw 路径；PNG 路径下 5Hz 占空比 98%，不可行。",
+
+    "measured": {
+      "_source": "probe APK v0.1 实测，2025-09-17，红手指实例",
+      "android": "13 (API 33)",
+      "abi": "arm64-v8a",
+      "displayId": 0,
+      "physicalResolution": [720, 1280],
+      "gameResolution": [1280, 720],
+      "rootShellOpenMs": 45,
+      "rootShellRoundTripMs": 8,
+      "oneShotSuMs": 22,
+      "capturePngMedianMs": 196,
+      "capturePngP90Ms": 243,
+      "inputKeyeventMedianMs": 20,
+      "standbyBucket": 10,
+      "batteryOptimized": false,
+      "dozeWhitelisted": false,
+      "selinux": "Disabled"
+    },
+
+    "keepAliveOnStart": {
+      "_note": "P0 实测未豁免电池优化、不在 Doze 白名单 → 首次启动需自动配置",
+      "addDozeWhitelist": true,
+      "requestBatteryExemption": true
+    },
+
+    "captureTimeoutMs": 500,
+    "blackScreenVarianceThreshold": 4.0,
+    "blackScreenEntropyThreshold": 1.5,
+    "frozenFrameTimeoutMs": 60000,
+    "pauseInputDuringLoading": true,
+    "safetySceneWhitelist": ["freeMarket", "field"],
+    "dialogScanEveryNFrames": 3,
+    "restartServiceEveryMs": 86400000,
+    "humanize": {
+      "intervalJitterPct": 0.15,
+      "gestureDurationJitterPct": 0.2,
+      "tapJitterPct": 0.003,
+      "randomPauseProbability": 0.03,
+      "randomPauseRangeMs": [300, 1200],
+      "shuffleIndependentActions": true
+    }
+  },
+
+  "keymap": {
+    "channel": "keyevent",
+    "skills": { "1": 8, "2": 9, "3": 10, "4": 11 },
+    "move": { "left": 21, "right": 22, "up": 19, "down": 20 },
+    "interact": 66,
+    "cancel": 111,
+    "menuOpen": 111,
+    "menuFreeMarket": null,
+    "repeatRateHz": 10,
+    "longPressMaxMs": 800,
+    "note": "全部键位可配。技能仅启用实际存在的 1~3 个。menuOpen/menuFreeMarket 待 Q-07 确认。"
+  },
+
+  "buffProfile": {
+    "_note": "机内 UI 直接编辑这一段（F-19：用户要求界面上可设置 BUFF 数量、按键启用、持续时间）。",
+    "class": "",
+    "buffCount": 2,
+    "buffs": [
+      { "slot": 1, "enabled": true,  "key": "skills.1", "name": "BUFF1", "durationMin": 5 },
+      { "slot": 2, "enabled": true,  "key": "skills.2", "name": "BUFF2", "durationMin": 5 },
+      { "slot": 3, "enabled": false, "key": "skills.3", "name": "BUFF3", "durationMin": 5 }
+    ],
+    "cycleSafetyMarginPct": 6,
+    "derived": {
+      "effectiveDurationMin": "min(启用的 durationMin)",
+      "cyclePeriodMs": "effectiveDurationMin*60000*(1 - cycleSafetyMarginPct/100)"
+    },
+    "_example": "2 个 BUFF 各 5 分钟，安全余量 6% → 周期 = 5*60000*0.94 = 282000ms"
+  },
+
+  "screens": {
+    "minimap": {
+      "roi": [0.0023, 0.1097, 0.1477, 0.2958],
+      "pixelBox": [3, 79, 186, 134],
+      "mapBounds": [0.02, 0.02, 0.98, 0.98],
+      "playerColor": { "h": [0, 360], "s": [0, 255], "v": [0, 255] },
+      "playerAreaRange": [3, 200],
+      "minConfidence": 0.55,
+      "lowConfidenceFrameLimit": 8,
+      "role": "场景判定主锚点 + 走位定位"
+    },
+    "hudBars": {
+      "roi": [0.4180, 0.8625, 0.5820, 0.9819],
+      "pixelBox": [535, 621, 210, 86],
+      "rows": [
+        { "name": "hp", "order": 1 },
+        { "name": "mp", "order": 2 },
+        { "name": "exp", "order": 3 }
+      ],
+      "role": "辅助场景判定（战斗中 HP 下降）"
+    },
+
+    "hudHpBar": {
+      "roi": [0.4289, 0.8958, 0.5711, 0.9125],
+      "pixelBox": [549, 645, 182, 12],
+      "color": { "h": [[340, 360], [0, 20]], "s": [120, 255], "v": [80, 255] },
+      "measured": { "bgr": [36, 36, 255], "hsv": [0, 218, 255], "fillRatio": 0.99,
+                    "redColumnSpanPx": [182, 180, 181] },
+      "hpPercentMetric": "redColumnSpan / 182",
+      "death": { "hpBelowPct": 5, "confirmFrames": 3, "alsoAlertIfBarMissing": true },
+      "role": "① 游戏存活检测 ② 血量百分比 ③ 死亡检测",
+      "note": "三张实机截图坐标与颜色完全一致，极可靠。菜单打开时 V 从 255 降到 177。"
+    },
+
+    "headHpBar": {
+      "searchRoi": [0.30, 0.35, 0.70, 0.70],
+      "observed": { "pixelBox": [579, 381, 58, 7], "roi": [0.4523, 0.5292, 0.4977, 0.5389] },
+      "color": { "h": [[340, 360], [0, 20]], "s": [120, 255], "v": [80, 255] },
+      "sizeRangePx": [[30, 4], [120, 16]],
+      "role": "角色屏幕定位（走位闭环的核心）",
+      "note": "仅组队时出现。判据必须用 H/S 而非 V —— 菜单打开时 V 从 221 降到 154。待人工确认。"
+    },
+
+    "menuDim": {
+      "enabled": true,
+      "brightnessDropRatio": 0.80,
+      "hudBarBrightnessDropRatio": 0.85,
+      "baselineLearnWindowMs": 30000,
+      "measured": { "normalBrightness": 141, "menuBrightness": 86, "dropPct": 39 },
+      "role": "菜单/全屏遮罩检测",
+      "note": "小地图无法区分『野外』与『野外+菜单』（NCC=1.0000），必须靠全屏亮度骤降。"
+    },
+
+    "skillBar": {
+      "bandY": [0.5417, 0.6139],
+      "columnPeriodPx": 76,
+      "note": "键盘通道已确认可用，本段仅作触摸兜底参考，不需精确标定。"
+    },
+    "dialogScanRoi": [0.15, 0.15, 0.85, 0.85],
+    "forbiddenZones": [
+      { "name": "待标定-充值入口", "roi": [0.93, 0.01, 0.999, 0.09], "confirmed": false }
+    ]
+  },
+
+  "buttons": {
+    "_note": "键盘通道可用时大部分不需要。保留以支持触摸降级通道。",
+    "menu_open": [0.9672, 0.0653],
+    "menu_open_confidence": "low",
+    "menu_open_note": "右上角圆形候选 pixelBox=[1219,28,38,38]，三张图位置一致但圆内纹理std高达70~92，不像平坦按钮。待人工确认（见 shots/_analysis/菜单按钮候选.png）",
+    "menu_panel_roi": [0.8008, 0.0, 1.0, 1.0],
+    "menu_free_market": [0.5000, 0.5000],
+    "portal_enter": [0.5000, 0.5000],
+    "btn_return_home": [0.5000, 0.9400],
+    "skill_1": [0.7250, 0.5778],
+    "skill_2": [0.7594, 0.5778],
+    "skill_3": [0.7937, 0.5778],
+    "skill_4": [0.8280, 0.5778]
+  },
+
+  "templates": {
+    "scene_freeMarket": "tpl/scene_freeMarket.png",
+    "scene_field": "tpl/scene_field.png",
+    "scene_menu": "tpl/scene_menu.png",
+    "scene_loading": "tpl/scene_loading.png",
+    "dialog_disconnect": "tpl/dialog_disconnect.png",
+    "dialog_notice": "tpl/dialog_notice.png",
+    "dialog_update": "tpl/dialog_update.png",
+    "dialog_purchase": "tpl/dialog_purchase.png",
+    "tpl_note": "scene_* 模板均从小地图 ROI 裁取，已在本次交付中自动生成。"
+  },
+
+  "scenes": [
+    {
+      "id": "loading",
+      "priority": 100,
+      "anchors": [
+        { "source": "minimap", "template": "scene_loading", "threshold": 0.80 }
+      ],
+      "confirmFrames": 2,
+      "onEnter": ["pauseInput"],
+      "onExit": ["resumeInput"]
+    },
+    {
+      "id": "login",
+      "priority": 99,
+      "anchors": [
+        { "template": "dialog_disconnect", "roi": [0.15, 0.15, 0.85, 0.85], "threshold": 0.85 }
+      ],
+      "confirmFrames": 2,
+      "onEnter": ["pauseAll", "alertFatal:检测到登录页/被踢回，已暂停"]
+    },
+    {
+      "id": "freeMarket",
+      "priority": 50,
+      "anchors": [
+        { "source": "minimap", "template": "scene_freeMarket", "threshold": 0.82 }
+      ],
+      "confirmFrames": 3
+    },
+    {
+      "id": "field",
+      "priority": 50,
+      "anchors": [
+        { "source": "minimap", "template": "scene_field", "threshold": 0.82 }
+      ],
+      "confirmFrames": 3
+    },
+    {
+      "id": "dialog",
+      "priority": 95,
+      "anchors": [
+        { "template": "dialog_notice",   "roi": [0.15,0.15,0.85,0.85], "threshold": 0.86 },
+        { "template": "dialog_update",   "roi": [0.15,0.15,0.85,0.85], "threshold": 0.86 },
+        { "template": "dialog_purchase", "roi": [0.15,0.15,0.85,0.85], "threshold": 0.82 }
+      ],
+      "confirmFrames": 2
+    }
+  ],
+
+  "rules": [
+    {
+      "id": "buff_1",
+      "name": "BUFF 技能 1",
+      "enabled": true,
+      "priority": "P3_BUFF",
+      "detect": { "kind": "none" },
+      "trigger": { "mode": "timer", "periodMs": 300000, "jitterPct": 0.12 },
+      "guard": { "scene": ["field"], "requireDialogFree": true },
+      "actions": [ { "type": "key", "key": "skills.1", "waitAfterMs": 900 } ],
+      "verify": { "expect": { "kind": "none" }, "timeoutMs": 0, "retry": 0 },
+      "onFail": { "action": "alert", "alert": "BUFF1 动作异常" },
+      "note": "detect/verify 的 kind 改为 buffSlot 并补模板即可启用视觉确认，代码无需改动。"
+    },
+    {
+      "id": "buff_2",
+      "name": "BUFF 技能 2",
+      "enabled": false,
+      "priority": "P3_BUFF",
+      "detect": { "kind": "none" },
+      "trigger": { "mode": "timer", "periodMs": 300000, "jitterPct": 0.12 },
+      "guard": { "scene": ["field"], "requireDialogFree": true },
+      "actions": [ { "type": "key", "key": "skills.2", "waitAfterMs": 900 } ],
+      "verify": { "expect": { "kind": "none" }, "timeoutMs": 0, "retry": 0 },
+      "onFail": { "action": "alert", "alert": "BUFF2 动作异常" }
+    },
+    {
+      "id": "buff_3",
+      "name": "BUFF 技能 3",
+      "enabled": false,
+      "priority": "P3_BUFF",
+      "detect": { "kind": "none" },
+      "trigger": { "mode": "timer", "periodMs": 300000, "jitterPct": 0.12 },
+      "guard": { "scene": ["field"], "requireDialogFree": true },
+      "actions": [ { "type": "key", "key": "skills.3", "waitAfterMs": 900 } ],
+      "verify": { "expect": { "kind": "none" }, "timeoutMs": 0, "retry": 0 },
+      "onFail": { "action": "alert", "alert": "BUFF3 动作异常" }
+    },
+    {
+      "id": "death_watch",
+      "name": "角色死亡检测（HP 归零 / 血条消失）",
+      "enabled": true,
+      "priority": "P0_EMERGENCY",
+      "detect": {
+        "kind": "hpBarFill",
+        "roi": [0.4289, 0.8958, 0.5711, 0.9125],
+        "hpBelowPct": 5,
+        "alsoTriggerIfBarMissing": true,
+        "confirmFrames": 3
+      },
+      "trigger": { "mode": "onPresent", "minIntervalMs": 3000, "cooldownMs": 30000 },
+      "guard": { "scene": ["freeMarket", "field", "unknown"] },
+      "actions": [
+        { "type": "pause", "message": "检测到角色死亡或血量归零，停止所有操作" },
+        { "type": "alert", "level": "FATAL", "message": "角色疑似死亡（HP<5% 或血条消失），已全局暂停。请人工处理复活。" }
+      ],
+      "verify": { "expect": { "kind": "always" }, "timeoutMs": 0, "retry": 0 },
+      "onFail": { "action": "alert", "alert": "死亡检测告警" },
+      "note": "不做自动复活——复活流程未知且可能涉及消费确认，风险不对等。"
+    },
+
+    {
+      "id": "dialog_notice",
+      "name": "公告弹窗",
+      "enabled": true,
+      "priority": "P0_EMERGENCY",
+      "detect": { "kind": "template", "template": "dialog_notice", "roi": [0.15,0.15,0.85,0.85], "threshold": 0.86, "confirmFrames": 2 },
+      "trigger": { "mode": "onPresent", "minIntervalMs": 5000, "cooldownMs": 8000 },
+      "guard": { "scene": ["dialog"] },
+      "actions": [ { "type": "key", "key": "cancel", "waitAfterMs": 800 } ],
+      "verify": { "expect": { "kind": "templateGone", "template": "dialog_notice", "roi": [0.15,0.15,0.85,0.85], "threshold": 0.86 }, "timeoutMs": 3000, "retry": 1 },
+      "onFail": { "action": "pauseAndAlert", "alert": "公告弹窗关不掉，已暂停" }
+    },
+    {
+      "id": "dialog_update",
+      "name": "更新提示",
+      "enabled": true,
+      "priority": "P0_EMERGENCY",
+      "detect": { "kind": "template", "template": "dialog_update", "roi": [0.15,0.15,0.85,0.85], "threshold": 0.86, "confirmFrames": 2 },
+      "trigger": { "mode": "onPresent", "minIntervalMs": 5000, "cooldownMs": 30000 },
+      "guard": { "scene": ["dialog", "unknown"] },
+      "actions": [
+        { "type": "alert", "level": "FATAL", "message": "游戏/平台更新提示，模板可能全部失效，已暂停" },
+        { "type": "pause", "message": "更新提示：不自动更新，等待重新标定" }
+      ],
+      "verify": { "expect": { "kind": "always" }, "timeoutMs": 0, "retry": 0 },
+      "onFail": { "action": "alert", "alert": "更新弹窗告警" }
+    },
+    {
+      "id": "dialog_purchase",
+      "name": "消费确认弹窗（红线）",
+      "enabled": true,
+      "priority": "P0_EMERGENCY",
+      "detect": { "kind": "template", "template": "dialog_purchase", "roi": [0.15,0.15,0.85,0.85], "threshold": 0.82, "confirmFrames": 2 },
+      "trigger": { "mode": "onPresent", "minIntervalMs": 5000, "cooldownMs": 30000 },
+      "guard": { "scene": ["dialog", "freeMarket", "field", "unknown"] },
+      "actions": [
+        { "type": "pause", "message": "检测到消费确认弹窗，立即停止所有操作" },
+        { "type": "alert", "level": "FATAL", "message": "【红线】检测到消费/充值确认弹窗，已全局暂停。请人工检查！" }
+      ],
+      "verify": { "expect": { "kind": "always" }, "timeoutMs": 0, "retry": 0 },
+      "onFail": { "action": "alert", "alert": "消费弹窗红线告警" }
+    }
+  ],
+
+  "macros": {
+    "macro_wait_and_stroll": {
+      "name": "野外原地走动等待（简易模式）",
+      "timeoutMs": 300000,
+      "retry": 0,
+      "onFail": "alertAndPause",
+      "steps": [
+        { "type": "assertScene", "scene": "field", "timeoutMs": 5000, "onFail": "alertAndPause" },
+        {
+          "type": "walkRange",
+          "axis": "x",
+          "mode": "keyRepeat",
+          "from": [0.45, 0.55],
+          "to":   [0.55, 0.55],
+          "until": { "kind": "scheduleDue" },
+          "tolerance": 0.030,
+          "stepRepeatCount": 3,
+          "maxIterationsPerLeg": 25,
+          "pauseBetweenMs": [1200, 3500],
+          "onStuck": { "action": "nudgeRandom", "retry": 3, "thenAlert": "野外原地走动卡住" }
+        }
+      ]
+    },
+
+    "macro_wait_in_market": {
+      "name": "自由市场内走动等待",
+      "timeoutMs": 300000,
+      "retry": 0,
+      "onFail": "alertAndPause",
+      "steps": [
+        { "type": "assertScene", "scene": "freeMarket", "timeoutMs": 5000, "onFail": "alertAndPause" },
+        {
+          "type": "walkRange",
+          "axis": "x",
+          "mode": "keyRepeat",
+          "from": [0.30, 0.55],
+          "to":   [0.45, 0.55],
+          "until": { "kind": "scheduleDue" },
+          "tolerance": 0.025,
+          "stepRepeatCount": 3,
+          "maxIterationsPerLeg": 25,
+          "pauseBetweenMs": [800, 2500],
+          "onStuck": { "action": "nudgeRandom", "retry": 3, "thenAlert": "自由市场走动卡住" }
+        }
+      ]
+    },
+
+    "macro_exit_market": {
+      "name": "离开自由市场（走到传送门 + 按方向键上）",
+      "timeoutMs": 60000,
+      "retry": 1,
+      "onFail": "alertAndPause",
+      "steps": [
+        { "type": "assertScene", "scene": "freeMarket", "timeoutMs": 5000 },
+        {
+          "type": "walkTo",
+          "mode": "keyRepeat",
+          "axis": "x",
+          "locateSelf": "headHpBar",
+          "locateTarget": "portalMarker",
+          "targetRef": "portal_in_market",
+          "tolerance": 0.030,
+          "stepRepeatCount": 3,
+          "maxIterations": 30,
+          "onStuck": { "action": "nudgeRandom", "retry": 3 }
+        },
+        { "type": "key", "key": "move.up", "waitAfterMs": 800,
+          "note": "用户确认：走到传送门后按方向键上回到原来的地图" },
+        { "type": "waitScene", "scene": "loading", "timeoutMs": 8000, "onFail": "retry" },
+        { "type": "waitSceneGone", "scene": "loading", "timeoutMs": 30000 },
+        { "type": "assertScene", "scene": "field", "timeoutMs": 15000, "onFail": "alertAndPause" }
+      ]
+    },
+
+    "macro_cast_buffs": {
+      "name": "逐个释放 BUFF",
+      "timeoutMs": 30000,
+      "retry": 1,
+      "onFail": "alertAndPause",
+      "steps": [
+        { "type": "assertScene", "scene": "field", "timeoutMs": 8000, "onFail": "alertAndPause" },
+        { "type": "wait", "durationMs": 1200, "jitterMs": 600 },
+        { "type": "runRule", "ruleId": "buff_1" },
+        { "type": "wait", "durationMs": 900, "jitterMs": 400 },
+        { "type": "runRule", "ruleId": "buff_2" },
+        { "type": "wait", "durationMs": 900, "jitterMs": 400 },
+        { "type": "runRule", "ruleId": "buff_3" }
+      ],
+      "note": "buff_2/buff_3 enabled=false 时自动跳过。技能间强制 ≥0.9s 间隔。"
+    },
+
+    "macro_return_market": {
+      "name": "返回自由市场（菜单 → 自由市场按键）",
+      "timeoutMs": 90000,
+      "retry": 1,
+      "onFail": "alertAndPause",
+      "steps": [
+        { "type": "assertScene", "scene": "field", "timeoutMs": 8000, "onFail": "alertAndPause" },
+        { "type": "key", "key": "menuOpen", "waitAfterMs": 900,
+          "note": "Q-07 待确认：菜单怎么打开（快捷键还是屏幕坐标）" },
+        { "type": "assertMenuOpen", "timeoutMs": 3000, "onFail": "retry",
+          "note": "用全屏亮度骤降判定菜单已打开" },
+        { "type": "tap", "target": "menu_free_market", "jitter": 0.003, "waitAfterMs": 900,
+          "note": "菜单中的『自由市场』按键，坐标待标定" },
+        { "type": "waitScene", "scene": "loading", "timeoutMs": 8000, "onFail": "retry" },
+        { "type": "waitSceneGone", "scene": "loading", "timeoutMs": 30000 },
+        { "type": "assertScene", "scene": "freeMarket", "timeoutMs": 20000, "onFail": "alertAndPause" }
+      ]
+    }
+  },
+
+  "schedule": {
+    "mode": "loop",
+    "waitLocation": "inPlace",
+    "_waitLocation_options": {
+      "inPlace": "简易模式：全程待在野外，原地走动，到点原地加 BUFF（推荐先做，无地图切换风险）",
+      "freeMarket": "回城模式：自由市场等待 → 传送门 → 方向键上出去 → 加 BUFF → 菜单回自由市场"
+    },
+    "anchor": "afterCast",
+    "_anchor_options": {
+      "afterCast": "从上一次释放 BUFF 起算（推荐，间隔最稳定）",
+      "afterReturn": "从回到等待位之后才计时（往返耗时不占用周期）"
+    },
+    "periodMs": 282000,
+    "periodJitterPct": 0.12,
+    "initialDelayMs": 5000,
+    "onStepError": "alertAndPause",
+    "steps": [
+      { "macro": "macro_wait_and_stroll" },
+      { "macro": "macro_cast_buffs" }
+    ],
+    "_steps_freeMarketMode": [
+      { "macro": "macro_wait_in_market" },
+      { "macro": "macro_exit_market" },
+      { "macro": "macro_cast_buffs" },
+      { "macro": "macro_return_market" }
+    ],
+    "note": "periodMs = 5min × (1 - 6% 安全余量) = 282s。切换 waitLocation 时同步切换 steps。"
+  },
+
+  "alerts": {
+    "dedupeWindowMs": 300000,
+    "fatalRepeatMs": 600000,
+    "sendScreenshotOnError": true,
+    "screenshotRetentionCount": 50,
+    "channels": [
+      { "type": "localLog", "enabled": true },
+      { "type": "dingtalk", "url": "", "enabled": false, "secret": "" },
+      { "type": "feishu",   "url": "", "enabled": false }
+    ]
+  },
+
+  "management": {
+    "_note": "v1 不实现，仅预留字段，v2 加管理端时无需改数据模型。",
+    "enabled": false,
+    "stateApiPort": 8788,
+    "stateApiBind": "127.0.0.1",
+    "reportIntervalMs": 60000,
+    "configPullUrl": "",
+    "deviceId": "",
+    "configRevision": "r2-example"
+  },
+
+  "fmea": {
+    "ruleFailStreakToBreak": 3,
+    "macroFailStreakToBreak": 2,
+    "globalFailCountWindowMs": 300000,
+    "globalFailCountToBreak": 10,
+    "backoffStartMs": 1000,
+    "backoffMaxMs": 30000,
+    "autoResumeAfterMs": 0,
+    "cycleOverrunAlertMs": 300000,
+    "templateStaleProbe": {
+      "unknownSceneRatio": 0.30,
+      "unknownWindowMs": 600000,
+      "verifyFailRatio": 0.50,
+      "verifyMinSamples": 10
+    }
+  }
+}

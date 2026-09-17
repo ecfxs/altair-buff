@@ -1,0 +1,24 @@
+# ---- 工具链（908MB，绝不上传）----
+.toolchain/
+
+# ---- 构建产物 ----
+build/
+*/build/
+.gradle/
+local.properties
+captures/
+*.apk
+!probe/build/outputs/apk/release/probe-release.apk
+
+# ---- 签名密钥：不公开，否则任何人都能签出「同一个应用」的更新包 ----
+keystore/
+*.jks
+*.keystore
+
+# ---- 游戏截图与分析产物：含游戏画面，不公开 ----
+shots/
+
+# ---- 系统 ----
+.DS_Store
+*.swp
+*~

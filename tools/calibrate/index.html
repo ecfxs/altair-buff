@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>标定工具 · 冒险岛世界·阿尔泰</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; background:#14161a; color:#d8dde3; font:13px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; display:flex; height:100vh; overflow:hidden;}
+  #left { flex:1; overflow:auto; padding:12px; }
+  #right { width:360px; background:#1b1f26; border-left:1px solid #2c333d; display:flex; flex-direction:column; }
+  h1 { font-size:15px; margin:0 0 10px; color:#eaf0f6; font-weight:600;}
+  h2 { font-size:12px; margin:14px 0 6px; color:#8b97a6; font-weight:600; letter-spacing:.05em; text-transform:uppercase;}
+  canvas { background:#0c0e11; border:1px solid #2c333d; border-radius:4px; cursor:crosshair; display:block; }
+  .row { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:8px;}
+  button { background:#2a323d; color:#d8dde3; border:1px solid #3a4450; border-radius:4px; padding:5px 10px; cursor:pointer; font-size:12px;}
+  button:hover { background:#354050; }
+  button.on { background:#2563eb; border-color:#3b82f6; color:#fff; }
+  button.danger { background:#3a2226; border-color:#5a2a30; }
+  input, select { background:#0f1216; color:#d8dde3; border:1px solid #3a4450; border-radius:4px; padding:5px 7px; font-size:12px; width:100%;}
+  input[type=range]{ padding:0; }
+  .item { border:1px solid #2c333d; border-radius:4px; padding:7px 8px; margin-bottom:6px; background:#161a20;}
+  .item .nm { display:flex; gap:5px; align-items:center; margin-bottom:4px;}
+  .item .nm input { flex:1; }
+  .item .co { font-family:ui-monospace,Menlo,monospace; font-size:11px; color:#7fd18b; word-break:break-all;}
+  .item .ty { font-size:11px; color:#8b97a6;}
+  .muted { color:#6c7787; font-size:11px;}
+  #log { padding:8px 10px; border-top:1px solid #2c333d; font-size:11px; color:#7fd18b; min-height:34px; font-family:ui-monospace,monospace;}
+  #list { flex:1; overflow:auto; padding:0 10px 10px; }
+  .pad { padding:10px; border-bottom:1px solid #2c333d;}
+  #wrap { position:relative; display:inline-block; }
+  #hint { position:absolute; pointer-events:none; background:#000a; color:#ffd479; padding:2px 6px; border-radius:3px; font-family:ui-monospace,monospace; font-size:11px; display:none;}
+  kbd{background:#2a323d;border:1px solid #3a4450;border-radius:3px;padding:0 4px;font-size:11px;}
+</style>
+</head>
+<body>
+<div id="left">
+  <h1>标定工具 — 冒险岛世界 · 阿尔泰</h1>
+  <div class="row">
+    <span class="muted">截图</span>
+    <select id="imgSel" style="width:220px"></select>
+    <span class="muted">缩放</span>
+    <input type="range" id="zoom" min="25" max="150" value="100" style="width:130px">
+    <span id="zoomTxt" class="muted">100%</span>
+    <label class="muted"><input type="checkbox" id="showGrid" checked style="width:auto"> 网格</label>
+  </div>
+  <div id="wrap"><canvas id="cv"></canvas><div id="hint"></div></div>
+  <p class="muted">
+    画框 <kbd>B</kbd> ｜ 标点 <kbd>P</kbd> ｜ 画圆 <kbd>C</kbd> ｜ 撤销 <kbd>Z</kbd> ｜ 删除选中 <kbd>Del</kbd><br>
+    圆：按下定圆心，拖到半径处松开。所有坐标实时以归一化值 [0,1] 显示，可跨分辨率复用。
+  </p>
+</div>
+
+<div id="right">
+  <div class="pad">
+    <h2>工具</h2>
+    <div class="row">
+      <button id="tRoi" class="on">画框 (ROI)</button>
+      <button id="tPoint">标点</button>
+      <button id="tCircle">画圆</button>
+    </div>
+    <h2>语义类型</h2>
+    <select id="type">
+      <option value="minimap">小地图 minimap</option>
+      <option value="minimap_player">小地图内角色点范围</option>
+      <option value="hud_bars">HP/MP/EXP 条</option>
+      <option value="buff_bar">BUFF 图标栏</option>
+      <option value="buff_slot">单个 BUFF 槽位</option>
+      <option value="skill_key">技能键</option>
+      <option value="joystick">摇杆</option>
+      <option value="scene_anchor">场景锚点</option>
+      <option value="portal">传送点</option>
+      <option value="forbidden" selected>危险区(禁止点击)</option>
+      <option value="other">其他</option>
+    </select>
+    <h2>名称</h2>
+    <input id="name" placeholder="例如 buff_haste / portal_enter">
+  </div>
+  <div class="pad">
+    <div class="row">
+      <button id="save">保存到项目</button>
+      <button id="dl">下载 JSON</button>
+      <button id="clear" class="danger">清空</button>
+    </div>
+  </div>
+  <div id="list"></div>
+  <div id="log">就绪。选一张截图，开始标注。</div>
+</div>
+
+<script>
+const IMG_DIR = "/shots/";
+let img = null, scale = 1, items = [], sel = -1, tool = "roi";
+let drag = null;
+
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const wrap = document.getElementById("wrap"), hint = document.getElementById("hint");
+const log = (m) => document.getElementById("log").textContent = m;
+
+const COLORS = { roi:"#22c55e", point:"#f59e0b", circle:"#3b82f6" };
+const TYPE_LABEL = {};
+[...document.getElementById("type").options].forEach(o => TYPE_LABEL[o.value] = o.text);
+
+fetch("/api/images").then(r=>r.json()).then(d=>{
+  const s = document.getElementById("imgSel");
+  if(!d.images || !d.images.length){ log("shots/ 里没找到截图"); return; }
+  d.images.forEach(n=>{ const o=document.createElement("option"); o.value=n; o.textContent=n; s.appendChild(o); });
+  loadImage();
+  log(`找到 ${d.images.length} 张截图。标注完成后点「保存到项目」。`);
+}).catch(e=>log("加载图片列表失败: "+e));
+
+document.getElementById("imgSel").onchange = loadImage;
+document.getElementById("zoom").oninput = (e)=>{ scale = e.target.value/100; document.getElementById("zoomTxt").textContent = e.target.value+"%"; fitCanvas(); draw(); };
+document.getElementById("showGrid").onchange = draw;
+
+function loadImage(){
+  const n = document.getElementById("imgSel").value;
+  if(!n) return;
+  const im = new Image();
+  im.onload = ()=>{
+    img = im;
+    const maxW = document.getElementById("left").clientWidth - 40;
+    scale = Math.min(1, maxW / im.naturalWidth);
+    document.getElementById("zoom").value = Math.round(scale*100);
+    document.getElementById("zoomTxt").textContent = Math.round(scale*100)+"%";
+    fitCanvas(); draw();
+  };
+  im.onerror = ()=>log("图片加载失败: "+n);
+  im.src = IMG_DIR + encodeURIComponent(n);
+}
+
+function fitCanvas(){
+  if(!img) return;
+  cv.width  = Math.round(img.naturalWidth  * scale);
+  cv.height = Math.round(img.naturalHeight * scale);
+}
+
+function toImg(ev){
+  const r = cv.getBoundingClientRect();
+  return { x:(ev.clientX-r.left)/scale, y:(ev.clientY-r.top)/scale };
+}
+function nx(v){ return +(v/img.naturalWidth ).toFixed(4); }
+function ny(v){ return +(v/img.naturalHeight).toFixed(4); }
+
+cv.addEventListener("mousedown", ev=>{
+  if(!img) return;
+  const p = toImg(ev);
+  if(tool==="roi" || tool==="circle"){ drag = {x0:p.x, y0:p.y, x1:p.x, y1:p.y}; }
+  else {
+    const it = {kind:"point", type:document.getElementById("type").value,
+                name:document.getElementById("name").value || "point_"+(items.length+1),
+                x:nx(p.x), y:ny(p.y)};
+    items.push(it); sel = items.length-1; render(); draw();
+  }
+});
+cv.addEventListener("mousemove", ev=>{
+  if(!img) return;
+  const p = toImg(ev);
+  hint.style.display="block";
+  hint.style.left = (ev.clientX - cv.getBoundingClientRect().left + 14)+"px";
+  hint.style.top  = (ev.clientY - cv.getBoundingClientRect().top  + 14)+"px";
+  hint.textContent = `(${nx(p.x)}, ${ny(p.y)})  px(${Math.round(p.x)}, ${Math.round(p.y)})`;
+  if(drag){
+    drag.x1=p.x; drag.y1=p.y;
+    if(tool==="circle"){
+      hint.textContent += `  r=${Math.round(Math.hypot(drag.x1-drag.x0, drag.y1-drag.y0))}px`;
+    }
+    draw();
+  }
+});
+window.addEventListener("mouseup", ()=>{
+  if(!drag || !img) return;
+  const nm = document.getElementById("name").value || (tool+"_"+(items.length+1));
+  const ty = document.getElementById("type").value;
+  if(tool==="roi"){
+    const x1=Math.min(drag.x0,drag.x1), y1=Math.min(drag.y0,drag.y1);
+    const x2=Math.max(drag.x0,drag.x1), y2=Math.max(drag.y0,drag.y1);
+    if(Math.abs(x2-x1)<3 || Math.abs(y2-y1)<3){ drag=null; draw(); return; }
+    items.push({kind:"roi", type:ty, name:nm, roi:[nx(x1),ny(y1),nx(x2),ny(y2)]});
+  } else {
+    const r = Math.hypot(drag.x1-drag.x0, drag.y1-drag.y0);
+    if(r<4){ drag=null; draw(); return; }
+    items.push({kind:"circle", type:ty, name:nm, cx:nx(drag.x0), cy:ny(drag.y0),
+                r:+(r/Math.min(img.naturalWidth,img.naturalHeight)).toFixed(4)});
+  }
+  sel = items.length-1; drag=null; render(); draw();
+});
+
+document.getElementById("tRoi").onclick    = ()=>setTool("roi");
+document.getElementById("tPoint").onclick  = ()=>setTool("point");
+document.getElementById("tCircle").onclick = ()=>setTool("circle");
+function setTool(t){
+  tool=t;
+  ["tRoi","tPoint","tCircle"].forEach(id=>document.getElementById(id).classList.remove("on"));
+  document.getElementById(t==="roi"?"tRoi":t==="point"?"tPoint":"tCircle").classList.add("on");
+}
+window.addEventListener("keydown", e=>{
+  if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT") return;
+  const k = e.key.toLowerCase();
+  if(k==="b") setTool("roi"); else if(k==="p") setTool("point"); else if(k==="c") setTool("circle");
+  else if(k==="z"){ items.pop(); sel=-1; render(); draw(); }
+  else if(e.key==="Delete" && sel>=0){ items.splice(sel,1); sel=-1; render(); draw(); }
+});
+
+function draw(){
+  if(!img) return;
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.drawImage(img,0,0,cv.width,cv.height);
+  if(document.getElementById("showGrid").checked){
+    ctx.strokeStyle="#ffffff22"; ctx.lineWidth=1;
+    for(let i=1;i<10;i++){
+      const x=cv.width*i/10, y=cv.height*i/10;
+      ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,cv.height); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(cv.width,y); ctx.stroke();
+    }
+    ctx.fillStyle="#ffffff55"; ctx.font="11px monospace";
+    for(let i=1;i<10;i++){ ctx.fillText((i/10).toFixed(1), cv.width*i/10+2, 12); ctx.fillText((i/10).toFixed(1), 3, cv.height*i/10+12); }
+  }
+  items.forEach((it,i)=>{
+    const c = COLORS[it.kind] || "#fff";
+    ctx.strokeStyle=c; ctx.fillStyle=c; ctx.lineWidth = (i===sel?3:1.6);
+    let lx, ly;
+    if(it.kind==="roi"){
+      const [a,b,d,e]=it.roi;
+      const x=a*cv.width, y=b*cv.height, w=(d-a)*cv.width, h=(e-b)*cv.height;
+      ctx.strokeRect(x,y,w,h); lx=x; ly=y;
+      ctx.globalAlpha=.12; ctx.fillRect(x,y,w,h); ctx.globalAlpha=1;
+    } else if(it.kind==="point"){
+      const x=it.x*cv.width, y=it.y*cv.height;
+      ctx.beginPath(); ctx.arc(x,y,6,0,7); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x-11,y); ctx.lineTo(x+11,y); ctx.moveTo(x,y-11); ctx.lineTo(x,y+11); ctx.stroke();
+      lx=x; ly=y;
+    } else {
+      const x=it.cx*cv.width, y=it.cy*cv.height, r=it.r*Math.min(cv.width,cv.height);
+      ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.stroke(); lx=x-r; ly=y-r;
+    }
+    const tag = it.name;
+    ctx.font="12px monospace";
+    const tw = ctx.measureText(tag).width+8;
+    ctx.globalAlpha=.85; ctx.fillRect(lx, Math.max(0,ly-16), tw, 15); ctx.globalAlpha=1;
+    ctx.fillStyle="#0b0e12"; ctx.fillText(tag, lx+4, Math.max(11,ly-4));
+  });
+  if(drag && (tool==="roi"||tool==="circle")){
+    ctx.strokeStyle="#ffd479"; ctx.lineWidth=2; ctx.setLineDash([5,4]);
+    if(tool==="roi"){
+      const x=Math.min(drag.x0,drag.x1)*scale, y=Math.min(drag.y0,drag.y1)*scale;
+      ctx.strokeRect(x,y,Math.abs(drag.x1-drag.x0)*scale,Math.abs(drag.y1-drag.y0)*scale);
+    } else {
+      const x=drag.x0*scale, y=drag.y0*scale, r=Math.hypot(drag.x1-drag.x0,drag.y1-drag.y0)*scale;
+      ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+}
+
+function coordText(it){
+  if(it.kind==="roi")    return `roi=[${it.roi.join(", ")}]`;
+  if(it.kind==="point")  return `point=(${it.x}, ${it.y})`;
+  return `center=(${it.cx}, ${it.cy}) r=${it.r}`;
+}
+
+function render(){
+  const box = document.getElementById("list");
+  box.innerHTML = "";
+  items.forEach((it,i)=>{
+    const d = document.createElement("div");
+    d.className = "item";
+    d.style.borderColor = i===sel ? "#3b82f6" : "#2c333d";
+    d.innerHTML = `<div class="nm">
+        <span style="color:${COLORS[it.kind]};font-weight:700">${i+1}</span>
+        <input value="${it.name.replace(/"/g,'&quot;')}" data-i="${i}" data-k="name">
+        <button class="danger" data-del="${i}">×</button>
+      </div>
+      <div class="ty">${it.kind} · ${TYPE_LABEL[it.type]||it.type}</div>
+      <div class="co">${coordText(it)}</div>`;
+    d.onclick = (e)=>{ if(e.target.tagName==="INPUT"||e.target.tagName==="BUTTON") return; sel=i; render(); draw(); };
+    box.appendChild(d);
+  });
+  box.querySelectorAll("input[data-k=name]").forEach(inp=>{
+    inp.oninput = ()=>{ items[+inp.dataset.i].name = inp.value; draw(); };
+  });
+  box.querySelectorAll("button[data-del]").forEach(b=>{
+    b.onclick = ()=>{ items.splice(+b.dataset.del,1); sel=-1; render(); draw(); };
+  });
+}
+
+function payload(){
+  return { schemaVersion:1, game:"冒险岛世界-阿尔泰", package:"com.nexon.mod",
+           refWidth: img?img.naturalWidth:0, refHeight: img?img.naturalHeight:0,
+           sourceImage: document.getElementById("imgSel").value,
+           calibratedAt: new Date().toISOString(), items: items };
+}
+
+document.getElementById("dl").onclick = ()=>{
+  const blob = new Blob([JSON.stringify(payload(),null,2)],{type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = "calibration.json"; a.click();
+  log("已下载 calibration.json");
+};
+document.getElementById("save").onclick = async ()=>{
+  if(!items.length) return log("还没有任何标定项");
+  try {
+    const r = await fetch("/api/save", {method:"POST", headers:{"Content-Type":"application/json"},
+                                        body: JSON.stringify(payload())});
+    const j = await r.json();
+    log(j.ok ? `已保存 ${j.items} 个标定项到 ${j.path}` : ("保存失败: "+j.error));
+  } catch(e){ log("保存失败: "+e); }
+};
+document.getElementById("clear").onclick = ()=>{
+  if(confirm("清空所有标定项？")){ items=[]; sel=-1; render(); draw(); log("已清空"); }
+};
+render();
+</script>
+</body>
+</html>
