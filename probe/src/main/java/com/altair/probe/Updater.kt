@@ -208,15 +208,25 @@ class Updater(
 
     // ------------------------------------------------------------ 下载
 
-    private fun download(url: String, out: File, onPct: (Int) -> Unit) {
+    private fun download(rawUrl: String, out: File, onPct: (Int) -> Unit) {
         out.delete()
+        // ★ 缓存破坏参数，必须有。
+        // GitHub 的 /releases/latest/download/ 重定向会被 CDN 按 URL 缓存。
+        // 实测：刚发完新版直接请求 latest 会拿到**上一个版本**的 APK，
+        // 结果是「下载到旧包 → 版本不更高 → 提示已是最新 → 静默永不更新」。
+        // 加上每次都不同的时间戳参数即可绕过。
+        val sep = if (rawUrl.contains("?")) "&" else "?"
+        val url = "$rawUrl${sep}_t=${System.currentTimeMillis()}"
         var conn: HttpURLConnection? = null
         try {
             conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 connectTimeout = 20000
                 readTimeout = 60000
                 instanceFollowRedirects = true
+                useCaches = false
                 setRequestProperty("User-Agent", "altair-probe")
+                setRequestProperty("Cache-Control", "no-cache, no-store, must-revalidate")
+                setRequestProperty("Pragma", "no-cache")
             }
             conn.connect()
             val code = conn.responseCode
