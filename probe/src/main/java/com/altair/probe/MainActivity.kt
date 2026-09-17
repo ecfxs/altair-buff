@@ -36,6 +36,9 @@ class MainActivity : Activity() {
     private lateinit var urlField: EditText
     private lateinit var autoChk: CheckBox
     private lateinit var forceChk: CheckBox
+    private lateinit var mgmtField: EditText
+    private lateinit var mgmtChk: CheckBox
+    private val mgmt by lazy { Management(this, ShellCore.root) }
     // 与悬浮窗共用同一套核心（同一个 su 进程、同一份日志）
     private val probe get() = ShellCore.probe
     private val updater get() = ShellCore.updater
@@ -61,6 +64,7 @@ class MainActivity : Activity() {
         appendLine("  ⑥ 按键通道诊断             — 区分「注入失败」还是「游戏不认键」★★★")
         appendLine("  ⑦ 触摸测试                 — 键盘走不通时，验证触摸点击方案")
         appendLine()
+        appendLine("集控：填服务器地址 + 勾选启用，设备会定时上报状态并拉取配置")
         appendLine("自更新：点「自更新(多源)」会自动在 代理/GitHub/jsDelivr 之间切换")
         appendLine("        （实测 GitHub 直连在国内经常不通，故默认走代理）")
         appendLine()
@@ -68,6 +72,7 @@ class MainActivity : Activity() {
         appendLine()
         appendLine("准备就绪。")
         startupUpdateCheck()
+        maybeStartMgmt()
     }
 
     // ------------------------------------------------------------ UI
@@ -162,6 +167,36 @@ class MainActivity : Activity() {
             "按URL更新" to { runUpdateByUrl() },
             "安装本地APK" to { runLocalInstall() },
             "更新日志" to { runShowUpdateLog() }
+        ))
+
+        // ---------------- 集控（多设备统一管理） ----------------
+        mgmtField = EditText(this).apply {
+            hint = "集控服务器地址，如 http://1.2.3.4:8080"
+            setText(mgmt.server)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(Color.parseColor("#C9D4E0"))
+            setHintTextColor(Color.parseColor("#5A6675"))
+            setBackgroundColor(Color.parseColor("#161A20"))
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(6) }
+        }
+        root.addView(mgmtField)
+
+        mgmtChk = CheckBox(this).apply {
+            text = "启用集控定期上报（设备主动上报+拉配置，云手机在NAT后只能这么做）"
+            isChecked = mgmt.enabled
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            setTextColor(Color.parseColor("#8FA3B8"))
+        }
+        root.addView(mgmtChk)
+
+        root.addView(buttonRow(
+            "上报一次" to { runMgmtReport() },
+            "拉取配置" to { runMgmtPull() },
+            "设备ID" to { runShowDeviceId() }
         ))
 
         val scroll = ScrollView(this).apply {
@@ -312,6 +347,42 @@ class MainActivity : Activity() {
             )
         }
         return false
+    }
+
+    // ------------------------------------------------------------ 集控
+
+    private fun runMgmtReport() {
+        mgmt.server = mgmtField.text.toString()
+        mgmt.enabled = mgmtChk.isChecked
+        appendLine()
+        appendLine("--- 集控：上报一次 ---")
+        background("集控上报") {
+            val r = mgmt.reportOnce()
+            runOnUiThread { r.split('\n').forEach { appendLine(it) } }
+        }
+    }
+
+    private fun runMgmtPull() {
+        mgmt.server = mgmtField.text.toString()
+        appendLine()
+        appendLine("--- 集控：拉取配置 ---")
+        background("集控拉配置") {
+            val r = mgmt.pullConfigOnce()
+            runOnUiThread { r.split('\n').forEach { appendLine(it) } }
+        }
+    }
+
+    private fun runShowDeviceId() {
+        appendLine()
+        appendLine("设备ID: ${mgmt.deviceId}")
+        appendLine("（把这个填进集控服务器的设备列表，即可按设备下发不同配置）")
+    }
+
+    /** 若勾选了集控，进入前台时启动上报循环。 */
+    private fun maybeStartMgmt() {
+        mgmt.server = mgmtField.text.toString()
+        mgmt.enabled = mgmtChk.isChecked
+        if (mgmt.enabled) mgmt.start() else mgmt.stop()
     }
 
     // ------------------------------------------------------------ Root 权限
@@ -570,6 +641,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         runCatching { LogBus.remove(logListener) }
+        runCatching { mgmt.stop() }
         // 注意：不在这里关闭 root shell —— 悬浮窗可能还在用同一个 ShellCore.root
     }
 }

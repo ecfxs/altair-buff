@@ -24,6 +24,7 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import org.json.JSONArray
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -60,6 +61,44 @@ class OverlayService : Service() {
 
         fun stop(ctx: Context) {
             ctx.stopService(Intent(ctx, OverlayService::class.java))
+        }
+
+        private fun prefs(ctx: Context) = ctx.getSharedPreferences("overlay", Context.MODE_PRIVATE)
+
+        // ---- 供集控（Management）读写的静态入口 ----
+        // 集控下发配置时需要改这些值，但它是另一个类，拿不到 Service 实例，
+        // 所以走 SharedPreferences 这个共享存储，下次服务启动/刷新时生效。
+
+        /** 读取门禁目标包名。 */
+        fun targetPkgOf(ctx: Context): String =
+            prefs(ctx).getString("targetPkg", "com.nexon.mod") ?: "com.nexon.mod"
+
+        /** 写入门禁目标包名。 */
+        fun setTargetPkgOf(ctx: Context, pkg: String) {
+            prefs(ctx).edit().putString("targetPkg", pkg).apply()
+        }
+
+        /** 保存采集点（集控下发后，重启悬浮窗即可用新坐标）。 */
+        fun savePickedPointsOf(ctx: Context, pts: List<Pair<Float, Float>>) {
+            val arr = JSONArray()
+            pts.forEach { (x, y) ->
+                arr.put(JSONArray().put(x.toDouble()).put(y.toDouble()))
+            }
+            prefs(ctx).edit().putString("pickedPoints", arr.toString()).apply()
+        }
+
+        /** 读取采集点。 */
+        fun pickedPointsOf(ctx: Context): List<Pair<Float, Float>> {
+            val raw = prefs(ctx).getString("pickedPoints", "") ?: ""
+            if (raw.isBlank()) return emptyList()
+            return runCatching {
+                val arr = JSONArray(raw)
+                (0 until arr.length()).mapNotNull { i ->
+                    val p = arr.optJSONArray(i) ?: return@mapNotNull null
+                    if (p.length() < 2) null
+                    else p.optDouble(0).toFloat() to p.optDouble(1).toFloat()
+                }
+            }.getOrDefault(emptyList())
         }
     }
 
@@ -115,7 +154,8 @@ class OverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         ShellCore.init(this)
-        targetPkg = prefs().getString("targetPkg", "com.nexon.mod") ?: "com.nexon.mod"
+        targetPkg = targetPkgOf(this)
+        lastPicks = pickedPointsOf(this)
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         startForeground(NOTIF_ID, buildNotification())
         LogBus.add(logListener)
@@ -537,6 +577,7 @@ class OverlayService : Service() {
         runCatching { wm.removeView(v) }
         pickView = null
         lastPicks = v.points.toList()      // 关掉后仍能用来「点N」
+        runCatching { savePickedPointsOf(this, lastPicks) }   // 持久化，重启后仍在
         LogBus.emit("采点模式：已关闭，共 ${lastPicks.size} 个点")
         LogBus.emit(v.export())
         // 面板可能因为日志变长而需要重排，刷新一下状态

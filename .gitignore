@@ -23,3 +23,7 @@ shots/
 .DS_Store
 *.swp
 *~
+
+# 集控服务器的运行时存储（含设备状态与配置，不入库）
+tools/control-store.json
+
