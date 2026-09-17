@@ -154,7 +154,7 @@ echo
 echo " 回滚用版本地址:"
 echo "   $PINNED"
 echo
-echo " 各源当前提供的 versionCode（期望 = $NEW_CODE_FINAL）:"
+echo " 各源当前提供的 versionCode（期望 = ${NEW_CODE_FINAL}）:"
 printf "   %-12s %s\n" "gh-proxy" "$(ver_of "https://gh-proxy.com/$LATEST")"
 printf "   %-12s %s\n" "ghfast"   "$(ver_of "https://ghfast.top/$LATEST")"
 printf "   %-12s %s\n" "GitHub"  "$(ver_of "$LATEST")"
