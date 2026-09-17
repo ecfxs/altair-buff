@@ -493,6 +493,7 @@ class Probe(private val ctx: Context, private val log: (String) -> Unit) {
 
         val sb = StringBuilder()
         sb.append("$keyLabel (code=$keycode) × $times 次，间隔 ${gapSec}s\n")
+        sb.append("发送前焦点窗口: ${focusedWindow()}\n")
         val ts = ArrayList<Long>()
         for (i in 1..times) {
             val (ms, err) = sh.timedExec("input keyevent $keycode", 6000)
@@ -544,6 +545,118 @@ class Probe(private val ctx: Context, private val log: (String) -> Unit) {
         }
         sb.append("→ 角色若来回移动了，方向键连发方案成立 ✅\n")
         sb.append("→ 只动一下就停：需要改用 keyHold 或提高连发频率\n")
+        return sb.toString()
+    }
+
+    // ------------------------------------------------------------ 按键通道诊断
+
+    /**
+     * 当前有输入焦点的窗口。
+     *
+     * 这是判断「按键到底发给了谁」的唯一可靠依据。
+     * 如果发键时焦点不在游戏上，那"按键无效"就跟游戏绑不绑定键无关了。
+     */
+    fun focusedWindow(): String {
+        if (!rootOk) return "(无 root)"
+        val a = sh.exec("dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -4", 6000)
+        val b = sh.exec("dumpsys activity activities 2>/dev/null | grep -E 'topResumedActivity|mResumedActivity' | head -2", 6000)
+        val t = (a + "\n" + b).lines().map { it.trim() }.filter { it.isNotEmpty() }
+            .distinct().joinToString(" | ")
+        return t.ifEmpty { "(取不到焦点信息)" }
+    }
+
+    /**
+     * 按键通道诊断：区分「注入没生效」与「游戏不认这些键」。
+     *
+     * 设计要点：
+     *   - 顺序很重要：先发游戏用的数字键（此时游戏应在前台），
+     *     再发 BACK（游戏通常会弹退出确认），
+     *     **最后**才发 HOME（会离开游戏，所以放最后）。
+     *   - 每一步都记录焦点窗口，这样即使结果异常也能定位原因。
+     */
+    fun keyDiagnostics(delaySec: Int): String {
+        if (!rootOk) return "无 root，无法诊断"
+        try { Thread.sleep(delaySec * 1000L) } catch (_: InterruptedException) {}
+
+        val sb = StringBuilder()
+        sb.append("按键通道诊断\n")
+        sb.append("起始焦点: ${focusedWindow()}\n\n")
+
+        // 第一步：数字键 1（游戏该响应的键）
+        sb.append("【1】数字键1 (KEYCODE_1=8) —— 期望：游戏放出技能\n")
+        repeat(3) { i ->
+            val (ms, err) = sh.timedExec("input keyevent 8", 6000)
+            sb.append("    第 ${i + 1} 次: ${ms}ms  ${err.take(40)}\n")
+            try { Thread.sleep(2500) } catch (_: InterruptedException) {}
+        }
+
+        // 第二步：BACK —— 游戏通常会弹「确认退出」
+        sb.append("\n【2】返回键 (KEYCODE_BACK=4) —— 期望：游戏弹退出确认\n")
+        val (bms, berr) = sh.timedExec("input keyevent 4", 6000)
+        sb.append("    ${bms}ms  ${berr.take(40)}\n")
+        try { Thread.sleep(2500) } catch (_: InterruptedException) {}
+
+        // 第三步：HOME —— 系统级，任何环境都该响应。放最后，因为它会离开游戏
+        sb.append("\n【3】Home 键 (KEYCODE_HOME=3) —— 期望：云手机回到桌面\n")
+        val (hms, herr) = sh.timedExec("input keyevent 3", 6000)
+        sb.append("    ${hms}ms  ${herr.take(40)}\n")
+        try { Thread.sleep(2000) } catch (_: InterruptedException) {}
+        sb.append("发送后焦点: ${focusedWindow()}\n")
+
+        sb.append(
+            """
+            |
+            |=== 怎么读这个结果 ===
+            |  · Home 生效（回桌面了）  → 注入通道正常 ✅
+            |      那「数字键无效」= 游戏不绑定这些键
+            |      → 必须改用触摸点击（需要标定技能键坐标）
+            |  · Home 也没反应          → input 注入被环境限制
+            |      → 改用 sendevent 底层注入，或直接走触摸
+            |  · Home 生效且 BACK 也生效 → 通道完全正常，纯粹是游戏键位问题
+            """.trimMargin()
+        )
+        return sb.toString()
+    }
+
+    /**
+     * 触摸通道测试：在「右侧中部技能键排」的估计位置上依次点击。
+     * 用来验证触摸可用性，同时顺便验证我此前对技能键位置的估计对不对。
+     */
+    fun tapTest(delaySec: Int): String {
+        if (!rootOk) return "无 root"
+        try { Thread.sleep(delaySec * 1000L) } catch (_: InterruptedException) {}
+
+        // 先截一帧拿到**当前真实方向**的尺寸（游戏横屏时是 1280x720）
+        val ref = File(cache, "tapref.raw")
+        ref.delete()
+        sh.timedExec("screencap -d ${if (bestDisplayId >= 0) bestDisplayId else 0} ${ref.absolutePath}", 10000)
+        val hdr = parseRawHeader(ref)
+        val w = hdr?.get(0) ?: 1280
+        val h = hdr?.get(1) ?: 720
+
+        val sb = StringBuilder()
+        sb.append("触摸测试\n")
+        sb.append("当前采集尺寸 ${w} x ${h} → ${if (w > h) "横屏（与游戏一致）" else "竖屏 ⚠ 游戏可能不在前台"}\n")
+        sb.append("焦点: ${focusedWindow()}\n\n")
+
+        // 估计的技能键排：y≈0.578，x 从 0.725 起每 0.034 一个
+        val y = 0.5778
+        val xs = listOf(0.7250, 0.7594, 0.7937, 0.8280)
+        for ((i, x) in xs.withIndex()) {
+            val px = (x * w).toInt()
+            val py = (y * h).toInt()
+            val (ms, err) = sh.timedExec("input tap $px $py", 6000)
+            sb.append("  点击 ${i + 1}: (${px}, ${py})  归一化(${x}, ${y})  ${ms}ms  ${err.take(30)}\n")
+            try { Thread.sleep(2500) } catch (_: InterruptedException) {}
+        }
+        sb.append(
+            """
+            |
+            |→ 有技能被放出来：触摸通道可用，且技能键位置估计正确 ✅
+            |→ 完全没反应：要么位置不对，要么触摸也受限
+            |   （位置可用 tools/calibrate 标定工具重新框，我给你换算成坐标）
+            """.trimMargin()
+        )
         return sb.toString()
     }
 

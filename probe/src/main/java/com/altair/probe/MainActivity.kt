@@ -53,7 +53,9 @@ class MainActivity : Activity() {
         appendLine("  ② 连续截图 5s           — 持续采样率")
         appendLine("  ③ 采集压测              — PNG vs RAW 时延对比（决定走位能否闭环）")
         appendLine("  ④ 游戏中截图(10s)       — 点完立刻切到游戏，验证游戏画面可截")
-        appendLine("  ⑤/⑥ 游戏中按键/走位测试   — 点完立刻切到游戏，到点自动重复发送")
+        appendLine("  ⑤ 游戏中按键测试           — 验证游戏是否响应数字键")
+        appendLine("  ⑥ 按键通道诊断             — 区分「注入失败」还是「游戏不认键」★★★")
+        appendLine("  ⑦ 触摸测试                 — 键盘走不通时，验证触摸点击方案")
         appendLine()
         appendLine("注意：探测会反复执行 screencap，游戏会短暂卡顿，属正常。")
         appendLine()
@@ -94,14 +96,15 @@ class MainActivity : Activity() {
         root.addView(buttonRow(
             "④ 游戏中截图(10s)" to { runDelayed(10) },
             "⑤ 游戏中按键测试" to { runGameKeys() },
-            "⑥ 游戏中走位测试" to { runGameWalk() }
+            "⑥ 按键通道诊断" to { runKeyDiag() }
         ))
         root.addView(buttonRow(
+            "⑦ 触摸测试(10s)" to { runTapTest() },
             "复制报告" to { copyReport() },
-            "分享/导出" to { shareReport() },
             "保存到文件" to { saveReport() }
         ))
         root.addView(buttonRow(
+            "分享/导出" to { shareReport() },
             "清空" to { body.removeAllViews(); appendLine("已清空。") }
         ))
 
@@ -322,6 +325,43 @@ class MainActivity : Activity() {
                 appendLine("--- 游戏中按键测试结果 ---")
                 r.split('\n').forEach { appendLine(it) }
                 toast("按键测试结束")
+            }
+        }
+    }
+
+    /**
+     * 按键通道诊断 —— 用来区分「注入没生效」与「游戏不认这些键」。
+     * 点完立刻切到游戏。最后会发 Home 键，云手机会回桌面，属正常。
+     */
+    private fun runKeyDiag() {
+        val delay = 10
+        appendLine()
+        appendLine(">>> 已启动：$delay 秒后依次发送 数字键1×3 → 返回键 → Home键 <<<")
+        appendLine(">>> 请立刻切到游戏。最后会回桌面（Home 键），属正常 <<<")
+        background("按键通道诊断") {
+            val r = probe.keyDiagnostics(delay)
+            runOnUiThread {
+                appendLine()
+                appendLine("--- 按键通道诊断结果 ---")
+                r.split('\n').forEach { appendLine(it) }
+                toast("诊断结束")
+            }
+        }
+    }
+
+    /** 触摸通道测试：在估计的技能键排上依次点击 4 个位置。 */
+    private fun runTapTest() {
+        val delay = 10
+        appendLine()
+        appendLine(">>> 已启动：$delay 秒后依次点击右侧技能键排的 4 个估计位置 <<<")
+        appendLine(">>> 请立刻切到游戏，观察是否有技能被放出来 <<<")
+        background("触摸测试") {
+            val r = probe.tapTest(delay)
+            runOnUiThread {
+                appendLine()
+                appendLine("--- 触摸测试结果 ---")
+                r.split('\n').forEach { appendLine(it) }
+                toast("触摸测试结束")
             }
         }
     }
