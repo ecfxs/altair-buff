@@ -685,6 +685,47 @@ class Probe(
         return sb.toString()
     }
 
+    // ------------------------------------------------------------ 按键扫描
+
+    /**
+     * 按键扫描。
+     *
+     * 背景：实机已证明 **方向键生效** → `input keyevent` 能送达游戏，游戏也处理 KeyEvent。
+     * 那「数字键1无效」就只有一种解释：**游戏没把技能绑在 KEYCODE_1 上**。
+     *
+     * 既然通道是通的，就直接把常见动作键挨个试一遍，找出真正能触发技能的那个。
+     * 每个键之间有间隔，日志会先打印"即将发送 XXX"，方便你盯着游戏看是哪一个生效。
+     */
+    fun keyScan(delaySec: Int, gapMs: Int = 2200): String {
+        if (!ensureShell()) return "无 root"
+        try { Thread.sleep(delaySec * 1000L) } catch (_: InterruptedException) {}
+
+        // 候选键：数字 1-8、字母常用键、以及各种修饰/动作键
+        val candidates = listOf(
+            "数字1" to 8, "数字2" to 9, "数字3" to 10, "数字4" to 11,
+            "数字5" to 12, "数字6" to 13, "数字7" to 14, "数字8" to 15,
+            "Q" to 45, "W" to 51, "E" to 33, "R" to 46,
+            "A" to 29, "S" to 47, "D" to 32, "F" to 34,
+            "空格" to 62, "回车" to 66, "Tab" to 61,
+            "左Shift" to 59, "左Ctrl" to 113, "左Alt" to 57,
+            "Z" to 54, "X" to 52, "C" to 31, "V" to 50, "B" to 30
+        )
+
+        val sb = StringBuilder()
+        sb.append("按键扫描：共 ${candidates.size} 个候选，每个间隔 ${gapMs}ms\n")
+        sb.append("请盯着游戏，记下**哪一个**让技能放出来了。\n\n")
+        sb.append("焦点: ").append(focusedWindow()).append("\n\n")
+
+        for ((name, code) in candidates) {
+            val (ms, _) = sh.timedExec("input keyevent $code", 6000)
+            sb.append("  发 ${name} (code=$code)  ${ms}ms\n")
+            try { Thread.sleep(gapMs.toLong()) } catch (_: InterruptedException) {}
+        }
+        sb.append("\n→ 把「哪一个生效了」告诉我，我把它写进配置。\n")
+        sb.append("→ 若全部无效，说明技能确实只能靠触摸，那就继续走采点+触摸方案。\n")
+        return sb.toString()
+    }
+
     // ------------------------------------------------------------ 触摸点击（键盘走不通时的方案）
 
     /**
@@ -694,7 +735,7 @@ class Probe(
      * 这样归一化坐标换算永远正确，不会因方向变化而点偏。
      * 代价是每次多约 200ms —— 手动测试完全可接受。
      */
-    fun tapNorm(nx: Double, ny: Double, label: String = ""): String {
+    fun tapNorm(nx: Double, ny: Double, label: String = "", pressMs: Int = 90): String {
         if (!ensureShell()) return "无 root"
         val d = if (bestDisplayId >= 0) bestDisplayId else 0
         val ref = File(cache, "tapref.raw")
@@ -705,12 +746,20 @@ class Probe(
         val h = hdr?.get(1) ?: 720
         val px = (nx * w).toInt().coerceIn(0, w - 1)
         val py = (ny * h).toInt().coerceIn(0, h - 1)
-        val (ms, err) = sh.timedExec("input tap $px $py", 8000)
+
+        // ★ 关键：不要用 `input tap`。
+        // tap 发出的 DOWN/UP 时间戳几乎相同（0ms），很多游戏有「最短按压时长」判定，
+        // 会把这种 0ms 点击当成无效输入直接丢弃。
+        // `input swipe x y x y D` 是同一个点出发再回到同一个点，能精确控制按住 D 毫秒，
+        // 这才是游戏认得的「真实点击」。
+        val cmd = if (pressMs > 0) "input swipe $px $py $px $py $pressMs"
+                  else "input tap $px $py"
+        val (ms, err) = sh.timedExec(cmd, 8000)
         val tag = if (label.isBlank()) "" else "[$label] "
         val nx4 = "%.4f".format(nx)
         val ny4 = "%.4f".format(ny)
         // 注意：Kotlin 允许中文作标识符，所以 "$tag点击" 会被当成变量名 —— 必须加花括号
-        return "${tag}点击 ($px, $py)  归一化($nx4, $ny4)  画面 ${w}x${h}  ${ms}ms  ${err.take(40)}"
+        return "${tag}点击 ($px, $py)  归一化($nx4, $ny4)  画面 ${w}x${h}  按压 ${pressMs}ms  ${ms}ms  ${err.take(40)}"
     }
 
     // ------------------------------------------------------------ 按键通道诊断
@@ -804,14 +853,18 @@ class Probe(
         sb.append("当前采集尺寸 ${w} x ${h} → ${if (w > h) "横屏（与游戏一致）" else "竖屏 ⚠ 游戏可能不在前台"}\n")
         sb.append("焦点: ${focusedWindow()}\n\n")
 
-        // 估计的技能键排：y≈0.578，x 从 0.725 起每 0.034 一个
-        val y = 0.5778
-        val xs = listOf(0.7250, 0.7594, 0.7937, 0.8280)
-        for ((i, x) in xs.withIndex()) {
-            val px = (x * w).toInt()
-            val py = (y * h).toInt()
-            val (ms, err) = sh.timedExec("input tap $px $py", 6000)
-            sb.append("  点击 ${i + 1}: (${px}, ${py})  归一化(${x}, ${y})  ${ms}ms  ${err.take(30)}\n")
+        // 用 v0.13 实机采点得到的**真实**技能键坐标（此前推算的位置偏左了）
+        val pts = listOf(
+            0.7416 to 0.5673,
+            0.8041 to 0.5756,
+            0.8649 to 0.5673,
+            0.9180 to 0.5728
+        )
+        for ((i, p) in pts.withIndex()) {
+            val px = (p.first * w).toInt()
+            val py = (p.second * h).toInt()
+            val (ms, err) = sh.timedExec("input swipe $px $py $px $py 90", 6000)
+            sb.append("  点击 ${i + 1}: (${px}, ${py})  ${ms}ms  ${err.take(30)}\n")
             try { Thread.sleep(2500) } catch (_: InterruptedException) {}
         }
         sb.append(

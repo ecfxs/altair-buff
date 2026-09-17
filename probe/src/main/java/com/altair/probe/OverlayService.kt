@@ -205,7 +205,11 @@ class OverlayService : Service() {
             "点4" to { tapPick(3) }
         ))
         root.addView(row(
-            "复制日志" to { copyLog() },
+            "键扫描" to { act("键扫描") { ShellCore.probe.keyScan(3) } },
+            "点1长按" to { tapPick(0, 250) },
+            "复制日志" to { copyLog() }
+        ))
+        root.addView(row(
             "隐藏面板" to { hidePanel() }
         ))
 
@@ -364,7 +368,7 @@ class OverlayService : Service() {
     }
 
     /** 点击第 idx 个采集点（从 0 开始）。 */
-    private fun tapPick(idx: Int) {
+    private fun tapPick(idx: Int, pressMs: Int = 90) {
         val v = pickView
         // 采点层开着时也能点：先从它拿；关掉时从最后一次的副本拿
         val pts = v?.points ?: lastPicks
@@ -373,7 +377,9 @@ class OverlayService : Service() {
             return
         }
         val (nx, ny) = pts[idx]
-        act("点${idx + 1}") { ShellCore.probe.tapNorm(nx.toDouble(), ny.toDouble(), "点${idx + 1}") }
+        act("点${idx + 1}") {
+            ShellCore.probe.tapNorm(nx.toDouble(), ny.toDouble(), "点${idx + 1}", pressMs)
+        }
     }
 
     // ------------------------------------------------------------ ROI 覆盖层    // ------------------------------------------------------------ ROI 覆盖层
@@ -449,7 +455,8 @@ class RoiView(ctx: Context) : View(ctx) {
     private val rois = listOf(
         Triple("小地图", floatArrayOf(0.0023f, 0.1097f, 0.1477f, 0.2958f), Color.parseColor("#FF3BD16F")),
         Triple("HUD血条", floatArrayOf(0.4289f, 0.8958f, 0.5711f, 0.9125f), Color.parseColor("#FFFF4444")),
-        Triple("技能键带", floatArrayOf(0.7000f, 0.5417f, 0.9500f, 0.6139f), Color.parseColor("#FFFFC53D"))
+        // 技能键带：边界由 v0.13 实机采点结果反推（不再是最初的推算值）
+        Triple("技能键带", floatArrayOf(0.7150f, 0.5350f, 0.9500f, 0.6150f), Color.parseColor("#FFFFC53D"))
     )
 
     override fun onDraw(canvas: Canvas) {
@@ -457,9 +464,13 @@ class RoiView(ctx: Context) : View(ctx) {
         val h = height.toFloat()
         if (w <= 0 || h <= 0) return
 
-        // 技能键排的 4 个估计位置
-        val skillXs = floatArrayOf(0.7250f, 0.7594f, 0.7937f, 0.8280f)
-        val skillY = 0.5778f
+        // 技能键 4 个位置 —— **实机采点实测值**（此前推算的偏左了约 0.06）
+        val skillPts = arrayOf(
+            0.7416f to 0.5673f,
+            0.8041f to 0.5756f,
+            0.8649f to 0.5673f,
+            0.9180f to 0.5728f
+        )
 
         // 归一化 1/10 网格（细线，帮助读数）
         stroke.strokeWidth = 1f
@@ -484,8 +495,8 @@ class RoiView(ctx: Context) : View(ctx) {
         // 技能键位置点
         stroke.color = Color.parseColor("#FFFFC53D")
         stroke.strokeWidth = 3f
-        for (x in skillXs) {
-            val cx = x * w; val cy = skillY * h
+        for ((x, y) in skillPts) {
+            val cx = x * w; val cy = y * h
             canvas.drawCircle(cx, cy, 16f, stroke)
             canvas.drawLine(cx - 26f, cy, cx + 26f, cy, stroke)
             canvas.drawLine(cx, cy - 26f, cx, cy + 26f, stroke)
