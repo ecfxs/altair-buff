@@ -685,6 +685,34 @@ class Probe(
         return sb.toString()
     }
 
+    // ------------------------------------------------------------ 触摸点击（键盘走不通时的方案）
+
+    /**
+     * 在归一化坐标处点击。
+     *
+     * 每次都先截一帧拿到**当前真实方向**的尺寸（横屏 1280x720 / 竖屏 720x1280），
+     * 这样归一化坐标换算永远正确，不会因方向变化而点偏。
+     * 代价是每次多约 200ms —— 手动测试完全可接受。
+     */
+    fun tapNorm(nx: Double, ny: Double, label: String = ""): String {
+        if (!ensureShell()) return "无 root"
+        val d = if (bestDisplayId >= 0) bestDisplayId else 0
+        val ref = File(cache, "tapref.raw")
+        ref.delete()
+        sh.timedExec("screencap -d $d ${ref.absolutePath}", 12000)
+        val hdr = parseRawHeader(ref)
+        val w = hdr?.get(0) ?: 1280
+        val h = hdr?.get(1) ?: 720
+        val px = (nx * w).toInt().coerceIn(0, w - 1)
+        val py = (ny * h).toInt().coerceIn(0, h - 1)
+        val (ms, err) = sh.timedExec("input tap $px $py", 8000)
+        val tag = if (label.isBlank()) "" else "[$label] "
+        val nx4 = "%.4f".format(nx)
+        val ny4 = "%.4f".format(ny)
+        // 注意：Kotlin 允许中文作标识符，所以 "$tag点击" 会被当成变量名 —— 必须加花括号
+        return "${tag}点击 ($px, $py)  归一化($nx4, $ny4)  画面 ${w}x${h}  ${ms}ms  ${err.take(40)}"
+    }
+
     // ------------------------------------------------------------ 按键通道诊断
 
     /**

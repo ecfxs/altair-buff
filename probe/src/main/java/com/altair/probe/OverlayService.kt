@@ -63,6 +63,8 @@ class OverlayService : Service() {
     private lateinit var wm: WindowManager
     private var panel: View? = null
     private var roiView: RoiView? = null
+    private var pickView: PickView? = null
+    private var lastPicks: List<Pair<Float, Float>> = emptyList()
     private var statusTv: TextView? = null
     private var logTv: TextView? = null
     private var selfBtn: Button? = null
@@ -182,20 +184,27 @@ class OverlayService : Service() {
         // ---- 按钮 ----
         root.addView(row(
             "截图" to { act("截图") { ShellCore.probe.quickCapture() } },
-            "数字键1" to { act("数字键1") { ShellCore.probe.sendKey(8) } },
-            "方向→" to { act("方向右") { ShellCore.probe.sendKey(22) } }
-        ))
-        root.addView(row(
-            "方向←" to { act("方向左") { ShellCore.probe.sendKey(21) } },
             "按键诊断" to { act("按键诊断") { ShellCore.probe.keyDiagnostics(3) } },
-            "触摸×4" to { act("触摸测试") { ShellCore.probe.tapTest(3) } }
+            "申请Root" to { act("申请Root") { ShellCore.probe.requestRoot() } }
         ))
         root.addView(row(
-            "ROI显示" to { toggleRoi() },
-            "申请Root" to { act("申请Root") { ShellCore.probe.requestRoot() } },
-            "复制日志" to { copyLog() }
+            "数字键1" to { act("数字键1") { ShellCore.probe.sendKey(8) } },
+            "方向→" to { act("方向右") { ShellCore.probe.sendKey(22) } },
+            "方向←" to { act("方向左") { ShellCore.probe.sendKey(21) } }
         ))
         root.addView(row(
+            "★采点" to { togglePick() },
+            "清点" to { clearPicks() },
+            "ROI显示" to { toggleRoi() }
+        ))
+        root.addView(row(
+            "点1" to { tapPick(0) },
+            "点2" to { tapPick(1) },
+            "点3" to { tapPick(2) },
+            "点4" to { tapPick(3) }
+        ))
+        root.addView(row(
+            "复制日志" to { copyLog() },
             "隐藏面板" to { hidePanel() }
         ))
 
@@ -297,7 +306,68 @@ class OverlayService : Service() {
         LogBus.emit("已复制日志到剪贴板（${LogBus.dump().length} 字）")
     }
 
-    // ------------------------------------------------------------ ROI 覆盖层
+    // ------------------------------------------------------------ 坐标采集
+
+    /**
+     * 切换坐标采集模式。
+     *
+     * 打开后铺一层**全屏透明可触摸**的覆盖层：你直接在游戏画面上点技能键的位置，
+     * 每次点击都会被记录并画上编号。采点期间游戏收不到点击（正好，不该有副作用）。
+     * 采完点切换回来，就能用「点1..点4」按采集到的坐标做触摸测试。
+     */
+    private fun togglePick() {
+        if (pickView != null) { stopPick(); return }
+        val v = PickView(this)
+        v.onPick = { idx, nx, ny ->
+            LogBus.emit("采点 $idx: [%.4f, %.4f]".format(nx, ny))
+        }
+        val p = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            overlayType(),
+            // 可触摸（要接收点击）但不吃焦点（否则会抢游戏输入焦点）
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        )
+        runCatching { wm.addView(v, p) }
+            .onSuccess {
+                pickView = v
+                LogBus.emit("采点模式：已开启 —— 请直接在游戏画面上依次点技能键的位置（1、2、3…）")
+            }
+            .onFailure { LogBus.emit("采点层添加失败: ${it.message}") }
+    }
+
+    private fun stopPick() {
+        val v = pickView ?: return
+        runCatching { wm.removeView(v) }
+        pickView = null
+        lastPicks = v.points.toList()      // 关掉后仍能用来「点N」
+        LogBus.emit("采点模式：已关闭，共 ${lastPicks.size} 个点")
+        LogBus.emit(v.export())
+        // 面板可能因为日志变长而需要重排，刷新一下状态
+        ui.post { refreshStatus() }
+    }
+
+    private fun clearPicks() {
+        pickView?.clearAll()
+        LogBus.emit("已清空采集点")
+    }
+
+    /** 点击第 idx 个采集点（从 0 开始）。 */
+    private fun tapPick(idx: Int) {
+        val v = pickView
+        // 采点层开着时也能点：先从它拿；关掉时从最后一次的副本拿
+        val pts = v?.points ?: lastPicks
+        if (idx >= pts.size) {
+            LogBus.emit("点${idx + 1}：还没采集到该位置（当前共 ${pts.size} 个）")
+            return
+        }
+        val (nx, ny) = pts[idx]
+        act("点${idx + 1}") { ShellCore.probe.tapNorm(nx.toDouble(), ny.toDouble(), "点${idx + 1}") }
+    }
+
+    // ------------------------------------------------------------ ROI 覆盖层    // ------------------------------------------------------------ ROI 覆盖层
 
     private fun toggleRoi() {
         if (roiView != null) {
