@@ -25,9 +25,12 @@ import kotlin.math.sqrt
  *
  * 所有探测都只读或只写自己 cache 目录，除「测试按键」外无副作用。
  */
-class Probe(private val ctx: Context, private val log: (String) -> Unit) {
-
-    private val sh = RootShell()
+class Probe(
+    private val ctx: Context,
+    /** 由外部注入的常驻 root shell —— Activity 与悬浮窗共用同一个 su 进程。 */
+    private val sh: RootShell,
+    private val log: (String) -> Unit
+) {
     private val rep = StringBuilder()
 
     // 供 UI 与结论使用
@@ -45,8 +48,12 @@ class Probe(private val ctx: Context, private val log: (String) -> Unit) {
     /** 暴露常驻 shell 给自更新模块复用，避免开第二个 su 进程。 */
     val shell: RootShell get() = sh
 
-    /** 确保常驻 root shell 已建立。 */
-    fun ensureShell(): Boolean = if (sh.isAlive) true else sh.open()
+    /** 确保常驻 root shell 已建立（并同步 rootOk，供只走悬浮窗、没跑过完整探测的场景）。 */
+    fun ensureShell(): Boolean {
+        if (sh.isAlive) { rootOk = true; return true }
+        rootOk = sh.open()
+        return rootOk
+    }
 
     // ------------------------------------------------------------ 输出辅助
 
@@ -545,6 +552,32 @@ class Probe(private val ctx: Context, private val log: (String) -> Unit) {
         }
         sb.append("→ 角色若来回移动了，方向键连发方案成立 ✅\n")
         sb.append("→ 只动一下就停：需要改用 keyHold 或提高连发频率\n")
+        return sb.toString()
+    }
+
+    /**
+     * 悬浮窗用的快速截图：一次报告分辨率/方向/方差/熵/黑屏判定 + 当前焦点窗口。
+     * 用来在游戏画面上随时确认「画面截得到吗」「现在谁在前台」。
+     */
+    fun quickCapture(): String {
+        if (!ensureShell()) return "无 root"
+        val d = if (bestDisplayId >= 0) bestDisplayId else 0
+        val f = File(cache, "quick.raw")
+        f.delete()
+        val (ms, err) = sh.timedExec("screencap -d $d ${f.absolutePath}", 12000)
+        val sb = StringBuilder()
+        sb.append("焦点: ").append(focusedWindow()).append('\n')
+        val hdr = parseRawHeader(f)
+        if (hdr == null) {
+            sb.append("raw 截图失败 ${ms}ms  ${err.take(60)}")
+            return sb.toString()
+        }
+        val w = hdr[0]; val h = hdr[1]
+        sb.append("截图 ${w}x${h} ${if (w > h) "横屏（与游戏一致）" else "竖屏 ⚠ 游戏可能不在前台"}  ${ms}ms\n")
+        analyzeRaw(f, hdr)?.let {
+            sb.append("方差=${fmt(it[0])} 熵=${fmt(it[1])} → ")
+            sb.append(if (isBlack(it[0], it[1])) "★ 黑屏/纯色 ⚠" else "有内容 ✅")
+        }
         return sb.toString()
     }
 

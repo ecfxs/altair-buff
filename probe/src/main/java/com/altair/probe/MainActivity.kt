@@ -36,15 +36,19 @@ class MainActivity : Activity() {
     private lateinit var urlField: EditText
     private lateinit var autoChk: CheckBox
     private lateinit var forceChk: CheckBox
-    private val probe by lazy { Probe(this) { line -> runOnUiThread { appendLine(line) } } }
-    private val updater by lazy {
-        Updater(this, probe.shell) { line -> runOnUiThread { appendLine(line) } }
-    }
+    // 与悬浮窗共用同一套核心（同一个 su 进程、同一份日志）
+    private val probe get() = ShellCore.probe
+    private val updater get() = ShellCore.updater
+
+    /** LogBus 的监听器：把日志渲染到界面。 */
+    private val logListener: (String) -> Unit = { line -> runOnUiThread { renderLine(line) } }
     private var busy = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ShellCore.init(this)
         buildUi()
+        LogBus.add(logListener)
         appendLine("P0 探测工具 v" + updater.currentVersionName() + " · 冒险岛世界/阿尔泰")
         appendLine("用途：实测 root 真伪、screencap 是否黑屏、真实 displayId、截图与按键时延。")
         appendLine()
@@ -100,12 +104,16 @@ class MainActivity : Activity() {
         ))
         root.addView(buttonRow(
             "⑦ 触摸测试(10s)" to { runTapTest() },
+            "启动悬浮窗 ★" to { startOverlay() },
+            "停止悬浮窗" to { stopOverlay() }
+        ))
+        root.addView(buttonRow(
             "复制报告" to { copyReport() },
             "保存到文件" to { saveReport() }
         ))
         root.addView(buttonRow(
             "分享/导出" to { shareReport() },
-            "清空" to { body.removeAllViews(); appendLine("已清空。") }
+            "清空" to { body.removeAllViews(); LogBus.clear(); appendLine("已清空。") }
         ))
 
         // ---------------- 自更新区 ----------------
@@ -191,7 +199,10 @@ class MainActivity : Activity() {
 
     private val buffer = StringBuilder()
 
-    private fun appendLine(s: String = "") {
+    /** 所有输出统一走 LogBus，悬浮窗与主界面共享同一份日志。 */
+    private fun appendLine(s: String = "") = LogBus.emit(s)
+
+    private fun renderLine(s: String = "") {
         buffer.append(s).append('\n')
         val tv = TextView(this).apply {
             text = s
@@ -239,6 +250,61 @@ class MainActivity : Activity() {
             appendLine("--- 采集通道压测：PNG vs RAW ---")
             r.split('\n').forEach { appendLine(it) }
         }
+    }
+
+    // ------------------------------------------------------------ 悬浮窗
+
+    /**
+     * 启动悬浮控制台。
+     *
+     * 悬浮窗权限（SYSTEM_ALERT_WINDOW）正常需要用户去设置里手动开，
+     * 但我们有 root —— 直接用 `appops set` 自己授权，用户无感。
+     */
+    private fun startOverlay() {
+        ShellCore.init(this)
+        Thread {
+            val ok = ensureOverlayPermission()
+            runOnUiThread {
+                if (!ok) {
+                    appendLine()
+                    appendLine("无法获取悬浮窗权限。请手动到「设置 → 应用 → P0探测 → 显示在其他应用上层」开启。")
+                    toast("需要悬浮窗权限")
+                    return@runOnUiThread
+                }
+                OverlayService.start(this)
+                appendLine()
+                appendLine("悬浮控制台已启动 —— 按钮会浮在游戏画面上，可直接点。")
+                appendLine("悬浮窗里点「ROI显示」还能把识别框画在游戏画面上。")
+                toast("悬浮窗已启动")
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    private fun stopOverlay() {
+        OverlayService.stop(this)
+        appendLine()
+        appendLine("悬浮控制台已停止。")
+        toast("悬浮窗已停止")
+    }
+
+    /** 优先用 root 自授权；失败则退回到拉起系统设置页。 */
+    private fun ensureOverlayPermission(): Boolean {
+        if (android.provider.Settings.canDrawOverlays(this)) return true
+        if (ShellCore.ensureRoot()) {
+            ShellCore.root.exec("appops set ${packageName} SYSTEM_ALERT_WINDOW allow", 8000)
+            Thread.sleep(400)
+            if (android.provider.Settings.canDrawOverlays(this)) return true
+        }
+        // 兜底：让用户手动开
+        runCatching {
+            startActivity(
+                Intent(
+                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    android.net.Uri.parse("package:$packageName")
+                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
+        return false
     }
 
     // ------------------------------------------------------------ 自更新
@@ -428,7 +494,7 @@ class MainActivity : Activity() {
     private var lastReport: String? = null
 
     private fun currentReport(): String =
-        lastReport ?: buffer.toString().ifBlank { "（还没有内容）" }
+        LogBus.dump().ifBlank { lastReport ?: "（还没有内容）" }
 
     private fun copyReport() {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -461,6 +527,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        try { probe.close() } catch (_: Throwable) {}
+        runCatching { LogBus.remove(logListener) }
+        // 注意：不在这里关闭 root shell —— 悬浮窗可能还在用同一个 ShellCore.root
     }
 }
