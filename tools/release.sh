@@ -100,7 +100,9 @@ echo
 echo "==== 同步 dist/ 供 jsDelivr 使用 ===="
 mkdir -p "$ROOT/dist"
 cp "$APK" "$ROOT/dist/probe-release.apk"
-git add -A
+# 只提交 dist/ —— 用 git add -A 会把工作区里未提交的源码改动一起吞进
+# 一个叫「dist: 同步到 vX」的提交里，提交信息与内容不符，以后翻历史看不懂。
+git add dist/
 if git diff --cached --quiet; then
   echo "  dist 无变化"
   PUSHED=1
