@@ -117,9 +117,21 @@ class Probe(
         rootOk = ok
         sb.append("    结果: ").append(if (ok) "成功 ✅" else "失败 ❌").append("  (${ms}ms)\n")
         if (ok) {
+            sb.append("    生效模式: ").append(sh.modeName).append('\n')
             sb.append("    id 输出: ").append(sh.lastHandshakeOutput.replace("\n", " ").trim()).append('\n')
             val (rt, _) = sh.timedExec("id", 5000)
-            sb.append("    单次往返: ${rt}ms\n")
+            sb.append("    单次命令往返: ${rt}ms\n")
+            if (sh.mode == com.altair.probe.RootShell.Mode.ONESHOT) {
+                sb.append(
+                    """
+                    |
+                    |    说明：本机的 su 不支持交互式常驻 shell（无 TTY 时立即退出），
+                    |          已自动降级为 `su -c` 单次调用模式。
+                    |          慢约 20ms/命令，但截图本身要 200~275ms，影响可忽略。
+                    |          **root 权限本身是正常的**，不需要再折腾授权。
+                    |""".trimMargin()
+                )
+            }
         } else {
             sb.append("    su 原始输出: ").append(sh.lastHandshakeOutput.ifBlank { "(空)" }).append('\n')
             sb.append("    失败原因: ").append(sh.lastError.ifBlank { "(未知)" }).append('\n')
@@ -226,9 +238,10 @@ class Probe(
             return
         }
 
+        kv("root 通道模式", sh.modeName)
         val (ms, idOut) = sh.timedExec("id", 5000)
         kv("id 输出", idOut.replace("\n", " ").trim())
-        kv("常驻 shell 单次往返", "${ms}ms   ← 主通道的实际开销")
+        kv("单次命令往返", "${ms}ms   ← 主通道的实际开销")
 
         // 嵌套跑一次一次性 su，作为「每帧新建进程」的代价对照
         val (spawnMs, spawnOut) = sh.timedExec("su -c id", 8000)
@@ -411,7 +424,10 @@ class Probe(
             sb.append("• root 不可用 → 主通道为「无障碍 + MediaProjection」，功能可用但延迟高 3~5 倍。\n")
             sb.append("  请到红手指客户端打开 root 开关后重测。\n")
         } else {
-            sb.append("• root 可用 → 走常驻 shell 主通道。\n")
+            sb.append("• root 可用 → 通道模式：${sh.modeName}\n")
+            if (sh.mode == com.altair.probe.RootShell.Mode.ONESHOT) {
+                sb.append("  （本机 su 不支持交互式 shell，已自动降级；每命令多约 20ms，可接受）\n")
+            }
         }
         if (bestDisplayId >= 0) {
             sb.append("• 可用 displayId = $bestDisplayId，截图正常，无黑屏。\n")
