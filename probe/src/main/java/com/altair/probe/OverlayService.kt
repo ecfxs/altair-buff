@@ -169,8 +169,13 @@ class OverlayService : Service() {
             text = "初始化…"
             setTextColor(Color.parseColor("#8FA3B8"))
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 9f)
-            setPadding(dp(2), 0, dp(2), dp(6))
+            setPadding(dp(2), dp(2), dp(2), dp(4))
             maxLines = 2
+            // ★ 固定高度：否则文本长短变化会让整个面板忽大忽小
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(30)
+            )
+            ellipsize = android.text.TextUtils.TruncateAt.END
         }
         root.addView(statusTv)
 
@@ -187,8 +192,11 @@ class OverlayService : Service() {
         ))
         root.addView(row(
             "ROI显示" to { toggleRoi() },
-            "复制日志" to { copyLog() },
-            "隐藏" to { hidePanel() }
+            "申请Root" to { act("申请Root") { ShellCore.probe.requestRoot() } },
+            "复制日志" to { copyLog() }
+        ))
+        root.addView(row(
+            "隐藏面板" to { hidePanel() }
         ))
 
         // ---- 最近日志 ----
@@ -197,13 +205,21 @@ class OverlayService : Service() {
             setTextColor(Color.parseColor("#C9D4E0"))
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 8f)
             typeface = Typeface.MONOSPACE
-            setPadding(dp(2), dp(6), dp(2), 0)
+            setPadding(dp(2), dp(4), dp(2), 0)
             maxLines = 4
+            // ★ 固定高度：日志行数变化不能让面板跟着变
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(52)
+            )
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setHorizontallyScrolling(false)
         }
         root.addView(logTv)
 
+        // ★ 固定宽度：内容长短不再影响面板尺寸，避免「随意变动大小」
+        val panelW = dp(262)
         val p = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            panelW,
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType(),
             // ★ 必须 NOT_FOCUSABLE：否则抢走游戏输入焦点，按键全部失效

@@ -29,9 +29,18 @@ class RootShell {
 
     val isAlive: Boolean get() = proc?.isAlive == true
 
+    /** 最近一次 open() 握手时 `id` 的原始输出（失败时是 su 的报错），用于诊断。 */
+    var lastHandshakeOutput: String = ""
+        private set
+
+    /** 最近一次 open() 失败的原因。 */
+    var lastError: String = ""
+        private set
+
     /** 启动常驻 su 并握手校验。返回是否真的拿到了 root。 */
     fun open(timeoutMs: Long = 10000): Boolean {
         close()
+        lastError = ""
         return try {
             val p = ProcessBuilder("su")
                 .redirectErrorStream(true)
@@ -54,8 +63,12 @@ class RootShell {
             }.also { it.isDaemon = true; it.start() }
 
             val out = exec("id", timeoutMs)
-            out.contains("uid=0")
-        } catch (_: Throwable) {
+            lastHandshakeOutput = out
+            val ok = out.contains("uid=0")
+            if (!ok) lastError = if (out.isBlank()) "su 无任何输出（可能被拒绝或超时）" else out.take(200)
+            ok
+        } catch (t: Throwable) {
+            lastError = "${t.javaClass.simpleName}: ${t.message}"
             close()
             false
         }

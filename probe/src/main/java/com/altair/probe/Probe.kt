@@ -10,6 +10,7 @@ import android.util.DisplayMetrics
 import android.view.WindowManager
 import java.io.File
 import java.io.RandomAccessFile
+import java.util.concurrent.TimeUnit
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
@@ -47,6 +48,93 @@ class Probe(
 
     /** 暴露常驻 shell 给自更新模块复用，避免开第二个 su 进程。 */
     val shell: RootShell get() = sh
+
+    /**
+     * 安全地跑一次性外部命令：读取放到独立线程，主线程只 waitFor 带超时。
+     * **绝不用 readText()+waitFor() 无超时的写法** —— 某些 su 会卡住不返回，那样整个 App 就挂了。
+     */
+    private fun tryOneShot(cmd: List<String>, timeoutMs: Long): String {
+        return try {
+            val p = ProcessBuilder(cmd).redirectErrorStream(true).start()
+            val out = StringBuilder()
+            val t = Thread {
+                runCatching { p.inputStream.bufferedReader().forEachLine { out.append(it).append('\n') } }
+            }
+            t.isDaemon = true
+            t.start()
+            val done = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+            if (!done) {
+                runCatching { p.destroy() }
+                "超时（${timeoutMs}ms 内未返回）"
+            } else {
+                out.toString().trim().ifEmpty { "(无输出，退出码 ${p.exitValue()})" }
+            }
+        } catch (t: Throwable) {
+            "${t.javaClass.simpleName}: ${t.message}"
+        }
+    }
+
+    /**
+     * 申请 / 重新检测 root 权限。
+     *
+     * 为什么需要单独的按钮：`pm install -r` 更新 APK 会杀掉本进程并重启，
+     * **su 的授权会话很可能随之失效** —— 表现为「系统里明明给了 root，但 App 拿不到」。
+     * 这个按钮会关掉旧 shell、重新拉起 su（若系统弹授权框就趁机点允许），
+     * 并把每一步的原始输出报出来，失败时能直接看到 su 说了什么。
+     */
+    fun requestRoot(): String {
+        val sb = StringBuilder()
+        sb.append("=== 申请 / 检测 root 权限 ===\n")
+
+        // 1) 枚举候选 su 路径（不同云手机方案 su 位置不同）
+        val cands = listOf(
+            "/system/bin/su", "/system/xbin/su", "/sbin/su", "/su/bin/su",
+            "/system/sbin/su", "/vendor/bin/su", "/debug_ramdisk/su",
+            "/acct/.mci/bin/su", "/system/xbin/daemonsu"
+        )
+        sb.append("候选 su 路径:\n")
+        val found = cands.filter { File(it).exists() }
+        for (c in cands) sb.append("  ${if (File(c).exists()) "✅" else "— "} $c\n")
+        if (found.isEmpty()) sb.append("  ⚠ 常见路径下都没找到 su 文件\n")
+
+        // 2) 一次性 `su -c id`：这条会触发系统的授权询问
+        sb.append("\n[1] 一次性 su -c id（若系统弹授权框，请点「允许」）\n")
+        sb.append("    ").append(tryOneShot(listOf("su", "-c", "id"), 25_000)).append('\n')
+
+        // 3) 候选路径逐个试（有些机器的 su 不在 PATH 里）
+        for (c in found) {
+            if (c == "/system/xbin/su") continue
+            sb.append("\n[2] $c -c id\n")
+            sb.append("    ").append(tryOneShot(listOf(c, "-c", "id"), 15_000)).append('\n')
+        }
+
+        // 4) 重新建立常驻 shell
+        sb.append("\n[3] 重建常驻 shell（主通道）\n")
+        sh.close()
+        val t0 = System.nanoTime()
+        val ok = sh.open(25_000)
+        val ms = (System.nanoTime() - t0) / 1_000_000
+        rootOk = ok
+        sb.append("    结果: ").append(if (ok) "成功 ✅" else "失败 ❌").append("  (${ms}ms)\n")
+        if (ok) {
+            sb.append("    id 输出: ").append(sh.lastHandshakeOutput.replace("\n", " ").trim()).append('\n')
+            val (rt, _) = sh.timedExec("id", 5000)
+            sb.append("    单次往返: ${rt}ms\n")
+        } else {
+            sb.append("    su 原始输出: ").append(sh.lastHandshakeOutput.ifBlank { "(空)" }).append('\n')
+            sb.append("    失败原因: ").append(sh.lastError.ifBlank { "(未知)" }).append('\n')
+            sb.append(
+                """
+                |
+                |=== 失败时怎么办 ===
+                |  · 确认红手指客户端里的 root 开关是打开的
+                |  · 看云手机屏幕上有没有弹授权框 —— 有就点「允许」，然后**重新点一次本按钮**
+                |  · 部分云手机更新 App 后需要重新授权，这是已知现象
+                |""".trimMargin()
+            )
+        }
+        return sb.toString()
+    }
 
     /** 确保常驻 root shell 已建立（并同步 rootOk，供只走悬浮窗、没跑过完整探测的场景）。 */
     fun ensureShell(): Boolean {

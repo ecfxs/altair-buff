@@ -93,6 +93,10 @@ class MainActivity : Activity() {
         root.addView(status)
 
         root.addView(buttonRow(
+            "★ 申请Root权限" to { runRequestRoot() },
+            "自更新" to { runSelfUpdate() }
+        ))
+        root.addView(buttonRow(
             "① 开始探测" to { runProbe() },
             "② 连续截图 5s" to { runBurst() },
             "③ 采集压测" to { runBench() }
@@ -137,7 +141,7 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, dp(6))
         }
         autoChk = CheckBox(this).apply {
-            text = "启动自动检查更新"
+            text = "启动时自动检查更新（默认关）"
             isChecked = updater.autoCheck()
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTextColor(Color.parseColor("#8FA3B8"))
@@ -152,7 +156,6 @@ class MainActivity : Activity() {
         root.addView(optRow)
 
         root.addView(buttonRow(
-            "自更新" to { runSelfUpdate() },
             "安装本地APK" to { runLocalInstall() },
             "更新日志" to { runShowUpdateLog() }
         ))
@@ -307,6 +310,25 @@ class MainActivity : Activity() {
         return false
     }
 
+    // ------------------------------------------------------------ Root 权限
+
+    /**
+     * 申请 / 重新检测 root 权限。
+     *
+     * 已知现象：`pm install -r` 更新 APK 会杀掉本进程并重启，
+     * su 的授权会话可能随之失效 —— 表现为「系统里明明给了 root，App 却拿不到」。
+     * 这个按钮会重建 shell 并把 su 的原始输出报出来。
+     */
+    private fun runRequestRoot() {
+        appendLine()
+        appendLine("--- 申请 / 检测 root 权限 ---")
+        appendLine("提示：若云手机屏幕上弹出授权框，请点「允许」，然后【再点一次本按钮】。")
+        background("申请Root") {
+            val r = ShellCore.probe.requestRoot()
+            runOnUiThread { r.split('\n').forEach { appendLine(it) } }
+        }
+    }
+
     // ------------------------------------------------------------ 自更新
 
     private fun runSelfUpdate() {
@@ -360,6 +382,7 @@ class MainActivity : Activity() {
                     }
                 }
             } catch (_: Throwable) {}
+            // 默认不自动检查更新：只有用户在界面里勾选了才检查（并已提示）
             if (url.isEmpty() || !auto) return@Thread
             try { Thread.sleep(4000) } catch (_: InterruptedException) {}
             try {

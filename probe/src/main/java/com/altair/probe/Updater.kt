@@ -57,8 +57,9 @@ class Updater(
     fun saveUrl(u: String) =
         ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putString(KEY_URL, u.trim()).apply()
 
+    /** 启动时是否自动检查更新。**默认关闭** —— 更新只应在手动点击时发生。 */
     fun autoCheck(): Boolean =
-        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean(KEY_AUTO, true)
+        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean(KEY_AUTO, false)
 
     fun setAutoCheck(b: Boolean) =
         ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putBoolean(KEY_AUTO, b).apply()
