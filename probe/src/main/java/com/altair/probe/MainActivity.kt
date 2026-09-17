@@ -61,6 +61,23 @@ class MainActivity : Activity() {
     private lateinit var targetField: EditText
     private val buffRows = mutableListOf<Triple<CheckBox, Spinner, EditText>>()
 
+    // ---- 全局操作状态条 ----
+    private lateinit var busyStrip: TextView
+    private val ticker = android.os.Handler(android.os.Looper.getMainLooper())
+    private val tick = object : Runnable {
+        override fun run() {
+            val l = Busy.current
+            busyStrip.text = if (l == null) "就绪" else "⏳ $l   ${"%.1f".format(Busy.elapsedMs() / 1000.0)}s"
+            busyStrip.setBackgroundColor(
+                Color.parseColor(if (l == null) "#12331F" else "#33301A")
+            )
+            busyStrip.setTextColor(
+                Color.parseColor(if (l == null) "#7FD18B" else "#FFD479")
+            )
+            ticker.postDelayed(this, 250)
+        }
+    }
+
     // ---- 日志页 ----
     private lateinit var logScroll: ScrollView
     private lateinit var logBody: LinearLayout
@@ -101,6 +118,16 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.parseColor("#0F1216"))
         }
         root.addView(buildTabBar())
+        busyStrip = TextView(this).apply {
+            text = "就绪"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            typeface = Typeface.MONOSPACE
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        root.addView(busyStrip)
+        ticker.post(tick)
 
         val container = android.widget.FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -206,6 +233,7 @@ class MainActivity : Activity() {
                 append("前台应用 : ").append(if (fg.isBlank()) "未知" else fg).append('\n')
                 append("目标游戏 : ").append(target).append('\n')
                 append("悬浮窗   : ").append(if (OverlayService.running) "运行中" else "未启动").append('\n')
+                append("当前操作 : ").append(Busy.current ?: "空闲").append('\n')
                 append("采集点   : ").append(pts.size).append(" 个")
                 if (pts.size >= 4) append("（技能键已就绪）")
             }
@@ -502,12 +530,38 @@ class MainActivity : Activity() {
 
     private fun buttonRow(vararg btns: Pair<String, () -> Unit>): LinearLayout = row(*btns)
 
+    /**
+     * 执行一个操作，并给出**三段式反馈**：开始 / 进度 / 结果。
+     *
+     * 同时做互斥：上一个还没跑完就再点别的，会直接提示而不是静默堆叠 ——
+     * 否则两个操作同时抢 root shell，结果会互相穿插，根本看不懂。
+     */
     private fun act(label: String, block: () -> String) {
+        val running = Busy.current
+        if (running != null) {
+            toast("正在执行「$running」，请等它结束")
+            log("⚠ 忽略「$label」：当前正在执行「$running」")
+            return
+        }
+        val t0 = System.currentTimeMillis()
+        Busy.begin(label)
         log("▸ $label")
         Thread {
-            val r = runCatching { block() }
-                .getOrElse { "出错: ${it.javaClass.simpleName}: ${it.message}" }
-            runOnUiThread { r.split('\n').forEach { log(it) } }
+            val res = runCatching { block() }
+            val ms = System.currentTimeMillis() - t0
+            Busy.end()
+            runOnUiThread {
+                if (res.isSuccess) {
+                    res.getOrNull()?.split('\n')?.forEach { if (it.isNotBlank()) log(it) }
+                    log("✅ $label 完成（${ms}ms）")
+                    toast("✅ $label 完成")
+                } else {
+                    val e = res.exceptionOrNull()
+                    log("❌ $label 失败（${ms}ms）：${e?.javaClass?.simpleName}: ${e?.message}")
+                    toast("❌ $label 失败，看日志页")
+                }
+                refreshRunStatus()
+            }
         }.apply { isDaemon = true }.start()
     }
 

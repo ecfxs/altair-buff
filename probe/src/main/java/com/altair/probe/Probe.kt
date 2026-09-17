@@ -322,6 +322,7 @@ class Probe(
         val times = ArrayList<Long>()
         var lastSt: DoubleArray? = null
         repeat(20) { i ->
+            Busy.count("截图时延测试", i + 1, 20)
             f.delete()
             val (ms, _) = sh.timedExec("screencap -d $d -p ${f.absolutePath}", 8000)
             if (f.exists() && f.length() > 1000) times.add(ms)
@@ -471,13 +472,15 @@ class Probe(
         val raw = File(cache, "bench.raw")
 
         val pngTs = ArrayList<Long>()
-        repeat(N) {
+        repeat(N) { i ->
+            Busy.count("采集压测 PNG", i + 1, N)
             png.delete()
             val (ms, _) = sh.timedExec("screencap -d $d -p ${png.absolutePath}", 10000)
             if (png.exists() && png.length() > 1000) pngTs.add(ms)
         }
         val rawTs = ArrayList<Long>()
-        repeat(N) {
+        repeat(N) { i ->
+            Busy.count("采集压测 RAW", i + 1, N)
             raw.delete()
             val (ms, _) = sh.timedExec("screencap -d $d ${raw.absolutePath}", 10000)
             if (raw.exists() && raw.length() > 1000) rawTs.add(ms)
@@ -716,7 +719,8 @@ class Probe(
         sb.append("请盯着游戏，记下**哪一个**让技能放出来了。\n\n")
         sb.append("焦点: ").append(focusedWindow()).append("\n\n")
 
-        for ((name, code) in candidates) {
+        candidates.forEachIndexed { idx, (name, code) ->
+            Busy.count("键扫描", idx + 1, candidates.size)
             val (ms, _) = sh.timedExec("input keyevent $code", 6000)
             sb.append("  发 ${name} (code=$code)  ${ms}ms\n")
             try { Thread.sleep(gapMs.toLong()) } catch (_: InterruptedException) {}
