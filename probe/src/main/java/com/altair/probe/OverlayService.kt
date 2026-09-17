@@ -66,6 +66,13 @@ class OverlayService : Service() {
     private var pickView: PickView? = null
     private var lastPicks: List<Pair<Float, Float>> = emptyList()
     private var panelParams: WindowManager.LayoutParams? = null
+    private var statusTvRef: TextView? = null
+    /** 门禁：目标游戏包名。只有它在前台时，输入类动作才允许执行。 */
+    private var targetPkg: String = "com.nexon.mod"
+    /** ROI 的用户意图（≠ 实际是否显示：实际显示还要满足「游戏在前台」）。 */
+    private var roiEnabled = false
+    /** 最近一次检测到的前台包名。 */
+    private var lastFg: String = "?"
     private var statusTv: TextView? = null
     private var logTv: TextView? = null
     private var selfBtn: Button? = null
@@ -82,9 +89,12 @@ class OverlayService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    private fun prefs() = getSharedPreferences("overlay", MODE_PRIVATE)
+
     override fun onCreate() {
         super.onCreate()
         ShellCore.init(this)
+        targetPkg = prefs().getString("targetPkg", "com.nexon.mod") ?: "com.nexon.mod"
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         startForeground(NOTIF_ID, buildNotification())
         LogBus.add(logListener)
@@ -123,10 +133,27 @@ class OverlayService : Service() {
 
     private fun buildStatus(): String {
         if (!ShellCore.ensureRoot()) return "root 不可用 ⚠ 请检查红手指 root 开关"
-        val focus = ShellCore.probe.focusedWindow()
-        // 只显示窗口名，去掉冗长的包路径前缀
-        val short = focus.replace(Regex("\\s+"), " ").take(70)
-        return "焦点: $short"
+        val fg = ShellCore.probe.foregroundPackage()
+        lastFg = fg.ifBlank { "?" }
+        syncRoiWithForeground(fg)
+        val armed = fg == targetPkg
+        return buildString {
+            append(if (armed) "🟢 游戏中 · 动作已启用" else "🔴 非游戏 · 动作已禁用")
+            append('\n')
+            append("前台: ").append(if (fg.isBlank()) "未知" else fg)
+            append('\n').append("目标: ").append(targetPkg)
+        }
+    }
+
+    /**
+     * ROI 只在「用户开启了 ROI」且「目标游戏处于前台」时显示。
+     * 游戏不在前台就自动隐藏 —— 免得把识别框画在别的界面上，既没意义又容易误解。
+     */
+    private fun syncRoiWithForeground(fg: String) {
+        val shouldShow = roiEnabled && fg == targetPkg
+        val showing = roiView != null
+        if (shouldShow && !showing) addRoi()
+        else if (!shouldShow && showing) removeRoi()
     }
 
     private fun refreshStatus() {
@@ -184,9 +211,10 @@ class OverlayService : Service() {
 
         // ---- 按钮 ----
         root.addView(row(
-            "截图" to { act("截图") { ShellCore.probe.quickCapture() } },
+            // 截图是只读操作，不设门禁 —— 它正好用来确认「现在前台到底是谁」
+            "截图" to { act("截图", guard = false) { ShellCore.probe.quickCapture() } },
             "按键诊断" to { act("按键诊断") { ShellCore.probe.keyDiagnostics(3) } },
-            "申请Root" to { act("申请Root") { ShellCore.probe.requestRoot() } }
+            "申请Root" to { act("申请Root", guard = false) { ShellCore.probe.requestRoot() } }
         ))
         root.addView(row(
             "数字键1" to { act("数字键1") { ShellCore.probe.sendKey(8) } },
@@ -205,6 +233,7 @@ class OverlayService : Service() {
             "点4" to { tapPick(3) }
         ))
         root.addView(row(
+            "标定游戏" to { calibrateTarget() },
             "点5" to { tapPick(4) },
             "点6" to { tapPick(5) },
             "键扫描" to { act("键扫描") { ShellCore.probe.keyScan(3) } }
@@ -304,9 +333,26 @@ class OverlayService : Service() {
 
     // ------------------------------------------------------------ 动作
 
-    private fun act(label: String, block: () -> String) {
+    /**
+     * 执行一个动作。
+     *
+     * [guard] 为 true 时先做**前台门禁**：只有目标游戏在前台才执行。
+     * 这是防止「在错误界面上乱点」的关键 —— 焦点一旦跑到桌面、系统弹窗或本应用上，
+     * 注入的点击/按键就会打到错误的地方。
+     */
+    private fun act(label: String, guard: Boolean = true, block: () -> String) {
         LogBus.emit("▸ $label")
         Thread {
+            if (guard) {
+                val fg = ShellCore.probe.foregroundPackage()
+                if (fg != targetPkg) {
+                    LogBus.emit(
+                        "   ⛔ 已跳过：当前前台是「${fg.ifBlank { "未知" }}」，" +
+                            "不是目标游戏「$targetPkg」"
+                    )
+                    return@Thread
+                }
+            }
             val r = runCatching { block() }.getOrElse { "出错: ${it.javaClass.simpleName}: ${it.message}" }
             LogBus.emit(r.trimEnd())
         }.apply { isDaemon = true }.start()
@@ -316,6 +362,27 @@ class OverlayService : Service() {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
         cm.setPrimaryClip(android.content.ClipData.newPlainText("probe", LogBus.dump()))
         LogBus.emit("已复制日志到剪贴板（${LogBus.dump().length} 字）")
+    }
+
+    /**
+     * 把「当前前台应用」记为门禁目标。
+     * 用法：切到游戏，点一下本按钮即可 —— 不用手打包名。
+     */
+    private fun calibrateTarget() {
+        Thread {
+            val fg = ShellCore.probe.foregroundPackage()
+            if (fg.isBlank()) {
+                LogBus.emit("标定游戏：取不到当前前台包名（root 不可用？）")
+                return@Thread
+            }
+            if (fg == packageName) {
+                LogBus.emit("标定游戏：当前前台是本应用自己，请先切到游戏再点。")
+                return@Thread
+            }
+            targetPkg = fg
+            prefs().edit().putString("targetPkg", fg).apply()
+            LogBus.emit("标定游戏：目标已设为「$fg」。此后只有它在前台时才执行动作。")
+        }.apply { isDaemon = true }.start()
     }
 
     // ------------------------------------------------------------ 坐标采集
@@ -391,12 +458,23 @@ class OverlayService : Service() {
     // ------------------------------------------------------------ ROI 覆盖层    // ------------------------------------------------------------ ROI 覆盖层
 
     private fun toggleRoi() {
-        if (roiView != null) {
-            roiView?.let { runCatching { wm.removeView(it) } }
-            roiView = null
+        roiEnabled = !roiEnabled
+        if (!roiEnabled) {
+            removeRoi()
             LogBus.emit("ROI 覆盖层：已关闭")
             return
         }
+        LogBus.emit("ROI 覆盖层：已开启（仅在游戏处于前台时显示）")
+        syncRoiWithForeground(ShellCore.probe.foregroundPackage())
+    }
+
+    private fun removeRoi() {
+        roiView?.let { runCatching { wm.removeView(it) } }
+        roiView = null
+    }
+
+    private fun addRoi() {
+        if (roiView != null) return
         val v = RoiView(this)
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -409,10 +487,7 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         )
         runCatching { wm.addView(v, p) }
-            .onSuccess {
-                roiView = v
-                LogBus.emit("ROI 覆盖层：已开启（绿=小地图 红=血条 黄=技能键带 青=中心）")
-            }
+            .onSuccess { roiView = v }
             .onFailure { LogBus.emit("ROI 覆盖层添加失败: ${it.message}") }
     }
 

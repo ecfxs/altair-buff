@@ -775,6 +775,40 @@ class Probe(
         return "${tag}点击 ($px, $py)  归一化($nx4, $ny4)  画面 ${w}x${h}  方式=$method 按压 ${pressMs}ms  ${ms}ms  ${err.take(40)}"
     }
 
+    // ------------------------------------------------------------ 前台应用检测
+
+    /**
+     * 当前前台应用的包名；取不到返回 ""。
+     *
+     * 为什么需要它：所有输入动作都只在**目标游戏处于前台**时才允许执行。
+     * 否则一旦焦点跑到桌面/系统弹窗/本应用上，点击和按键就会打到错误的地方 ——
+     * 无人值守时这是很危险的一类事故。
+     */
+    fun foregroundPackage(): String {
+        if (!ensureShell()) return ""
+        // mCurrentFocus=Window{a1b2 u0 com.nexon.mod/com.nexon.mod.MainActivity}
+        val a = sh.exec("dumpsys window 2>/dev/null | grep -m1 mCurrentFocus", 6000)
+        extractPkg(a)?.let { return it }
+        // 退而求其次：看顶层 resumed activity
+        val b = sh.exec(
+            "dumpsys activity activities 2>/dev/null | grep -m1 -E 'topResumedActivity|mResumedActivity'",
+            6000
+        )
+        extractPkg(b)?.let { return it }
+        return ""
+    }
+
+    /** 从窗口/活动信息里抠出包名。 */
+    private fun extractPkg(line: String): String? {
+        // 形如  u0 com.nexon.mod/com.nexon.mod.MainActivity
+        val m = Regex("""([a-zA-Z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/[A-Za-z0-9_.$]+""").find(line)
+        return m?.groupValues?.get(1)
+    }
+
+    /** 前台是否就是目标游戏。 */
+    fun isTargetForeground(target: String): Boolean =
+        target.isNotBlank() && foregroundPackage() == target
+
     // ------------------------------------------------------------ 按键通道诊断
 
     /**
