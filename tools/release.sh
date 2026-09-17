@@ -67,6 +67,22 @@ APK="$ROOT/probe/build/outputs/apk/release/probe-release.apk"
 [ -f "$APK" ] || { echo "!! 找不到 APK"; exit 1; }
 echo "APK: $(du -h "$APK" | cut -f1)"
 
+# ---- 构建后校验关键 manifest 属性 ----
+# 有些问题只在**打包后**才暴露（例如 networkSecurityConfig 没被打进去），
+# 看源码是看不出来的。这里对成品 APK 做一次硬校验。
+AAPT="${ANDROID_SDK_ROOT:-/nonexistent}/build-tools/33.0.1/aapt2"
+if [ -x "$AAPT" ]; then
+  MT="$("$AAPT" dump xmltree "$APK" --file AndroidManifest.xml 2>/dev/null)"
+  chk_attr() {
+    if echo "$MT" | grep -q "$1"; then echo "  ✅ $2"; else echo "  ❌ $2 缺失"; MFBAD=1; fi
+  }
+  echo "  ---- 成品 APK manifest 校验 ----"
+  chk_attr "usesCleartextTraffic.*=true" "允许明文 HTTP（集控服务器是 http://）"
+  chk_attr "networkSecurityConfig"       "网络安全配置已引用"
+  chk_attr "SYSTEM_ALERT_WINDOW"         "悬浮窗权限已声明"
+  [ "${MFBAD:-0}" = "1" ] && { echo "!! manifest 校验未通过，已中止发布"; exit 1; }
+fi
+
 # ---------------------------------------------------------------- 3) 仓库
 if [ -z "$REPO" ]; then
   if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then

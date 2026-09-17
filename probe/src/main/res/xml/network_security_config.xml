@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  为什么必须开明文流量
+  ====================
+  Android 9（API 28）起，应用默认**禁止明文 HTTP**。本项目 targetSdk=30，
+  因此不加这份配置的话，所有 http:// 请求都会被系统直接拦掉并抛
+  `IOException: Cleartext HTTP traffic to x.x.x.x not permitted`。
+
+  而集控服务器恰恰是 HTTP 的 —— 它的地址由用户在界面上填写，可能是任意 IP，
+  无法预先在配置里列白名单。所以只能放开 base-config。
+
+  代价与权衡：
+    · 放开后本 App 的所有明文 HTTP 都可通行。实际上只有集控这一个用途走 HTTP，
+      自更新用的 GitHub / 代理地址全是 HTTPS。
+    · 若将来给集控服务器配上 TLS（建议前面加一层 Nginx），
+      可以把 base-config 收掉，改成只对特定 domain 放行。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
