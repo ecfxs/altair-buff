@@ -44,6 +44,9 @@ import kotlin.math.max
 class OverlayService : Service() {
 
     companion object {
+        /** 面板宽度（dp）：展开 / 精简。固定宽度避免内容长短导致面板忽大忽小。 */
+        private const val PANEL_W_FULL = 208
+        private const val PANEL_W_COMPACT = 104
         private const val CH_ID = "altair_overlay"
         private const val NOTIF_ID = 1001
         @Volatile var running = false
@@ -67,6 +70,24 @@ class OverlayService : Service() {
     private var lastPicks: List<Pair<Float, Float>> = emptyList()
     private var panelParams: WindowManager.LayoutParams? = null
     private var statusTvRef: TextView? = null
+    private var statusPill: TextView? = null
+    private var collapseBtn: TextView? = null
+    private var contentBox: LinearLayout? = null
+    private var contentScroll: android.widget.ScrollView? = null
+    /** 精简模式：只显示一行运行状态，按钮全部收起。 */
+    private var compact = true
+    /**
+     * 按压方式循环。同一位置用不同按法试，是定位「游戏接受哪种触摸」的最快办法，
+     * 但为它单开三个按钮太占地方 —— 合并成一个循环按钮。
+     */
+    private val pressModes = listOf(
+        Triple("短50", 50, "swipe"),
+        Triple("中90", 90, "swipe"),
+        Triple("长250", 250, "swipe"),
+        Triple("自绘150", 150, "motionevent")
+    )
+    private var pressIdx = 1
+    private var pressBtn: Button? = null
     /** 门禁：目标游戏包名。只有它在前台时，输入类动作才允许执行。 */
     private var targetPkg: String = "com.nexon.mod"
     /** ROI 的用户意图（≠ 实际是否显示：实际显示还要满足「游戏在前台」）。 */
@@ -137,6 +158,12 @@ class OverlayService : Service() {
         lastFg = fg.ifBlank { "?" }
         syncRoiWithForeground(fg)
         val armed = fg == targetPkg
+        ui.post {
+            statusPill?.text = if (armed) "🟢 游戏中" else "🔴 非游戏"
+            statusPill?.setTextColor(
+                Color.parseColor(if (armed) "#7FD18B" else "#FFB454")
+            )
+        }
         return buildString {
             append(if (armed) "🟢 游戏中 · 动作已启用" else "🔴 非游戏 · 动作已禁用")
             append('\n')
@@ -178,97 +205,123 @@ class OverlayService : Service() {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#E6101317"))
-                cornerRadius = dp(10).toFloat()
+                cornerRadius = dp(8).toFloat()
                 setStroke(dp(1), Color.parseColor("#3A4450"))
             }
-            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setPadding(dp(5), dp(5), dp(5), dp(5))
         }
 
-        // ---- 标题栏（拖动把手）----
-        val title = TextView(this).apply {
-            text = "P0 悬浮控制台  ⠿"
+        // ---------------- 标题栏：状态胶囊 + 折叠按钮（整条可拖动） ----------------
+        val titleBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        statusPill = TextView(this).apply {
+            text = "⚪ 初始化"
+            setTextColor(Color.parseColor("#E6EDF5"))
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 10f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(3), dp(1), dp(2), dp(1))
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            layoutParams = LinearLayout.LayoutParams(0, dp(20), 1f)
+        }
+        collapseBtn = TextView(this).apply {
+            text = "▸"          // 默认精简
             setTextColor(Color.parseColor("#7FD18B"))
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(4), dp(2), dp(4), dp(4))
+            setPadding(dp(10), dp(1), dp(4), dp(1))
+            setOnClickListener { toggleCompact() }
         }
-        root.addView(title)
+        titleBar.addView(statusPill)
+        titleBar.addView(collapseBtn)
+        root.addView(titleBar)
 
-        // ---- 状态 ----
+        // ---------------- 可折叠内容 ----------------
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(3), 0, 0)
+        }
+
         statusTv = TextView(this).apply {
-            text = "初始化…"
+            text = "…"
             setTextColor(Color.parseColor("#8FA3B8"))
-            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 9f)
-            setPadding(dp(2), dp(2), dp(2), dp(4))
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 8f)
+            setPadding(dp(2), dp(1), dp(2), dp(3))
             maxLines = 2
-            // ★ 固定高度：否则文本长短变化会让整个面板忽大忽小
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(30)
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(24)
             )
             ellipsize = android.text.TextUtils.TruncateAt.END
         }
-        root.addView(statusTv)
+        content.addView(statusTv)
 
-        // ---- 按钮 ----
-        root.addView(row(
-            // 截图是只读操作，不设门禁 —— 它正好用来确认「现在前台到底是谁」
-            "截图" to { act("截图", guard = false) { ShellCore.probe.quickCapture() } },
-            "按键诊断" to { act("按键诊断") { ShellCore.probe.keyDiagnostics(3) } },
-            "申请Root" to { act("申请Root", guard = false) { ShellCore.probe.requestRoot() } }
-        ))
-        root.addView(row(
-            "数字键1" to { act("数字键1") { ShellCore.probe.sendKey(8) } },
-            "方向→" to { act("方向右") { ShellCore.probe.sendKey(22) } },
-            "方向←" to { act("方向左") { ShellCore.probe.sendKey(21) } }
-        ))
-        root.addView(row(
+        // 5 行按钮（原来 7 行，横屏放不下）
+        content.addView(row(
             "★采点" to { togglePick() },
             "清点" to { clearPicks() },
-            "ROI显示" to { toggleRoi() }
+            "ROI" to { toggleRoi() },
+            "标定" to { calibrateTarget() }
         ))
-        root.addView(row(
+        content.addView(row(
             "点1" to { tapPick(0) },
             "点2" to { tapPick(1) },
             "点3" to { tapPick(2) },
             "点4" to { tapPick(3) }
         ))
-        root.addView(row(
-            "标定游戏" to { calibrateTarget() },
+        content.addView(row(
             "点5" to { tapPick(4) },
             "点6" to { tapPick(5) },
-            "键扫描" to { act("键扫描") { ShellCore.probe.keyScan(3) } }
+            "按法" to { cyclePressMode() }
+        ).also { r ->
+            // 保存「按法」按钮引用，切换档位时更新它的文字
+            pressBtn = r.getChildAt(2) as? Button
+            updatePressBtn()
+        })
+        content.addView(row(
+            "键扫描" to { act("键扫描") { ShellCore.probe.keyScan(3) } },
+            "诊断" to { act("按键诊断") { ShellCore.probe.keyDiagnostics(3) } },
+            "申请Root" to { act("申请Root", guard = false) { ShellCore.probe.requestRoot() } }
         ))
-        root.addView(row(
-            "点1短按" to { tapPick(0, 50) },
-            "点1长按" to { tapPick(0, 250) },
-            "点1自绘" to { tapPick(0, 150, "motionevent") }
-        ))
-        root.addView(row(
+        content.addView(row(
+            // 截图是只读操作，不设门禁 —— 它正好用来确认「现在前台到底是谁」
+            "截图" to { act("截图", guard = false) { ShellCore.probe.quickCapture() } },
             "复制日志" to { copyLog() },
-            "隐藏面板" to { hidePanel() }
+            "隐藏" to { hidePanel() }
         ))
 
-        // ---- 最近日志 ----
         logTv = TextView(this).apply {
             text = "（日志）"
             setTextColor(Color.parseColor("#C9D4E0"))
-            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 8f)
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 7f)
             typeface = Typeface.MONOSPACE
-            setPadding(dp(2), dp(4), dp(2), 0)
-            maxLines = 4
-            // ★ 固定高度：日志行数变化不能让面板跟着变
+            setPadding(dp(2), dp(3), dp(2), 0)
+            maxLines = 3
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(52)
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(34)
             )
             ellipsize = android.text.TextUtils.TruncateAt.END
             setHorizontallyScrolling(false)
         }
-        root.addView(logTv)
+        content.addView(logTv)
 
-        // ★ 固定宽度：内容长短不再影响面板尺寸，避免「随意变动大小」
-        val panelW = dp(262)
+        contentBox = content
+
+        // 内容放进 ScrollView —— 万一内容还是超高，可以滚动而不是顶出屏幕
+        val scroll = android.widget.ScrollView(this).apply {
+            addView(content)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            isVerticalScrollBarEnabled = true
+        }
+        contentScroll = scroll
+        root.addView(scroll)
+
+        // ---------------- 窗口参数 ----------------
         val p = WindowManager.LayoutParams(
-            panelW,
+            dp(PANEL_W_FULL),
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType(),
             // ★ 必须 NOT_FOCUSABLE：否则抢走游戏输入焦点，按键全部失效
@@ -278,13 +331,13 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = dp(12)
-            y = dp(12)
+            x = dp(10)
+            y = dp(10)
         }
 
-        // 拖动
+        // 拖动（标题栏整条都能拖）
         var downX = 0f; var downY = 0f; var startX = 0; var startY = 0
-        title.setOnTouchListener { _, e ->
+        titleBar.setOnTouchListener { _, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = e.rawX; downY = e.rawY; startX = p.x; startY = p.y; true
@@ -302,7 +355,62 @@ class OverlayService : Service() {
         panel = root
         panelParams = p
         runCatching { wm.addView(root, p) }
+            .onSuccess {
+                // 默认进精简模式（只显示运行状态），点 ▸ 展开
+                applyCompact()
+                // ★ 高度兜底：横屏只有 720px 高，展开后很容易顶出屏幕。
+                //   量一次实际高度，超了就限制 ScrollView 的高度让它内部滚动。
+                root.post { capPanelHeight() }
+            }
             .onFailure { LogBus.emit("悬浮窗添加失败: ${it.message}（多半是没有悬浮窗权限）") }
+    }
+
+    /**
+     * 高度兜底。
+     * 横屏 1280x720 时可用高度只有 720px，而展开后的面板内容很容易超过它。
+     * 这里把面板总高限制在屏幕的 88% 以内，超出部分交给 ScrollView 内部滚动。
+     */
+    private fun capPanelHeight() {
+        val root = panel ?: return
+        val scroll = contentScroll ?: return
+        val maxTotal = (resources.displayMetrics.heightPixels * 0.88f).toInt()
+        if (root.height > maxTotal) {
+            val titleH = (statusPill?.height ?: dp(20))
+            val limit = (maxTotal - titleH - dp(12)).coerceAtLeast(dp(60))
+            scroll.layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, limit
+            )
+            scroll.requestLayout()
+        }
+    }
+
+    /** 切换精简 / 展开。 */
+    private fun toggleCompact() {
+        compact = !compact
+        applyCompact()
+    }
+
+    private fun applyCompact() {
+        contentScroll?.visibility = if (compact) View.GONE else View.VISIBLE
+        collapseBtn?.text = if (compact) "▸" else "▾"
+        panelParams?.let { p ->
+            p.width = dp(if (compact) PANEL_W_COMPACT else PANEL_W_FULL)
+            panel?.let { v -> runCatching { wm.updateViewLayout(v, p) } }
+            if (!compact) panel?.post { capPanelHeight() }
+        }
+        LogBus.emit(if (compact) "面板：精简模式（只显示运行状态）" else "面板：展开")
+    }
+
+    /** 循环切换按压方式，按钮文字同步显示当前档位。 */
+    private fun cyclePressMode() {
+        pressIdx = (pressIdx + 1) % pressModes.size
+        val m = pressModes[pressIdx]
+        LogBus.emit("按压方式 -> ${m.first}（${m.second}ms / ${m.third}）")
+        updatePressBtn()
+    }
+
+    private fun updatePressBtn() {
+        pressBtn?.text = "按法:${pressModes[pressIdx].first}"
     }
 
     private fun row(vararg btns: Pair<String, () -> Unit>): LinearLayout {
@@ -311,12 +419,12 @@ class OverlayService : Service() {
             val b = Button(this).apply {
                 text = label
                 isAllCaps = false
-                setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 10f)
-                setPadding(dp(4), 0, dp(4), 0)
+                setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 9f)
+                setPadding(dp(2), 0, dp(2), 0)
                 minWidth = 0
                 minimumWidth = 0
-                layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f)
-                    .apply { marginEnd = dp(3) }
+                layoutParams = LinearLayout.LayoutParams(0, dp(26), 1f)
+                    .apply { marginEnd = dp(2) }
                 setOnClickListener { fn() }
             }
             r.addView(b)
@@ -441,7 +549,11 @@ class OverlayService : Service() {
     }
 
     /** 点击第 idx 个采集点（从 0 开始）。 */
-    private fun tapPick(idx: Int, pressMs: Int = 90, method: String = "swipe") {
+    private fun tapPick(idx: Int, pressMs: Int = -1, method: String = "") {
+        // 未显式指定时，用「按法」按钮当前选中的档位
+        val cur = pressModes[pressIdx]
+        val useMs = if (pressMs < 0) cur.second else pressMs
+        val useMethod = method.ifBlank { cur.third }
         val v = pickView
         // 采点层开着时也能点：先从它拿；关掉时从最后一次的副本拿
         val pts = v?.points ?: lastPicks
@@ -451,7 +563,7 @@ class OverlayService : Service() {
         }
         val (nx, ny) = pts[idx]
         act("点${idx + 1}") {
-            ShellCore.probe.tapNorm(nx.toDouble(), ny.toDouble(), "点${idx + 1}", pressMs, method)
+            ShellCore.probe.tapNorm(nx.toDouble(), ny.toDouble(), "点${idx + 1}", useMs, useMethod)
         }
     }
 
