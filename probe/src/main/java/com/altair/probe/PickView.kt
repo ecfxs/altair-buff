@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.view.MotionEvent
 import android.view.View
@@ -32,6 +33,9 @@ class PickView(ctx: Context) : View(ctx) {
     /** 每采到一个点回调：(序号从1开始, nx, ny)。 */
     var onPick: ((Int, Float, Float) -> Unit)? = null
 
+    /** 点「完成采点」时的回调 —— 用于退出采集模式。 */
+    var onFinish: (() -> Unit)? = null
+
     private val cross = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 4f
@@ -58,6 +62,27 @@ class PickView(ctx: Context) : View(ctx) {
         color = Color.parseColor("#33FFFFFF")
     }
 
+    // ---- 内置「完成采点」按钮 ----
+    // 为什么必须在采集层里自带一个退出按钮：采集层是全屏可触摸的，
+    // 会盖住悬浮面板，用户就没法回去点面板上的「★采点」来关闭了。
+    private val finishRect = RectF()
+    private var finishPressed = false
+    private val finishBg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.parseColor("#E62563EB")
+    }
+    private val finishEdge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+        color = Color.WHITE
+    }
+    private val finishText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = 40f
+        typeface = Typeface.DEFAULT_BOLD
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+    }
+
     init {
         isClickable = true
         setBackgroundColor(Color.TRANSPARENT)
@@ -65,8 +90,25 @@ class PickView(ctx: Context) : View(ctx) {
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
         when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> return true
+            MotionEvent.ACTION_DOWN -> {
+                finishPressed = finishRect.contains(e.x, e.y)
+                if (finishPressed) invalidate()
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (finishPressed && !finishRect.contains(e.x, e.y)) {
+                    finishPressed = false
+                    invalidate()
+                }
+                return true
+            }
             MotionEvent.ACTION_UP -> {
+                if (finishPressed) {
+                    finishPressed = false
+                    invalidate()
+                    onFinish?.invoke()      // 点的是「完成」按钮 → 退出采集，不记录坐标
+                    return true
+                }
                 if (width <= 0 || height <= 0) return true
                 val nx = (e.x / width).coerceIn(0f, 1f)
                 val ny = (e.y / height).coerceIn(0f, 1f)
@@ -118,5 +160,23 @@ class PickView(ctx: Context) : View(ctx) {
             canvas.drawCircle(cx + r + 22f, cy - r - 22f, 20f, dot)
             canvas.drawText(n, cx + r + 22f - (if (n.length > 1) 16f else 9f), cy - r - 11f, text)
         }
+
+        drawFinishButton(canvas, w, h)
+    }
+
+    private fun drawFinishButton(canvas: Canvas, w: Float, h: Float) {
+        val bw = 380f
+        val bh = 104f
+        val margin = 56f
+        finishRect.set(
+            (w - bw) / 2f, h - bh - margin,
+            (w - bw) / 2f + bw, h - margin
+        )
+        finishBg.color = if (finishPressed) Color.parseColor("#E63B82F6") else Color.parseColor("#E62563EB")
+        canvas.drawRoundRect(finishRect, 22f, 22f, finishBg)
+        canvas.drawRoundRect(finishRect, 22f, 22f, finishEdge)
+        val label = if (points.isEmpty()) "完成采点（还没采）" else "完成采点（已采 ${points.size} 个）"
+        val cy = finishRect.centerY() - (finishText.descent() + finishText.ascent()) / 2f
+        canvas.drawText(label, finishRect.centerX(), cy, finishText)
     }
 }

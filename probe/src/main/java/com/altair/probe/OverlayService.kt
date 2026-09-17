@@ -65,6 +65,7 @@ class OverlayService : Service() {
     private var roiView: RoiView? = null
     private var pickView: PickView? = null
     private var lastPicks: List<Pair<Float, Float>> = emptyList()
+    private var panelParams: WindowManager.LayoutParams? = null
     private var statusTv: TextView? = null
     private var logTv: TextView? = null
     private var selfBtn: Button? = null
@@ -260,6 +261,7 @@ class OverlayService : Service() {
         }
 
         panel = root
+        panelParams = p
         runCatching { wm.addView(root, p) }
             .onFailure { LogBus.emit("悬浮窗添加失败: ${it.message}（多半是没有悬浮窗权限）") }
     }
@@ -330,10 +332,17 @@ class OverlayService : Service() {
                 or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         )
+        v.onFinish = { ui.post { stopPick() } }
+
+        // ★ 顺序很重要：采集层是全屏可触摸的，若它加在面板之后就会盖住面板，
+        //   用户便无法回去点「★采点」来关闭 —— 会直接被困住。
+        //   所以先摘下面板 → 加采集层 → 再把面板加回去，保证面板在最上层可点。
+        panel?.let { runCatching { wm.removeView(it) } }
         runCatching { wm.addView(v, p) }
             .onSuccess {
                 pickView = v
-                LogBus.emit("采点模式：已开启 —— 请直接在游戏画面上依次点技能键的位置（1、2、3…）")
+                panel?.let { pnl -> panelParams?.let { pp -> runCatching { wm.addView(pnl, pp) } } }
+                LogBus.emit("采点模式：已开启 —— 在游戏画面上依次点技能键位置；点完点画面下方的「完成采点」")
             }
             .onFailure { LogBus.emit("采点层添加失败: ${it.message}") }
     }
