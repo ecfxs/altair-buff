@@ -45,7 +45,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
-        appendLine("P0 探测工具 v0.4 · 冒险岛世界/阿尔泰")
+        appendLine("P0 探测工具 v" + updater.currentVersionName() + " · 冒险岛世界/阿尔泰")
         appendLine("用途：实测 root 真伪、screencap 是否黑屏、真实 displayId、截图与按键时延。")
         appendLine()
         appendLine("推荐顺序：")

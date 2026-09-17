@@ -35,14 +35,24 @@ class Updater(
         private const val PREF = "updater"
         private const val KEY_URL = "apk_url"
         private const val KEY_AUTO = "auto_check"
+        /**
+         * 默认更新源：GitHub Release 的 latest 固定地址。
+         * 它**永远指向最新 release**，所以配一次就永久有效 —— 以后每次发新版
+         * 你只要在 App 里点「自更新」即可，不需要改任何东西。
+         */
+        const val DEFAULT_URL =
+            "https://github.com/ecfxs/altair-buff/releases/latest/download/probe-release.apk"
         private const val SCRIPT = "/data/local/tmp/altair_update.sh"
         private const val LOGFILE = "/data/local/tmp/altair_update.log"
     }
 
     // ------------------------------------------------------------ 配置持久化
 
-    fun savedUrl(): String =
-        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString(KEY_URL, "") ?: ""
+    /** 已保存的更新源；没保存过则返回 [DEFAULT_URL]。 */
+    fun savedUrl(): String {
+        val u = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString(KEY_URL, "") ?: ""
+        return u.ifBlank { DEFAULT_URL }
+    }
 
     fun saveUrl(u: String) =
         ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putString(KEY_URL, u.trim()).apply()
