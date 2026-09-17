@@ -61,6 +61,7 @@ class Management(private val ctx: Context, private val sh: RootShell) {
         private const val KEY_SERVER = "server"
         private const val KEY_INTERVAL = "intervalMs"
         private const val KEY_DEVICE = "deviceId"
+        private const val KEY_TOKEN = "deviceToken"
         private const val KEY_REVISION = "appliedRevision"
         const val DEFAULT_INTERVAL_MS = 60_000L
         const val CONFIG_FILE = "pulled_config.json"
@@ -82,6 +83,19 @@ class Management(private val ctx: Context, private val sh: RootShell) {
     var intervalMs: Long
         get() = sp().getLong(KEY_INTERVAL, DEFAULT_INTERVAL_MS)
         set(v) = sp().edit().putLong(KEY_INTERVAL, v.coerceAtLeast(15_000L)).apply()
+
+    /**
+     * 设备 Token。
+     *
+     * 与面板密码**互相独立** —— 服务端生成的两套密钥各管一边：
+     *   · 面板密码 → 人用，HTTP Basic Auth
+     *   · 设备 Token → 本 App 用，放 X-Altair-Token 头
+     * 这样 APK 里的 token 万一泄漏，也不会连带泄漏面板密码。
+     * Token 在集控面板页面上直接可以看到并复制。
+     */
+    var token: String
+        get() = sp().getString(KEY_TOKEN, "") ?: ""
+        set(v) = sp().edit().putString(KEY_TOKEN, v.trim()).apply()
 
     /** 设备唯一标识：首次使用时生成并固定下来。 */
     val deviceId: String
@@ -245,12 +259,14 @@ class Management(private val ctx: Context, private val sh: RootShell) {
             doOutput = true
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
             setRequestProperty("User-Agent", "altair-probe")
+            if (token.isNotBlank()) setRequestProperty("X-Altair-Token", token)
         }
         try {
             OutputStreamWriter(c.outputStream, "UTF-8").use { it.write(body) }
             val code = c.responseCode
             val stream = if (code in 200..299) c.inputStream else c.errorStream
             val text = stream?.bufferedReader()?.readText() ?: ""
+            if (code == 401) throw RuntimeException("HTTP 401 鉴权失败 —— 请检查「集控 Token」是否与服务器一致")
             if (code !in 200..299) throw RuntimeException("HTTP $code ${text.take(120)}")
             return text
         } finally {
@@ -264,9 +280,11 @@ class Management(private val ctx: Context, private val sh: RootShell) {
             connectTimeout = 10_000
             readTimeout = 15_000
             setRequestProperty("User-Agent", "altair-probe")
+            if (token.isNotBlank()) setRequestProperty("X-Altair-Token", token)
         }
         try {
             val code = c.responseCode
+            if (code == 401) throw RuntimeException("HTTP 401 鉴权失败 —— 请检查「集控 Token」是否与服务器一致")
             if (code !in 200..299) throw RuntimeException("HTTP $code")
             return c.inputStream.bufferedReader().readText()
         } finally {

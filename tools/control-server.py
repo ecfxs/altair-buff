@@ -35,9 +35,12 @@
 """
 
 import argparse
+import base64
+import hmac
 import html
 import json
 import os
+import secrets
 import sys
 import threading
 import time
@@ -46,6 +49,32 @@ from urllib.parse import urlparse, parse_qs
 
 STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "control-store.json")
 LOCK = threading.Lock()
+
+def gen_secret(nbytes=18):
+    """生成 URL 安全的随机密钥。"""
+    return secrets.token_urlsafe(nbytes)
+
+
+def ensure_auth(st):
+    """确保存储里有凭据；首次运行自动生成并落盘。
+
+    刻意把「面板密码」和「设备 token」分成两套：
+      · 面板密码 —— 人用，走 HTTP Basic Auth
+      · 设备 token —— APK 用，走 X-Altair-Token 头
+    两者独立，APK 里存的 token 泄漏不会连带泄漏面板密码。
+    """
+    a = st.setdefault("auth", {})
+    changed = False
+    if not a.get("panelUser"):
+        a["panelUser"] = "admin"; changed = True
+    if not a.get("panelPass"):
+        a["panelPass"] = gen_secret(12); changed = True
+    if not a.get("deviceToken"):
+        a["deviceToken"] = gen_secret(18); changed = True
+    if changed:
+        save_store(st)
+    return a
+
 
 DEFAULT_CONFIG = {
     "revision": "r1",
@@ -84,6 +113,54 @@ def save_store(d):
 class Handler(BaseHTTPRequestHandler):
     server_version = "AltairControl/1.0"
 
+    # ---------- 鉴权 ----------
+
+    def _auth(self):
+        with LOCK:
+            return dict(ensure_auth(load_store()))
+
+    def _panel_ok(self):
+        """面板：HTTP Basic Auth。浏览器会原生弹出登录框。"""
+        hdr = self.headers.get("Authorization", "") or ""
+        if not hdr.startswith("Basic "):
+            return False
+        try:
+            raw = base64.b64decode(hdr[6:]).decode("utf-8")
+            u, p = raw.split(":", 1)
+        except Exception:
+            return False
+        a = self._auth()
+        return (hmac.compare_digest(u, a["panelUser"])
+                and hmac.compare_digest(p, a["panelPass"]))
+
+    def _device_ok(self):
+        """设备 API：随机 Token，走 X-Altair-Token 头（也允许 ?token= 便于调试）。"""
+        a = self._auth()
+        tok = self.headers.get("X-Altair-Token", "") or ""
+        if not tok:
+            q = parse_qs(urlparse(self.path).query)
+            tok = (q.get("token") or [""])[0]
+        if not tok:
+            return False
+        return hmac.compare_digest(tok, a["deviceToken"])
+
+    def _deny_panel(self):
+        # 认证失败退避，拖慢暴力破解
+        time.sleep(1.0)
+        body = b"\n401 Unauthorized\n"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Altair Control"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        print(f"[auth] 面板认证失败 来自 {self.client_address[0]}")
+
+    def _deny_device(self):
+        time.sleep(0.5)
+        self._json({"ok": False, "error": "invalid or missing device token"}, 401)
+        print(f"[auth] 设备 token 无效 来自 {self.client_address[0]}")
+
     # ---------- 工具 ----------
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -114,6 +191,17 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
 
+        # 健康检查不需要鉴权（便于探活/排障）
+        if u.path == "/healthz":
+            return self._json({"ok": True, "ts": int(time.time())})
+
+        if u.path.startswith("/api/"):
+            if not self._device_ok():
+                return self._deny_device()
+        else:
+            if not self._panel_ok():
+                return self._deny_panel()
+
         if u.path == "/api/config":
             dev = (q.get("deviceId") or [""])[0]
             with LOCK:
@@ -139,6 +227,13 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- POST ----------
     def do_POST(self):
         u = urlparse(self.path)
+
+        if u.path.startswith("/api/"):
+            if not self._device_ok():
+                return self._deny_device()
+        else:
+            if not self._panel_ok():
+                return self._deny_panel()
 
         if u.path == "/api/report":
             try:
@@ -189,6 +284,7 @@ class Handler(BaseHTTPRequestHandler):
     def _panel(self):
         with LOCK:
             st = load_store()
+            ensure_auth(st)
         now = time.time()
 
         rows = []
@@ -237,6 +333,16 @@ class Handler(BaseHTTPRequestHandler):
  {''.join(rows)}
 </table>
 
+<h2>设备 Token（填到 App 的「集控 Token」输入框）</h2>
+<div style="background:#0b0e12;border:1px solid #3a4450;border-radius:5px;padding:9px;
+            font-family:ui-monospace,monospace;font-size:13px;color:#7fd18b;word-break:break-all">
+  {html.escape(st["auth"]["deviceToken"])}
+</div>
+<div class="muted" style="margin-top:5px">
+  面板账号 <code>{html.escape(st["auth"]["panelUser"])}</code> 的密码不在页面上显示
+  （在服务器执行 <code>python3 /opt/altair-control/control-server.py --show</code> 查看或更换）
+</div>
+
 <h2>默认配置（未单独配置的设备都用它）</h2>
 <textarea id="cfg">{html.escape(cfg)}</textarea>
 <div style="margin-top:8px">
@@ -270,21 +376,59 @@ def main():
         sys.stderr.reconfigure(line_buffering=True)
     except Exception:
         pass
-    ap = argparse.ArgumentParser()
+
+    ap = argparse.ArgumentParser(description="阿尔泰挂机 · 集控服务器")
     ap.add_argument("--port", type=int, default=8899)
     ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--show", action="store_true", help="打印当前凭据后退出")
+    ap.add_argument("--set-password", metavar="新密码", help="修改面板密码后退出")
+    ap.add_argument("--set-token", metavar="新Token", help="修改设备 Token 后退出")
     a = ap.parse_args()
 
-    st = load_store()
+    with LOCK:
+        st = load_store()
+        auth = ensure_auth(st)
+        save_store(st)
+
+    if a.show:
+        print("=" * 66)
+        print("  当前凭据")
+        print("=" * 66)
+        print(f"  面板地址    http://<本机IP>:{a.port}/")
+        print(f"  面板账号    {auth['panelUser']}")
+        print(f"  面板密码    {auth['panelPass']}")
+        print(f"  设备 Token  {auth['deviceToken']}")
+        print("=" * 66)
+        return
+
+    if a.set_password or a.set_token:
+        with LOCK:
+            st = load_store()
+            au = ensure_auth(st)
+            if a.set_password:
+                au["panelPass"] = a.set_password
+                print(f"面板密码已更新为: {a.set_password}")
+            if a.set_token:
+                au["deviceToken"] = a.set_token
+                print(f"设备 Token 已更新为: {a.set_token}")
+            save_store(st)
+        print("（改完记得重启服务： systemctl restart altair-control）")
+        return
+
     print("=" * 66)
     print("  阿尔泰挂机 · 集控服务器")
     print("=" * 66)
-    print(f"  面板      http://127.0.0.1:{a.port}/")
-    print(f"  设备填    http://<本机公网IP>:{a.port}")
-    print(f"  存储      {STORE_PATH}")
-    print(f"  已有设备  {len(st['devices'])} 台")
+    print(f"  面板        http://<本机IP>:{a.port}/")
+    print(f"  面板账号    {auth['panelUser']}")
+    print(f"  面板密码    {auth['panelPass']}")
+    print(f"  设备 Token  {auth['deviceToken']}")
+    print(f"  存储        {STORE_PATH}")
+    print(f"  已有设备    {len(st['devices'])} 台")
+    print("-" * 66)
+    print("  再次查看凭据: python3 control-server.py --show")
+    print("  改登录口令  : python3 control-server.py --set-password 新口令")
+    print("  改设备Token : python3 control-server.py --set-token 新Token")
     print("=" * 66)
-    print("提示：云手机在机房，需把本服务放到它有网可达的地址（公网 VPS / 内网穿透）")
     print()
     ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
 

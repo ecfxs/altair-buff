@@ -38,6 +38,7 @@ class MainActivity : Activity() {
     private lateinit var forceChk: CheckBox
     private lateinit var mgmtField: EditText
     private lateinit var mgmtChk: CheckBox
+    private lateinit var mgmtToken: EditText
     private val mgmt by lazy { Management(this, ShellCore.root) }
     // 与悬浮窗共用同一套核心（同一个 su 进程、同一份日志）
     private val probe get() = ShellCore.probe
@@ -184,6 +185,21 @@ class MainActivity : Activity() {
             ).apply { bottomMargin = dp(6) }
         }
         root.addView(mgmtField)
+
+        mgmtToken = EditText(this).apply {
+            hint = "集控 Token（在集控面板页面上可复制）"
+            setText(mgmt.token)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(Color.parseColor("#C9D4E0"))
+            setHintTextColor(Color.parseColor("#5A6675"))
+            setBackgroundColor(Color.parseColor("#161A20"))
+            inputType = InputType.TYPE_CLASS_TEXT
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(6) }
+        }
+        root.addView(mgmtToken)
 
         mgmtChk = CheckBox(this).apply {
             text = "启用集控定期上报（设备主动上报+拉配置，云手机在NAT后只能这么做）"
@@ -351,8 +367,14 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------ 集控
 
-    private fun runMgmtReport() {
+    private fun saveMgmtFields() {
         mgmt.server = mgmtField.text.toString()
+        mgmt.token = mgmtToken.text.toString()
+        mgmt.enabled = mgmtChk.isChecked
+    }
+
+    private fun runMgmtReport() {
+        saveMgmtFields()
         mgmt.enabled = mgmtChk.isChecked
         appendLine()
         appendLine("--- 集控：上报一次 ---")
@@ -363,7 +385,7 @@ class MainActivity : Activity() {
     }
 
     private fun runMgmtPull() {
-        mgmt.server = mgmtField.text.toString()
+        saveMgmtFields()
         appendLine()
         appendLine("--- 集控：拉取配置 ---")
         background("集控拉配置") {
@@ -375,14 +397,21 @@ class MainActivity : Activity() {
     private fun runShowDeviceId() {
         appendLine()
         appendLine("设备ID: ${mgmt.deviceId}")
+        appendLine("Token : ${mgmt.token.ifBlank { "(未填)" }}")
         appendLine("（把这个填进集控服务器的设备列表，即可按设备下发不同配置）")
     }
 
     /** 若勾选了集控，进入前台时启动上报循环。 */
     private fun maybeStartMgmt() {
-        mgmt.server = mgmtField.text.toString()
-        mgmt.enabled = mgmtChk.isChecked
-        if (mgmt.enabled) mgmt.start() else mgmt.stop()
+        saveMgmtFields()
+        if (mgmt.enabled) {
+            if (mgmt.token.isBlank()) {
+                appendLine("⚠ 集控已勾选启用，但 Token 为空 —— 服务器会返回 401。请从集控面板复制 Token 填入。")
+            }
+            mgmt.start()
+        } else {
+            mgmt.stop()
+        }
     }
 
     // ------------------------------------------------------------ Root 权限
