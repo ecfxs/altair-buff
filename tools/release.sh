@@ -18,6 +18,8 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+# shellcheck source=/dev/null
+[ -f "$ROOT/.toolchain/env.sh" ] && source "$ROOT/.toolchain/env.sh"
 
 VER="${1:-}"
 REPO="${2:-}"
@@ -41,8 +43,10 @@ if [ "$CUR_VER" != "$VER" ]; then
   sed -i '' "s|versionName = \"$CUR_VER\"|versionName = \"$VER\"|" probe/build.gradle.kts
   sed -i '' "s|versionCode = $CUR_CODE|versionCode = $NEW_CODE|" probe/build.gradle.kts
   echo "版本号: $CUR_VER($CUR_CODE) -> $VER($NEW_CODE)"
+  NEW_CODE_FINAL=$NEW_CODE
 else
   echo "版本号已是 $VER (code=$CUR_CODE)"
+  NEW_CODE_FINAL=$CUR_CODE
 fi
 
 # ---------------------------------------------------------------- 2) 构建
@@ -88,19 +92,71 @@ else
   gh release create "$TAG" "$APK#probe-release.apk" -R "$REPO" -t "$TAG" -n "$NOTES"
 fi
 
-# ---------------------------------------------------------------- 5) 输出地址
+# ---------------------------------------------------------------- 5) 同步 dist（jsDelivr 源）
+#
+# 教训：dist/ 曾长期停留在 v0.6.0 —— 因为发布新版时忘了同步，
+# 导致 jsDelivr 那条备用源一直提供旧包。现在并入发布流程，不再依赖人工记得。
+echo
+echo "==== 同步 dist/ 供 jsDelivr 使用 ===="
+mkdir -p "$ROOT/dist"
+cp "$APK" "$ROOT/dist/probe-release.apk"
+git add -A
+if git diff --cached --quiet; then
+  echo "  dist 无变化"
+  PUSHED=1
+else
+  git commit -q -m "dist: 同步到 $TAG"
+  PUSHED=0
+  for i in $(seq 1 12); do
+    if git push origin HEAD 2>/dev/null; then PUSHED=1; break; fi
+    echo "  推送重试 $i / 12 ..."
+    sleep 15
+  done
+  [ "$PUSHED" = "1" ] && echo "  ✅ dist 已推送" \
+    || echo "  ⚠ dist 推送失败（GitHub 不通），jsDelivr 源会停留在旧版"
+fi
+
+# ---------------------------------------------------------------- 6) 清 jsDelivr 缓存
+if [ "$PUSHED" = "1" ]; then
+  echo -n "  清除 jsDelivr 缓存: "
+  if curl -sS --max-time 30 "https://purge.jsdelivr.net/gh/$REPO@main/dist/probe-release.apk" >/dev/null 2>&1; then
+    echo "已请求 ✅"
+  else
+    echo "请求失败（不影响，jsDelivr 会自行过期）"
+  fi
+fi
+
+# ---------------------------------------------------------------- 7) 多源验证
 LATEST="https://github.com/$REPO/releases/latest/download/probe-release.apk"
 PINNED="https://github.com/$REPO/releases/download/$TAG/probe-release.apk"
+JSD="https://cdn.jsdelivr.net/gh/$REPO@main/dist/probe-release.apk"
+AAPT="${ANDROID_SDK_ROOT:-/nonexistent}/build-tools/33.0.1/aapt2"
+
+ver_of() {
+  local u="$1"
+  rm -f /tmp/_relchk.apk
+  curl -sSL --max-time 90 -o /tmp/_relchk.apk "$u" 2>/dev/null
+  if [ -s /tmp/_relchk.apk ] && [ -x "$AAPT" ]; then
+    "$AAPT" dump badging /tmp/_relchk.apk 2>/dev/null | grep -oE "versionCode='[0-9]+'" | head -1 | tr -dc 0-9
+  fi
+}
+
 echo
 echo "============================================================"
-echo " 发布完成"
+echo " 发布完成   $TAG"
 echo "============================================================"
-echo " 【固定地址】配进 App 的更新源，一次配好永久有效："
-echo "   $LATEST"
+echo " App 内置 4 个更新源（按顺序自动切换）："
+echo "   1. gh-proxy  https://gh-proxy.com/$LATEST"
+echo "   2. ghfast    https://ghfast.top/$LATEST"
+echo "   3. GitHub    $LATEST"
+echo "   4. jsDelivr  $JSD"
 echo
-echo " 【版本地址】用于回滚到指定版本："
+echo " 回滚用版本地址:"
 echo "   $PINNED"
 echo
-echo -n " 可用性检查: "
-curl -sSL -o /dev/null -w "HTTP %{http_code}  %{size_download} bytes\n" -r 0-2000 "$LATEST" 2>&1 | tail -1
+echo " 各源当前提供的 versionCode（期望 = $NEW_CODE_FINAL）:"
+printf "   %-12s %s\n" "gh-proxy" "$(ver_of "https://gh-proxy.com/$LATEST")"
+printf "   %-12s %s\n" "ghfast"   "$(ver_of "https://ghfast.top/$LATEST")"
+printf "   %-12s %s\n" "GitHub"  "$(ver_of "$LATEST")"
+printf "   %-12s %s\n" "jsDelivr" "$(ver_of "$JSD")"
 echo "============================================================"

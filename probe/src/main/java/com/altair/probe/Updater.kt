@@ -44,6 +44,32 @@ class Updater(
             "https://github.com/ecfxs/altair-buff/releases/latest/download/probe-release.apk"
         private const val SCRIPT = "/data/local/tmp/altair_update.sh"
         private const val LOGFILE = "/data/local/tmp/altair_update.log"
+
+        /** GitHub Release 资产地址（所有代理都基于它）。 */
+        private const val GH_ASSET =
+            "https://github.com/ecfxs/altair-buff/releases/latest/download/probe-release.apk"
+
+        /**
+         * 更新源列表，**按国内可达性排序**。
+         *
+         * P0 实测（2026-09-17，国内网络）：
+         *   GitHub 直连   ❌ 完全不通（30s 超时）
+         *   gh-proxy.com  ✅ 410 KB/s，文件完整   ← 最快
+         *   ghfast.top    ✅ 200 KB/s，文件完整
+         *   jsDelivr CDN  ✅ 224 KB/s，但可能因 CDN 缓存滞留**旧版**
+         *
+         * 所以把代理放前面（最可能通、且始终指向 latest），GitHub 直连放中间，
+         * jsDelivr 放最后（它能通但新鲜度不保证）。
+         *
+         * 第三方代理是公共服务，可能失效 —— 这正是要**多源冗余**的原因。
+         */
+        val SOURCES: List<Pair<String, String>> = listOf(
+            "gh-proxy 代理" to "https://gh-proxy.com/$GH_ASSET",
+            "ghfast 代理" to "https://ghfast.top/$GH_ASSET",
+            "GitHub 直连" to GH_ASSET,
+            "jsDelivr CDN" to
+                "https://cdn.jsdelivr.net/gh/ecfxs/altair-buff@main/dist/probe-release.apk"
+        )
     }
 
     // ------------------------------------------------------------ 配置持久化
@@ -89,6 +115,59 @@ class Updater(
     /** 判断上次自更新是否留下了待确认的结果。 */
     fun hasUpdateLog(): Boolean =
         ensure() && sh.exec("test -f $LOGFILE && echo YES", 4000).contains("YES")
+
+    // ------------------------------------------------------------ 多源自动更新
+
+    /**
+     * 依次尝试全部更新源，找到比当前**版本更高**的就装。
+     *
+     * 关键：不是「第一个能下就用」，而是「下到了还要比版本」——
+     * 因为 jsDelivr 这类 CDN 可能仍缓存旧版，若先下到旧包就立刻判定
+     * 「已是最新」，会导致**静默地永远不更新**。所以每个源都要校验 versionCode。
+     */
+    fun updateAuto(force: Boolean): String {
+        if (!ensure()) return "root shell 不可用，无法自更新"
+        val cur = currentVersionCode()
+        val sb = StringBuilder()
+        sb.append("当前版本 versionCode=$cur (${currentVersionName()})\n")
+        sb.append("依次尝试 ${SOURCES.size} 个更新源…\n\n")
+
+        var anyReachable = false
+        for ((name, url) in SOURCES) {
+            val apk = File(ctx.cacheDir, "update.apk")
+            sb.append("▸ $name\n")
+            val got = try {
+                download(url, apk, connectMs = 10_000, readMs = 90_000)
+                apk.length() > 1000
+            } catch (t: Throwable) {
+                sb.append("   不可达: ${(t.message ?: t.javaClass.simpleName).take(70)}\n")
+                false
+            }
+            if (!got) continue
+            anyReachable = true
+
+            val info = ctx.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)
+            if (info == null) { sb.append("   不是有效 APK\n"); continue }
+            if (info.packageName != ctx.packageName) {
+                sb.append("   包名不匹配: ${info.packageName}\n"); continue
+            }
+            val v = info.longVersionCode
+            sb.append("   下载 ${apk.length() / 1024} KB   versionCode=$v\n")
+            if (v > cur) {
+                sb.append("\n✅ 找到更高版本（$cur → $v），来源：$name\n\n")
+                sb.append(installDetached(apk.absolutePath))
+                return sb.toString()
+            }
+            sb.append("   不高于当前版本，继续试下一个源\n")
+        }
+
+        sb.append("\n")
+        sb.append(
+            if (!anyReachable) "❌ 所有更新源都不可达。网络受限时可改用「安装本地APK」。"
+            else "✅ 已是最新版本（所有可达源都未提供更高版本）"
+        )
+        return sb.toString()
+    }
 
     // ------------------------------------------------------------ 从 URL 更新
 
@@ -209,7 +288,13 @@ class Updater(
 
     // ------------------------------------------------------------ 下载
 
-    private fun download(rawUrl: String, out: File, onPct: (Int) -> Unit) {
+    private fun download(
+        rawUrl: String,
+        out: File,
+        connectMs: Int = 20_000,
+        readMs: Int = 60_000,
+        onPct: (Int) -> Unit = {}
+    ) {
         out.delete()
         // ★ 缓存破坏参数，必须有。
         // GitHub 的 /releases/latest/download/ 重定向会被 CDN 按 URL 缓存。
@@ -221,8 +306,8 @@ class Updater(
         var conn: HttpURLConnection? = null
         try {
             conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 20000
-                readTimeout = 60000
+                connectTimeout = connectMs
+                readTimeout = readMs
                 instanceFollowRedirects = true
                 useCaches = false
                 setRequestProperty("User-Agent", "altair-probe")

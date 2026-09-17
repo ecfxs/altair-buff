@@ -61,6 +61,9 @@ class MainActivity : Activity() {
         appendLine("  ⑥ 按键通道诊断             — 区分「注入失败」还是「游戏不认键」★★★")
         appendLine("  ⑦ 触摸测试                 — 键盘走不通时，验证触摸点击方案")
         appendLine()
+        appendLine("自更新：点「自更新(多源)」会自动在 代理/GitHub/jsDelivr 之间切换")
+        appendLine("        （实测 GitHub 直连在国内经常不通，故默认走代理）")
+        appendLine()
         appendLine("注意：探测会反复执行 screencap，游戏会短暂卡顿，属正常。")
         appendLine()
         appendLine("准备就绪。")
@@ -94,7 +97,7 @@ class MainActivity : Activity() {
 
         root.addView(buttonRow(
             "★ 申请Root权限" to { runRequestRoot() },
-            "自更新" to { runSelfUpdate() }
+            "自更新(多源)" to { runSelfUpdate() }
         ))
         root.addView(buttonRow(
             "① 开始探测" to { runProbe() },
@@ -156,6 +159,7 @@ class MainActivity : Activity() {
         root.addView(optRow)
 
         root.addView(buttonRow(
+            "按URL更新" to { runUpdateByUrl() },
             "安装本地APK" to { runLocalInstall() },
             "更新日志" to { runShowUpdateLog() }
         ))
@@ -331,14 +335,29 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------ 自更新
 
+    /**
+     * 自更新（多源）：依次尝试 gh-proxy → ghfast → GitHub 直连 → jsDelivr，
+     * 找到版本更高的才装。因为 GitHub 在国内经常连不上，单源不可靠。
+     */
     private fun runSelfUpdate() {
+        updater.setAutoCheck(autoChk.isChecked)
+        appendLine()
+        appendLine("--- 自更新（多源自动切换）---")
+        appendLine("源顺序: " + Updater.SOURCES.joinToString(" → ") { it.first })
+        background("自更新") {
+            val r = updater.updateAuto(forceChk.isChecked)
+            runOnUiThread { r.split('\n').forEach { appendLine(it) } }
+        }
+    }
+
+    /** 按输入框里的自定义 URL 更新（用于自建源/回滚到指定版本）。 */
+    private fun runUpdateByUrl() {
         val url = urlField.text.toString().trim()
         if (url.isEmpty()) { toast("请先填更新源 URL"); return }
         updater.saveUrl(url)
-        updater.setAutoCheck(autoChk.isChecked)
         appendLine()
-        appendLine("--- 自更新 ---")
-        background("自更新") {
+        appendLine("--- 按指定 URL 更新 ---")
+        background("按URL更新") {
             val r = updater.updateFromUrl(url, forceChk.isChecked)
             runOnUiThread { r.split('\n').forEach { appendLine(it) } }
         }
