@@ -74,9 +74,15 @@ class MainActivity : Activity() {
             busyStrip.setTextColor(
                 Color.parseColor(if (l == null) "#7FD18B" else "#FFD479")
             )
+            // 引擎在跑时，让运行页的倒计时也实时走
+            if (tab == 0 && Engine.isRunning && System.currentTimeMillis() - lastRunRefresh > 900) {
+                lastRunRefresh = System.currentTimeMillis()
+                refreshRunStatus()
+            }
             ticker.postDelayed(this, 250)
         }
     }
+    private var lastRunRefresh = 0L
 
     // ---- 日志页 ----
     private lateinit var logScroll: ScrollView
@@ -195,6 +201,10 @@ class MainActivity : Activity() {
         ))
 
         c.addView(row(
+            "▶ 启动挂机" to { startEngine() },
+            "⏹ 停止挂机" to { stopEngine() }
+        ))
+        c.addView(row(
             "启动悬浮窗" to { startOverlay() },
             "停止悬浮窗" to { stopOverlay() }
         ))
@@ -230,6 +240,17 @@ class MainActivity : Activity() {
             val pts = OverlayService.pickedPointsOf(this)
             val txt = buildString {
                 append(if (armed) "🟢 游戏中 · 动作已启用" else "🔴 非游戏 · 动作已禁用").append('\n')
+                append("── 挂机引擎 ──").append('\n')
+                append("状态     : ").append(engineStateText()).append('\n')
+                append("下次补BUFF: ").append(countdownText()).append('\n')
+                append("已完成   : ").append(Engine.cycleCount).append(" 轮")
+                if (Engine.failStreak > 0) append("（连续失败 ${Engine.failStreak}）")
+                append('\n')
+                if (Engine.lastResult.isNotBlank()) append("上次结果 : ").append(Engine.lastResult).append('\n')
+                if (Engine.lastError.isNotBlank()) append("最近错误 : ").append(Engine.lastError).append('\n')
+                append("输入方式 : ").append(inputMethodLabel()).append('\n')
+                append("周期     : ").append(periodText()).append('\n')
+                append("── 环境 ──").append('\n')
                 append("前台应用 : ").append(if (fg.isBlank()) "未知" else fg).append('\n')
                 append("目标游戏 : ").append(target).append('\n')
                 append("悬浮窗   : ").append(if (OverlayService.running) "运行中" else "未启动").append('\n')
@@ -239,6 +260,57 @@ class MainActivity : Activity() {
             }
             runOnUiThread { runStatus.text = txt }
         }.apply { isDaemon = true }.start()
+    }
+
+    private fun engineStateText(): String = when (Engine.state) {
+        Engine.State.IDLE -> "空闲（未启动）"
+        Engine.State.WAITING -> "运行中 · 等待下一次"
+        Engine.State.CASTING -> "正在补 BUFF…"
+        Engine.State.PAUSED -> "已暂停"
+        Engine.State.ERROR -> "出错已熔断（需人工）"
+    }
+
+    private fun countdownText(): String {
+        if (!Engine.isRunning || Engine.nextDueAt <= 0) return "—"
+        val left = Engine.nextDueAt - System.currentTimeMillis()
+        if (left <= 0) return "即将执行"
+        val sec = left / 1000
+        return "%d分%02d秒后".format(sec / 60, sec % 60)
+    }
+
+    private fun periodText(): String {
+        val p = Engine.cyclePeriodMs()
+        return if (p <= 0) "未配置（设置页填 BUFF 时长后自动算）" else "%.1f 分钟".format(p / 60000.0)
+    }
+
+    private fun inputMethodLabel(): String =
+        if (inputMethodPref() == "touch") "触摸点击（用采集的坐标）" else "键盘按键（数字键 1-4）"
+
+    private fun inputMethodPref(): String =
+        getSharedPreferences("overlay", Context.MODE_PRIVATE).getString("inputMethod", "keyevent") ?: "keyevent"
+
+    private fun startEngine() {
+        Engine.buffConfig()   // 确保上下文已初始化
+        val period = Engine.cyclePeriodMs()
+        if (period <= 0) {
+            log("⛔ 启动失败：没有任何 BUFF 被启用，或时长未填。请到「设置」页配置 BUFF。")
+            toast("请先在设置页配置 BUFF")
+            switchTab(1)
+            return
+        }
+        if (inputMethodPref() == "touch" && OverlayService.pickedPointsOf(this).size < 4) {
+            log("⛔ 启动失败：输入方式是触摸，但还没采集技能键坐标（需 4 个点）。")
+            toast("请先在悬浮窗采点")
+            return
+        }
+        Engine.start(this)
+        switchTab(2)
+        refreshRunStatus()
+    }
+
+    private fun stopEngine() {
+        Engine.stop()
+        refreshRunStatus()
     }
 
     // ============================================================ 设置页
@@ -291,6 +363,28 @@ class MainActivity : Activity() {
         loadBuffConfig()
         c.addView(card("BUFF 技能（按职业设 1~3 个，持续时间决定补的间隔）", buffBox))
         c.addView(row("保存 BUFF 配置" to { saveBuffConfig() }))
+
+        // 输入方式：实测键盘与触摸哪个可用一直没定论，所以做成可切换
+        c.addView(section("技能键输入方式"))
+        val imRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val imSp = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                listOf("键盘按键 input keyevent 1-4", "触摸点击 input swipe 采集坐标"))
+            setSelection(if (inputMethodPref() == "touch") 1 else 0)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        imRow.addView(imSp)
+        c.addView(imRow)
+        c.addView(row("保存输入方式" to {
+            val m = if (imSp.selectedItemPosition == 1) "touch" else "keyevent"
+            getSharedPreferences("overlay", Context.MODE_PRIVATE)
+                .edit().putString("inputMethod", m).apply()
+            log("技能键输入方式已设为：" + if (m == "touch") "触摸点击" else "键盘按键")
+            refreshRunStatus()
+        }))
+        c.addView(note("说明：方向键已实测可用，说明键盘通道是通的；但数字键 1-4 在野外实测无响应。" +
+            "若「键扫描」找到能触发技能的键，用键盘；否则改用触摸（需先在悬浮窗采点）。"))
 
         // ---------- 坐标 ----------
         c.addView(buttonRow(

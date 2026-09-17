@@ -66,10 +66,19 @@ PY
     # 关键：真跑一遍 refresh()
     cat > /tmp/_chk_run.js <<'EOF'
 const els={};
-const mk=id=>(els[id]={id,innerHTML:'加载中…',textContent:'',value:'',style:{},matches:()=>false});
-['s-total','s-online','s-armed','s-upd','bar','devs','token','cfg','dev','msg'].forEach(mk);
-global.document={getElementById:id=>els[id]};
+const mk=id=>(els[id]={id,innerHTML:'加载中…',textContent:'',value:'',checked:false,style:{},
+  classList:{add(){},remove(){},contains(){return false}},matches:()=>false});
+// 面板会用到哪些 DOM id，桩就得有哪些 —— 缺一个就会在检查里暴露出来
+['s-total','s-online','s-run','s-cycle','s-upd','devs','token','f-dev','f-pkg','f-input',
+ 'f-notes','f-buffs','msg','modal','m-title','m-body',
+ 'b-en0','b-en1','b-en2','b-key0','b-key1','b-key2','b-dur0','b-dur1','b-dur2'].forEach(mk);
+global.document={getElementById:id=>els[id]||mk(id), addEventListener(){}, querySelector:()=>null};
 global.setInterval=()=>0;
+// ★ 保存真实定时器再覆盖。之前直接吞掉带延时的回调，导致断言根本没执行 ——
+//   那是最危险的一类失败：检查显示"通过"，其实什么都没验。
+const __realST = global.setTimeout.bind(global);
+global.setTimeout = (f, t) => __realST(f, Math.min(t === undefined ? 0 : t, 60));
+global.alert=()=>{};
 global.fetch=async u=>u.startsWith('/api/devices')
   ? {json:async()=>({devices:{'dev1':{lastSeen:Date.now()/1000-10,
       lastReport:{versionName:'x',armed:true,foreground:'g',targetPkg:'g',logTail:['a']}}},
@@ -78,13 +87,19 @@ global.fetch=async u=>u.startsWith('/api/devices')
 EOF
     cat /tmp/_chk_panel.js >> /tmp/_chk_run.js
     cat >> /tmp/_chk_run.js <<'EOF'
+global.__asserted = false;
 setTimeout(()=>{
+  global.__asserted = true;
   const rendered = els['devs'].innerHTML.includes('dev1');
   const total = String(els['s-total'].textContent) === '1';
   if (rendered && total) { console.log('  ✅ refresh() 真跑通过，设备卡片能渲染'); process.exit(0); }
   console.log('  ❌ refresh() 未渲染出设备卡片'); console.log('     devs=',els['devs'].innerHTML.slice(0,100));
   console.log('     total=',els['s-total'].textContent); process.exit(1);
 },300);
+// 看门狗：断言若从未执行，判失败（防止"假通过"）
+__realST(()=>{
+  if(!global.__asserted){ console.log('  ❌ 断言未执行 —— 检查脚本自身有问题，判失败'); process.exit(1); }
+}, 2500);
 EOF
     if ! node /tmp/_chk_run.js; then FAIL=1; fi
   else

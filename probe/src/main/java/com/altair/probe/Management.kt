@@ -62,6 +62,7 @@ class Management(private val ctx: Context, private val sh: RootShell) {
         private const val KEY_INTERVAL = "intervalMs"
         private const val KEY_DEVICE = "deviceId"
         private const val KEY_TOKEN = "deviceToken"
+        private const val KEY_DESIRED_REV = "desiredRev"
         private const val KEY_REVISION = "appliedRevision"
         const val DEFAULT_INTERVAL_MS = 60_000L
         const val CONFIG_FILE = "pulled_config.json"
@@ -137,6 +138,14 @@ class Management(private val ctx: Context, private val sh: RootShell) {
             o.put("versionCode", pi.longVersionCode)
             o.put("versionName", pi.versionName ?: "")
         }
+        // 设备型号 —— 多机挂机时靠它区分"这是哪台云手机"
+        runCatching {
+            o.put("model", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+            o.put("android", android.os.Build.VERSION.RELEASE)
+            o.put("deviceId", deviceId)
+        }
+        // 引擎状态 —— 监控台据此显示 BUFF 进度
+        runCatching { o.put("engine", Engine.statusJson()) }
         runCatching {
             val target = OverlayService.targetPkgOf(ctx)
             o.put("targetPkg", target)
@@ -187,6 +196,20 @@ class Management(private val ctx: Context, private val sh: RootShell) {
     /** 应用配置里我们认识的字段；不认识的只记录，不报错。 */
     private fun applyConfig(o: JSONObject): List<String> {
         val msgs = mutableListOf<String>()
+
+        // ---- 远程启停（desired state 模式）----
+        // 云手机在 NAT 后服务器连不上它，所以命令搭在设备轮询的返回里。
+        // 用 rev 去重：只有 rev 变了才执行，避免每轮都重复启停。
+        o.optJSONObject("desired")?.let { d ->
+            val rev = d.optInt("rev", 0)
+            val applied = sp().getInt(KEY_DESIRED_REV, -1)
+            if (rev != applied) {
+                val want = d.optBoolean("running", false)
+                if (want) Engine.start(ctx) else Engine.stop("监控台下发停止")
+                sp().edit().putInt(KEY_DESIRED_REV, rev).apply()
+                msgs += "远程指令：${if (want) "启动" else "停止"}（rev=$rev）"
+            }
+        }
         o.optString("targetPkg", "").takeIf { it.isNotBlank() }?.let {
             OverlayService.setTargetPkgOf(ctx, it)
             msgs += "targetPkg = $it"
@@ -207,6 +230,28 @@ class Management(private val ctx: Context, private val sh: RootShell) {
                 OverlayService.savePickedPointsOf(ctx, pts)
                 msgs += "skillPoints 共 ${pts.size} 个"
             }
+        }
+        // 远程改输入方式
+        o.optString("inputMethod", "").takeIf { it.isNotBlank() }?.let {
+            ctx.getSharedPreferences("overlay", Context.MODE_PRIVATE)
+                .edit().putString("inputMethod", it).apply()
+            msgs += "inputMethod = $it"
+        }
+        // 远程下发 BUFF 配置（个数/按键/时长）→ 写进 buff SharedPreferences，引擎直接读
+        o.optJSONArray("buff")?.let { arr ->
+            val ed = ctx.getSharedPreferences("buff", Context.MODE_PRIVATE).edit()
+            var n = 0
+            for (i in 0 until arr.length()) {
+                val b = arr.optJSONObject(i) ?: continue
+                val idx = b.optInt("idx", i + 1) - 1          // 上报用 1 基，存储用 0 基
+                if (idx !in 0..2) continue
+                ed.putBoolean("enabled$idx", b.optBoolean("enabled", false))
+                ed.putInt("key$idx", (b.optInt("key", idx + 1) - 1).coerceIn(0, 3))
+                ed.putInt("dur$idx", b.optInt("durationMin", 5).coerceIn(1, 240))
+                n++
+            }
+            ed.apply()
+            if (n > 0) msgs += "BUFF 配置已更新 $n 项"
         }
         o.optString("notes", "").takeIf { it.isNotBlank() }?.let { msgs += "notes: $it" }
         if (msgs.isEmpty()) msgs += "(配置里没有本版本认识的字段)"
