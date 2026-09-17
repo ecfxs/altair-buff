@@ -77,7 +77,10 @@ def ensure_auth(st):
 
 
 
-PANEL_HTML = """<!DOCTYPE html>
+# 注意：必须是**原始字符串** r""" —— 里面 JS 的 \n 要原样保留。
+# 用普通 """ 会让 Python 把 \n 转成真实换行，把 JS 字符串字面量截断，
+# 结果是整个面板脚本语法失效、页面永远停在「加载中」。
+PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>阿尔泰挂机 · 监控台</title>
