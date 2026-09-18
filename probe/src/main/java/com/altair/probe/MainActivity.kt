@@ -98,6 +98,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ShellCore.init(this)
+        Engine.init(this)   // ★ 必须早于任何读引擎配置的代码（否则「更新后一打开就闪退」）
         buildUi()
         LogBus.add(logListener)
         // 把之前累积的日志倒进来
@@ -234,6 +235,10 @@ class MainActivity : Activity() {
 
     private fun refreshRunStatus() {
         Thread {
+            // ★ 整体兜一层：后台线程里的未捕获异常会直接杀掉 App。
+            //   历史上正是这里的 NPE 造成「更新后一打开就闪退」——即使以后再出别的意外，
+            //   也只应写一条日志，而不是让整个 App 消失。
+            runCatching {
             val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
             val target = OverlayService.targetPkgOf(this)
             val armed = fg == target
@@ -259,6 +264,9 @@ class MainActivity : Activity() {
                 if (pts.size >= 4) append("（技能键已就绪）")
             }
             runOnUiThread { runStatus.text = txt }
+            }.onFailure {
+                LogBus.emit("刷新运行状态失败：${it.javaClass.simpleName}: ${it.message}")
+            }
         }.apply { isDaemon = true }.start()
     }
 

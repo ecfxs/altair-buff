@@ -56,13 +56,15 @@ object Engine {
 
     // ------------------------------------------------------------ 配置读取
 
-    private fun buffPrefs(): android.content.SharedPreferences =
-        ctx!!.getSharedPreferences("buff", Context.MODE_PRIVATE)
+    private fun buffPrefs(): android.content.SharedPreferences? =
+        ctx?.getSharedPreferences("buff", Context.MODE_PRIVATE)
 
     data class BuffCfg(val idx: Int, val enabled: Boolean, val key: Int, val durMin: Int)
 
     fun buffConfig(): List<BuffCfg> {
-        val sp = buffPrefs()
+        // 上下文没注入时返回空配置，**绝不抛异常** —— 界面启动时就要读它算周期，
+        // 这里一崩就是整个 App 崩（后台线程里的未捕获异常会带走进程）。
+        val sp = buffPrefs() ?: return emptyList()
         return (0 until 3).map { i ->
             BuffCfg(
                 idx = i,
@@ -75,15 +77,14 @@ object Engine {
 
     /** 回城模式：补完 BUFF 自动进自由市场等待（配置项 autoFreeMarket，默认关）。 */
     private fun autoFreeMarket(): Boolean =
-        ctx!!.getSharedPreferences("buff", Context.MODE_PRIVATE)
-            .getBoolean("autoFreeMarket", false)
+        buffPrefs()?.getBoolean("autoFreeMarket", false) ?: false
 
     /** 当前是否停在自由市场里。只在本进程内维护 —— 重启后按"未知"处理，下一轮会先尝试出市场。 */
     @Volatile private var inMarket = false
 
     private fun inputMethod(): String =
-        ctx!!.getSharedPreferences("overlay", Context.MODE_PRIVATE)
-            .getString("inputMethod", "keyevent") ?: "keyevent"
+        ctx?.getSharedPreferences("overlay", Context.MODE_PRIVATE)
+            ?.getString("inputMethod", "keyevent") ?: "keyevent"
 
     /** 循环周期 = 最短 BUFF 时长 × 0.94（留 6% 余量吸收抖动与卡顿）。 */
     fun cyclePeriodMs(): Long {
@@ -93,10 +94,23 @@ object Engine {
 
     // ------------------------------------------------------------ 生命周期
 
-    fun start(context: Context) {
-        if (running) { LogBus.emit("引擎已在运行"); return }
+    /**
+     * 注入上下文。**界面 onCreate 时就要调**。
+     *
+     * 为什么必须提前调用：引擎没启动时也有代码要读配置 —— 主界面刷新状态的「周期」那一行
+     * 会走 cyclePeriodMs → buffConfig。此前 ctx 只在 start() 里赋值，于是
+     * 「更新后第一次打开」必崩：`pm install -r` 会重启进程，此时 ctx 还是 null，
+     * 而后台线程里的 NPE 会直接带走整个 App —— 而且崩在「启动引擎」之前，
+     * 所以之后每次打开都一样，用户看到的就是「一打开就闪退」。
+     */
+    fun init(context: Context) {
         ctx = context.applicationContext
         MarketFlow.init(context)
+    }
+
+    fun start(context: Context) {
+        if (running) { LogBus.emit("引擎已在运行"); return }
+        init(context)
         val period = cyclePeriodMs()
         if (period <= 0) {
             LogBus.emit("⛔ 无法启动：没有任何 BUFF 被启用，或时长未填。请到「设置」页配置。")
@@ -104,7 +118,7 @@ object Engine {
             return
         }
         val touch = inputMethod() == "touch"
-        if (touch && OverlayService.pickedPointsOf(ctx!!).size < 4) {
+        if (touch && OverlayService.pickedPointsOf(context).size < 4) {
             LogBus.emit("⛔ 无法启动：输入方式为触摸，但还没采集技能键坐标（需 4 个点）。")
             state = State.ERROR; lastError = "触摸方式但缺技能键坐标"
             return
@@ -112,7 +126,7 @@ object Engine {
         // 回城模式先守「采点齐不齐」：宁可启动时明确拒绝，
         // 也不要每轮都在"进不去市场"里静默失败、还把日志刷满。
         if (autoFreeMarket()) {
-            val picks = OverlayService.pickedPointsOf(ctx!!).size
+            val picks = OverlayService.pickedPointsOf(context).size
             val need = if (MarketFlow.walkMode == "tap") 7 else 6
             if (picks < need) {
                 LogBus.emit(
@@ -250,9 +264,10 @@ object Engine {
      */
     private fun pressSkill(idx: Int): Pair<Boolean, String> {
         val b = buffConfig().getOrNull(idx) ?: return false to "配置缺失"
+        val c = ctx ?: return false to "上下文未初始化"
         return when (inputMethod()) {
             "touch" -> {
-                val pts = OverlayService.pickedPointsOf(ctx!!)
+                val pts = OverlayService.pickedPointsOf(c)
                 val p = pts.getOrNull(idx) ?: return false to "没有第 ${idx + 1} 个采集点"
                 val r = ShellCore.probe.tapNorm(p.first.toDouble(), p.second.toDouble(), "技能${idx + 1}")
                 if (r.contains("点击")) true to "点击(%.4f, %.4f)".format(p.first, p.second)
@@ -279,7 +294,7 @@ object Engine {
         o.put("lastError", lastError)
         o.put("lastResult", lastResult)
         o.put("inputMethod", if (ctx == null) "?" else inputMethod())
-        o.put("autoFreeMarket", if (ctx == null) false else autoFreeMarket())
+        o.put("autoFreeMarket", autoFreeMarket())
         o.put("inMarket", inMarket)
         o.put("cyclePeriodMs", cyclePeriodMs())
         if (nextDueAt > 0) o.put("nextDueAt", nextDueAt)
