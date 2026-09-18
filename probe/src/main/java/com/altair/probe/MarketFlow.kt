@@ -147,6 +147,14 @@ object MarketFlow {
         set(v) = setLong("alignTolMilli", (v * 1000).toLong())
 
     /**
+     * 血条识别不可用时的开环步数（每个方向按几次方向键）。
+     * 一次 keyevent 的位移量因机器而异，所以这里只求"能来回对称地动一下"。
+     */
+    var strollOpenLoopSteps: Int
+        get() = getLong("strollOpenSteps", 4L).toInt()
+        set(v) = setLong("strollOpenSteps", v.toLong())
+
+    /**
      * 原地走动的横向距离（**像素**，默认 100px —— 用户指定"左右走大概 100 像素"）。
      *
      * 用像素而不是屏宽比例：换分辨率时"走多少路"的体感不变，
@@ -337,7 +345,20 @@ object MarketFlow {
      */
     fun strollAndReturn(log: (String) -> Unit): Pair<Boolean, String> {
         // ① 标定当前位置：读一次角色血条 x，作为"走回这里"的原点
-        val origin = hpX() ?: return false to "没识别到角色血条，跳过原地走动（直接补 BUFF）"
+        // （分两步赋值：下面 repeat 的闭包要捕获它，可空变量无法被智能转换）
+        val originOrNull = hpX()
+        if (originOrNull == null) {
+            // 识别不到血条时**不再直接放弃** —— 退化为开环步进：
+            // 往一个方向按 N 次，再按反方向 N 次（对称，能回到大致原位）。
+            // 同时把带内诊断打出来，便于定位"为什么识别不到"。
+            log("⚠ 没识别到角色血条 → 退化为开环步进（左右各 ${strollOpenLoopSteps} 次）")
+            log("   诊断：" + runCatching { ShellCore.probe.diagnoseHpBar() }.getOrDefault("诊断不可用"))
+            repeat(strollOpenLoopSteps) { walkStep(-1, log) }
+            repeat(strollOpenLoopSteps) { walkStep(+1, log) }
+            return true to ("原地走动完成（开环）：左右各 $strollOpenLoopSteps 次；" +
+                "血条识别不可用，建议查诊断行")
+        }
+        val origin: Double = originOrNull
         val screenW = ShellCore.probe.screenWidthPx.coerceAtLeast(1)
         val dist = strollDistancePx.toDouble() / screenW      // 100px → 归一化
         val tol = 0.012

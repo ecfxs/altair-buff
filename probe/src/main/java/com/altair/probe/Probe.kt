@@ -1168,6 +1168,73 @@ class Probe(
         )
     }
 
+    /**
+     * 血条识别失败的诊断：用**放宽的判据**扫一条更宽的带子（25%~85% 高度），
+     * 把找到的偏红横段按"面积"排序报出来（位置 / 宽度 / 厚度 / 颜色）。
+     *
+     * 用来回答"为什么识别不到"这三件事：
+     *   · 颜色不对  → 报出的色值一看便知（判据是 R≥180 且 G,B≤110）
+     *   · 位置不对  → 报出的 y% 不在 50~60% 就说明得挪带子
+     *   · 尺寸不对  → 报出的宽/厚落在 20~120 / 4~10 之外就被过滤了
+     */
+    fun diagnoseHpBar(): String {
+        if (!ensureShell()) return "无 root，无法诊断"
+        val d = if (bestDisplayId >= 0) bestDisplayId else 0
+        val f = File(cache, "diag.raw")
+        f.delete()
+        sh.timedExec("screencap -d $d ${f.absolutePath}", 12000)
+        val hdr = parseRawHeader(f) ?: return "截图失败（拿不到 raw）"
+        val w = hdr[0]; val h = hdr[1]; val hb = hdr[4]
+        screenWidthPx = w; screenHeightPx = h
+        val y0 = (h * 0.25).toInt()
+        val y1 = (h * 0.85).toInt()
+        val band = readRawRoiRgb(f, w, h, hb, 0, y0, w, y1) ?: return "读取像素失败"
+        val bh = y1 - y0
+
+        // 放宽判据：只要"明显偏红"就算，不带 G/B 上限，便于看出真实色值
+        fun reddish(rgb: Int): Boolean {
+            val r = (rgb shr 16) and 0xFF
+            val g = (rgb shr 8) and 0xFF
+            val b = rgb and 0xFF
+            return r >= 150 && (r - g) >= 60 && (r - b) >= 50
+        }
+        class C(val y: Int, val x1: Int, val x2: Int, val t: Int, val rgb: Int)
+        val out = ArrayList<C>()
+        for (ry in 0 until bh) {
+            var x = 0
+            while (x < w) {
+                if (!reddish(band[ry * w + x])) { x++; continue }
+                var xe = x
+                while (xe + 1 < w && reddish(band[ry * w + xe + 1])) xe++
+                val runW = xe - x + 1
+                if (runW >= 8) {
+                    var t = 0
+                    var yy = ry
+                    while (yy < bh && t < 60) {
+                        var ok = 0
+                        for (xx in x..xe) if (reddish(band[yy * w + xx])) ok++
+                        if (ok.toDouble() / runW > 0.6) t++ else break
+                        yy++
+                    }
+                    out.add(C(y0 + ry, x, xe, t, band[ry * w + (x + xe) / 2]))
+                    if (out.size > 600) break
+                }
+                x = xe + 1
+            }
+        }
+        if (out.isEmpty()) {
+            return "在 25%~85% 高度带内没有任何偏红横段 —— 血条可能不是红色，或角色不在画面里"
+        }
+        out.sortByDescending { (it.x2 - it.x1 + 1) * it.t }
+        val top = out.take(4).joinToString("；") { c ->
+            val r = (c.rgb shr 16) and 0xFF
+            val g = (c.rgb shr 8) and 0xFF
+            val b = c.rgb and 0xFF
+            "y=${c.y}(${"%.0f".format(c.y * 100.0 / h)}%) x=${c.x1}..${c.x2} 宽=${c.x2 - c.x1 + 1} 厚=${c.t} 色=($r,$g,$b)"
+        }
+        return "共 ${out.size} 段偏红横段；最粗 4 段：$top"
+    }
+
     /** 头顶血条中心 x（归一化）。ROI 对齐与闭环走位用。 */
     fun findHeadHpBarX(bandLo: Double = 0.50, bandHi: Double = 0.60): Double? =
         findHeadHpBarBox(bandLo, bandHi)?.let { (it[0] + it[2] / 2f).toDouble() }
