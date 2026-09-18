@@ -1,0 +1,31 @@
+[Unit]
+Description=阿尔泰集控服务（altaird：设备 API + 监控台）
+Documentation=https://github.com/ecfxs/altair-buff
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=altair
+Group=altair
+# 只监听回环，公网流量一律走 Caddy（HTTPS）
+ExecStart=/opt/altair/altaird --addr 127.0.0.1:8788 --db /var/lib/altair/altair.db --data /var/lib/altair
+Restart=always
+RestartSec=3
+
+# 日志进 journald：journalctl -u altaird -f
+StandardOutput=journal
+StandardError=journal
+
+# ---- 加固 ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/altair
+
+[Install]
+WantedBy=multi-user.target

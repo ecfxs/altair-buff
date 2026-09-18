@@ -688,6 +688,28 @@ class Probe(
         return sb.toString()
     }
 
+    /**
+     * 一次画面统计：返回 [方差, 熵, 平均亮度(0-255)]，失败返回 null。
+     *
+     * 给「等菜单弹出」「等过图黑屏过去」这类流程判定用。
+     * 之所以不解析 quickCapture 的文本：那是给人看的，格式一变流程就悄悄失效。
+     */
+    fun screenStats(): DoubleArray? {
+        if (!ensureShell()) return null
+        val d = if (bestDisplayId >= 0) bestDisplayId else 0
+        val f = File(cache, "stats.raw")
+        f.delete()
+        sh.timedExec("screencap -d $d ${f.absolutePath}", 12000)
+        val hdr = parseRawHeader(f) ?: return null
+        return analyzeRaw(f, hdr)
+    }
+
+    /** 画面是否黑屏/纯色（过图加载中）。取不到画面时返回 null，调用方自己决定怎么办。 */
+    fun isScreenBlack(): Boolean? = screenStats()?.let { isBlack(it[0], it[1]) }
+
+    /** 整屏平均亮度（0-255）。菜单这类半透明遮罩会让它明显下降。 */
+    fun screenBrightness(): Double? = screenStats()?.getOrNull(2)
+
     // ------------------------------------------------------------ 按键扫描
 
     /**
@@ -958,6 +980,104 @@ class Probe(
         }
     }
 
+    /**
+     * 读一块区域的 RGB（打包成 0xRRGGBB）。row-major RGBA_8888。
+     * 血条检测要看颜色，光有亮度不够，所以单独开一个。
+     */
+    private fun readRawRoiRgb(
+        f: File, w: Int, h: Int, headerBytes: Int,
+        x1: Int, y1: Int, x2: Int, y2: Int
+    ): IntArray? {
+        return try {
+            val rw = (x2 - x1).coerceAtMost(w).coerceAtLeast(0)
+            val rh = (y2 - y1).coerceAtMost(h).coerceAtLeast(0)
+            if (rw <= 0 || rh <= 0) return null
+            RandomAccessFile(f, "r").use { raf ->
+                val rowBytes = w * 4
+                val buf = ByteArray(rowBytes)
+                val out = IntArray(rw * rh)
+                for (y in 0 until rh) {
+                    raf.seek(headerBytes.toLong() + (y1 + y).toLong() * rowBytes)
+                    raf.readFully(buf)
+                    val base = y * rw
+                    for (x in 0 until rw) {
+                        val o = (x1 + x) * 4
+                        val r = buf[o].toInt() and 0xFF
+                        val g = buf[o + 1].toInt() and 0xFF
+                        val b = buf[o + 2].toInt() and 0xFF
+                        out[base + x] = (r shl 16) or (g shl 8) or b
+                    }
+                }
+                out
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** 血条红像素判据（实机实测签名：主体 R195..249/G0/B0，外圈粉描边 R255/G96/B96）。 */
+    private fun isHpBarRed(rgb: Int): Boolean {
+        val r = (rgb shr 16) and 0xFF
+        val g = (rgb shr 8) and 0xFF
+        val b = rgb and 0xFF
+        return r >= 180 && g <= 110 && b <= 110 && (r - g) >= 90
+    }
+
+    /**
+     * 找**角色头顶血条**的中心 x（归一化 0..1）。找不到返回 null。
+     *
+     * 这是设备端唯一可靠的「角色现在在哪」信号 —— 设计文档 6.6 的闭环走位就靠它。
+     * （试过小地图角色点，太小、和场景杂点混在一起，实测分辨不出来。）
+     *
+     * 扫描范围只取角色头顶可能出现的那条横带（默认 y 50%~60%），
+     * 逐行找「红像素连续段」，再验竖向厚度 4~10px、宽 20~120px。
+     * 宽度下限放到 20 是因为角色贴屏幕边缘时血条会被裁掉一截。
+     */
+    fun findHeadHpBarX(bandLo: Double = 0.50, bandHi: Double = 0.60): Double? {
+        if (!ensureShell()) return null
+        val d = if (bestDisplayId >= 0) bestDisplayId else 0
+        val f = File(cache, "hpbar.raw")
+        f.delete()
+        sh.timedExec("screencap -d $d ${f.absolutePath}", 12000)
+        val hdr = parseRawHeader(f) ?: return null
+        val w = hdr[0]; val h = hdr[1]; val hb = hdr[4]
+        val y0 = (h * bandLo).toInt().coerceIn(0, h - 1)
+        val y1 = (h * bandHi).toInt().coerceIn(y0 + 1, h)
+        val band = readRawRoiRgb(f, w, h, hb, 0, y0, w, y1) ?: return null
+        val bh = y1 - y0
+
+        var bestScore = 0
+        var bestCx = -1
+        for (ry in 0 until bh) {
+            var x = 0
+            while (x < w) {
+                if (!isHpBarRed(band[ry * w + x])) { x++; continue }
+                var xe = x
+                while (xe + 1 < w && isHpBarRed(band[ry * w + xe + 1])) xe++
+                val runW = xe - x + 1
+                if (runW in 20..120) {
+                    var thick = 0
+                    var yy = ry
+                    while (yy < bh && thick < 12) {
+                        var ok = 0
+                        for (xx in x..xe) if (isHpBarRed(band[yy * w + xx])) ok++
+                        if (ok.toDouble() / runW > 0.6) thick++ else break
+                        yy++
+                    }
+                    if (thick in 4..10) {
+                        val score = runW * thick
+                        if (score > bestScore) {
+                            bestScore = score
+                            bestCx = (x + xe) / 2
+                        }
+                    }
+                }
+                x = xe + 1
+            }
+        }
+        return if (bestCx >= 0) bestCx.toDouble() / w else null
+    }
+
     /** 从 raw 文件里只读一个矩形区域的亮度值。row-major RGBA_8888。 */
     private fun readRawRoi(
         f: File, w: Int, h: Int, headerBytes: Int,
@@ -1019,7 +1139,9 @@ class Probe(
                 val mean = s1 / n
                 var ent = 0.0
                 for (c in hist) if (c > 0) { val p = c.toDouble() / n; ent -= p * ln(p) }
-                doubleArrayOf(s2 / n - mean * mean, ent)
+                // 第三个值是平均亮度（0-255）：判断「菜单弹出导致整屏变暗」
+                // 「过图黑屏」这类场景要看整屏亮度，光有方差/熵不够。
+                doubleArrayOf(s2 / n - mean * mean, ent, mean)
             }
         } catch (_: Throwable) {
             null

@@ -1,0 +1,883 @@
+openapi: 3.1.0
+info:
+  title: 阿尔泰集控 API
+  version: "1.0.0"
+  description: |
+    集控服务（altaird）的对外契约 —— **本文件是唯一来源**。
+
+    - 设备 API `/api/v1/device/*`：鉴权走 `X-Altair-Token`（设备长期 Token）
+    - 面板 API `/api/v1/panel/*`：鉴权走会话 Cookie（`POST /login` 除外）
+    - `/healthz` 免鉴权
+
+    云手机在 NAT 后，服务器无法主动连它，因此**一切设备状态都靠设备主动上报**，
+    启停指令以下发「期望状态 desired」的方式让设备下次上报时执行。
+
+servers:
+  - url: /
+    description: 与面板同源（Caddy 反代）
+
+tags:
+  - name: device
+  - name: panel
+  - name: health
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: 探活（免鉴权）
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  ts: { type: integer, format: int64 }
+                required: [ok, ts]
+
+  # ------------------------------------------------------------ 设备 API
+  /api/v1/device/report:
+    post:
+      tags: [device]
+      summary: 设备上报状态（响应带回期望状态与配置版本，合并往返）
+      security: [{ DeviceToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DeviceReport" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReportResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { description: 上报过频 }
+
+  /api/v1/device/config:
+    get:
+      tags: [device]
+      summary: 拉取配置（仅在 appliedRevision != configRevision 时需要）
+      security: [{ DeviceToken: [] }]
+      parameters:
+        - name: deviceId
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceConfigEnvelope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/device/screenshot:
+    post:
+      tags: [device]
+      summary: 上传截图（multipart；meta 为 JSON，file 为图片）
+      security: [{ DeviceToken: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                meta:
+                  type: string
+                  description: 'JSON 字符串：{"deviceId":"...","ts":1699999999999,"label":"可选"}'
+                file:
+                  type: string
+                  format: binary
+              required: [meta, file]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  id: { type: string }
+                  ts: { type: integer, format: int64 }
+                required: [ok, id, ts]
+        "413": { description: 文件过大 }
+
+  /api/v1/device/ack:
+    post:
+      tags: [device]
+      summary: 指令回执
+      security: [{ DeviceToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                deviceId: { type: string }
+                commandIds:
+                  type: array
+                  items: { type: string }
+                result: { type: string }
+              required: [deviceId, commandIds]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                required: [ok]
+
+  # ------------------------------------------------------------ 面板 API
+  /api/v1/panel/login:
+    post:
+      tags: [panel]
+      summary: 登录（成功下发 HttpOnly 会话 Cookie）
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: { type: string }
+                password: { type: string }
+              required: [username, password]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { description: 尝试过频，已退避 }
+
+  /api/v1/panel/logout:
+    post:
+      tags: [panel]
+      summary: 登出
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                required: [ok]
+
+  /api/v1/panel/me:
+    get:
+      tags: [panel]
+      summary: 当前会话与设备 Token（替代旧的 HTML 占位符注入）
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/panel/devices:
+    get:
+      tags: [panel]
+      summary: 设备列表 + 总览统计（白名单字段，绝不含任何密钥）
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DevicesResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/panel/devices/{id}:
+    get:
+      tags: [panel]
+      summary: 设备详情（含最近上报）
+      parameters:
+        - $ref: "#/components/parameters/DeviceId"
+        - name: reports
+          in: query
+          schema: { type: integer, default: 50, maximum: 500 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceDetail" }
+        "404": { description: 设备不存在 }
+    put:
+      tags: [panel]
+      summary: 更新设备的面板侧信息（备注），返回更新后的总览条目
+      parameters:
+        - $ref: "#/components/parameters/DeviceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                notes: { type: string, description: 面板侧备注；不下发给设备、不影响配置 revision }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceSummary" }
+        "404": { description: 设备不存在 }
+
+  /api/v1/panel/devices/{id}/history:
+    get:
+      tags: [panel]
+      summary: 时间序列（在线/轮次/心跳），供曲线用
+      parameters:
+        - $ref: "#/components/parameters/DeviceId"
+        - name: from
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: to
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: step
+          in: query
+          description: 采样步长（秒）
+          schema: { type: integer, default: 300 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  points:
+                    type: array
+                    items: { $ref: "#/components/schemas/HistoryPoint" }
+                required: [points]
+
+  /api/v1/panel/devices/{id}/logs:
+    get:
+      tags: [panel]
+      summary: 日志检索
+      parameters:
+        - $ref: "#/components/parameters/DeviceId"
+        - name: limit
+          in: query
+          schema: { type: integer, default: 200, maximum: 2000 }
+        - name: q
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lines:
+                    type: array
+                    items: { $ref: "#/components/schemas/LogLine" }
+                required: [lines]
+
+  /api/v1/panel/devices/{id}/interval:
+    put:
+      tags: [panel]
+      summary: 设定该设备的上报周期（下次 report 的 nextReportInMs 生效；0 = 用全局默认）
+      parameters:
+        - $ref: "#/components/parameters/DeviceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reportIntervalMs: { type: integer }
+              required: [reportIntervalMs]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  reportIntervalMs: { type: integer }
+                required: [ok]
+
+  /api/v1/panel/devices/{id}/command:
+    post:
+      tags: [panel]
+      summary: 下发启停（写期望状态，设备下次上报执行）
+      parameters:
+        - $ref: "#/components/parameters/DeviceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CommandRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DesiredState" }
+
+  /api/v1/panel/devices/batch-command:
+    post:
+      tags: [panel]
+      summary: 批量启停
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items: { type: string }
+                action: { type: string, enum: [start, stop] }
+              required: [ids, action]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  applied:
+                    type: array
+                    items: { type: string }
+                required: [ok, applied]
+
+  /api/v1/panel/configs/{scope}:
+    parameters:
+      - name: scope
+        in: path
+        required: true
+        description: '`default` 或具体 deviceId'
+        schema: { type: string }
+    get:
+      tags: [panel]
+      summary: 读取当前生效配置
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConfigEnvelope" }
+    put:
+      tags: [panel]
+      summary: 写入配置（revision 由服务端生成，客户端不得指定）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DeviceConfig" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConfigEnvelope" }
+
+  /api/v1/panel/configs/{scope}/revisions:
+    get:
+      tags: [panel]
+      summary: 配置历史版本
+      parameters:
+        - name: scope
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revisions:
+                    type: array
+                    items: { $ref: "#/components/schemas/ConfigRevision" }
+                required: [revisions]
+
+  /api/v1/panel/configs/{scope}/rollback:
+    post:
+      tags: [panel]
+      summary: 回滚到某个历史版本（生成新的 revision）
+      parameters:
+        - name: scope
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                revision: { type: string }
+              required: [revision]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConfigEnvelope" }
+
+  /api/v1/panel/screenshots:
+    get:
+      tags: [panel]
+      summary: 截图列表
+      parameters:
+        - name: deviceId
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 500 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  screenshots:
+                    type: array
+                    items: { $ref: "#/components/schemas/Screenshot" }
+                required: [screenshots]
+
+  /api/v1/panel/screenshots/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [panel]
+      summary: 取原图
+      responses:
+        "200":
+          description: 图片字节流
+          content:
+            image/jpeg: { schema: { type: string, format: binary } }
+            image/png: { schema: { type: string, format: binary } }
+        "404": { description: 不存在 }
+    delete:
+      tags: [panel]
+      summary: 删除截图（含磁盘文件）
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                required: [ok]
+
+  /api/v1/panel/audit:
+    get:
+      tags: [panel]
+      summary: 审计日志
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 1000 }
+        - name: actor
+          in: query
+          schema: { type: string }
+        - name: target
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: "#/components/schemas/AuditEntry" }
+                required: [entries]
+
+  /api/v1/panel/settings:
+    get:
+      tags: [panel]
+      summary: 全局设置
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Settings" }
+    put:
+      tags: [panel]
+      summary: 修改全局设置
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Settings" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Settings" }
+
+  /api/v1/panel/events:
+    get:
+      tags: [panel]
+      summary: SSE 事件流（report / command / screenshot / device-online / device-offline）
+      responses:
+        "200":
+          description: |
+            `text/event-stream`。每个事件形如：
+
+            ```
+            event: report
+            data: {"deviceId":"a1b2","ts":1699999999999}
+            ```
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    DeviceToken:
+      type: apiKey
+      in: header
+      name: X-Altair-Token
+    SessionCookie:
+      type: apiKey
+      in: cookie
+      name: altair_session
+
+  parameters:
+    DeviceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: 未认证或凭据无效
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              ok: { type: boolean }
+              error: { type: string }
+
+  schemas:
+    Buff:
+      type: object
+      properties:
+        idx: { type: integer }
+        enabled: { type: boolean }
+        key: { type: integer }
+        durationMin: { type: integer }
+      required: [idx, enabled, key, durationMin]
+
+    EngineStatus:
+      type: object
+      properties:
+        running: { type: boolean }
+        state:
+          type: string
+          enum: [WAITING, CASTING, IDLE, PAUSED, ERROR]
+        inputMethod: { type: string, enum: [keyevent, touch] }
+        cycleCount: { type: integer }
+        nextDueAt: { type: integer, format: int64, description: 设备本地时钟毫秒 }
+        cyclePeriodMs: { type: integer }
+        lastResult: { type: string }
+        lastError: { type: string }
+        buffs:
+          type: array
+          items: { $ref: "#/components/schemas/Buff" }
+
+    Heartbeat:
+      type: object
+      properties:
+        batteryPct: { type: integer }
+        charging: { type: boolean }
+        thermalC: { type: number }
+        memFreeMb: { type: integer }
+        netRttMs: { type: integer }
+
+    DeviceReport:
+      type: object
+      properties:
+        deviceId: { type: string }
+        protocolVersion: { type: integer }
+        ts: { type: integer, format: int64, description: 设备时钟毫秒 }
+        uptimeMs: { type: integer, format: int64 }
+        versionCode: { type: integer, format: int64 }
+        versionName: { type: string }
+        model: { type: string }
+        android: { type: string }
+        targetPkg: { type: string }
+        foreground: { type: string }
+        armed: { type: boolean }
+        appliedRevision: { type: string }
+        engine: { $ref: "#/components/schemas/EngineStatus" }
+        heartbeat: { $ref: "#/components/schemas/Heartbeat" }
+        logTail:
+          type: array
+          items: { type: string }
+        ackedCommands:
+          type: array
+          items: { type: string }
+      required: [deviceId, ts]
+
+    DeviceCommand:
+      type: object
+      properties:
+        id: { type: string }
+        action: { type: string, enum: [screenshot] }
+      required: [id, action]
+
+    DesiredState:
+      type: object
+      properties:
+        running: { type: boolean }
+        rev: { type: integer }
+        at: { type: integer, format: int64 }
+        by: { type: string }
+      required: [running, rev]
+
+    ReportResponse:
+      type: object
+      properties:
+        ok: { type: boolean }
+        ts: { type: integer, format: int64 }
+        desired: { $ref: "#/components/schemas/DesiredState" }
+        configRevision: { type: string }
+        nextReportInMs: { type: integer }
+        commands:
+          type: array
+          items: { $ref: "#/components/schemas/DeviceCommand" }
+      required: [ok, ts, desired, configRevision, nextReportInMs]
+
+    DeviceConfig:
+      type: object
+      properties:
+        revision: { type: string, description: 只读：由服务端生成，PUT 时忽略 }
+        targetPkg: { type: string }
+        pressMs: { type: integer }
+        skillPoints:
+          type: array
+          items:
+            type: array
+            items: { type: number }
+        inputMethod: { type: string, enum: [keyevent, touch] }
+        buff:
+          type: array
+          items: { $ref: "#/components/schemas/Buff" }
+        notes: { type: string }
+        autoFreeMarket:
+          type: boolean
+          description: 每轮补完 BUFF 后自动进自由市场等待并走到出口待命（回城模式）
+
+    DeviceConfigEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/DeviceConfig"
+        - type: object
+          properties:
+            desired: { $ref: "#/components/schemas/DesiredState" }
+
+    ConfigEnvelope:
+      type: object
+      properties:
+        scope: { type: string }
+        revision: { type: string }
+        config: { $ref: "#/components/schemas/DeviceConfig" }
+        updatedAt: { type: integer, format: int64 }
+        updatedBy: { type: string }
+      required: [scope, revision, config]
+
+    ConfigRevision:
+      type: object
+      properties:
+        revision: { type: string }
+        createdAt: { type: integer, format: int64 }
+        createdBy: { type: string }
+        config: { $ref: "#/components/schemas/DeviceConfig" }
+      required: [revision, createdAt, createdBy]
+
+    DeviceSummary:
+      type: object
+      properties:
+        id: { type: string }
+        lastSeen: { type: integer, format: int64 }
+        firstSeen: { type: integer, format: int64 }
+        online: { type: boolean }
+        model: { type: string }
+        android: { type: string }
+        versionName: { type: string }
+        protocolVersion: { type: integer }
+        appliedRevision: { type: string }
+        configRevision: { type: string }
+        configInSync: { type: boolean }
+        group: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        notes: { type: string, description: 面板侧备注（给运维看，不下发给设备、不影响配置 revision） }
+        reportIntervalMs: { type: integer }
+        desired: { $ref: "#/components/schemas/DesiredState" }
+        engine: { $ref: "#/components/schemas/EngineStatus" }
+        heartbeat: { $ref: "#/components/schemas/Heartbeat" }
+        foreground: { type: string }
+        armed: { type: boolean }
+        latestScreenshotId: { type: string }
+        stats:
+          type: object
+          properties:
+            cycles24h: { type: integer }
+            onlineRate24h: { type: number }
+        reportTs: { type: integer, format: int64, description: 上次上报的设备时钟毫秒，用于前端校正时钟偏差 }
+      required: [id, lastSeen, online]
+
+    DevicesResponse:
+      type: object
+      properties:
+        devices:
+          type: array
+          items: { $ref: "#/components/schemas/DeviceSummary" }
+        totals:
+          type: object
+          properties:
+            total: { type: integer }
+            online: { type: integer }
+            running: { type: integer }
+            cycles: { type: integer }
+          required: [total, online, running, cycles]
+        defaultConfigRevision: { type: string }
+      required: [devices, totals]
+
+    ReportRow:
+      type: object
+      properties:
+        ts: { type: integer, format: int64 }
+        receivedAt: { type: integer, format: int64 }
+        foreground: { type: string }
+        armed: { type: boolean }
+        running: { type: boolean }
+        state: { type: string }
+        cycleCount: { type: integer }
+        batteryPct: { type: integer }
+        thermalC: { type: number }
+        netRttMs: { type: integer }
+
+    DeviceDetail:
+      type: object
+      properties:
+        device: { $ref: "#/components/schemas/DeviceSummary" }
+        reports:
+          type: array
+          items: { $ref: "#/components/schemas/ReportRow" }
+      required: [device]
+
+    HistoryPoint:
+      type: object
+      properties:
+        ts: { type: integer, format: int64 }
+        running: { type: boolean }
+        cycleCount: { type: integer }
+        batteryPct: { type: integer }
+        thermalC: { type: number }
+        netRttMs: { type: integer }
+      required: [ts]
+
+    LogLine:
+      type: object
+      properties:
+        ts: { type: integer, format: int64 }
+        line: { type: string }
+      required: [ts, line]
+
+    Screenshot:
+      type: object
+      properties:
+        id: { type: string }
+        deviceId: { type: string }
+        ts: { type: integer, format: int64 }
+        bytes: { type: integer }
+        label: { type: string }
+        url: { type: string }
+      required: [id, deviceId, ts, url]
+
+    CommandRequest:
+      type: object
+      properties:
+        action: { type: string, enum: [start, stop] }
+      required: [action]
+
+    SessionInfo:
+      type: object
+      properties:
+        ok: { type: boolean }
+        user: { type: string }
+        expiresAt: { type: integer, format: int64 }
+      required: [ok, user, expiresAt]
+
+    Me:
+      type: object
+      properties:
+        user: { type: string }
+        deviceToken: { type: string }
+        expiresAt: { type: integer, format: int64 }
+      required: [user, deviceToken]
+
+    AuditEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        ts: { type: integer, format: int64 }
+        actor: { type: string }
+        action: { type: string }
+        target: { type: string }
+        detail: { type: string }
+        ip: { type: string }
+      required: [id, ts, actor, action]
+
+    Settings:
+      type: object
+      properties:
+        defaultReportIntervalMs: { type: integer }
+        reportRetentionDays: { type: integer }
+        logRetentionDays: { type: integer, description: 设备日志单独保留期；日志比时间序列占地方得多 }
+        screenshotRetentionN: { type: integer }
+        screenshotRetentionDays: { type: integer }
+      required: [defaultReportIntervalMs]

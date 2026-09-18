@@ -24,6 +24,26 @@ shots/
 *.swp
 *~
 
-# 集控服务器的运行时存储（含设备状态与配置，不入库）
+# 集控服务器的运行时存储（旧 Python 实现；新实现用 SQLite，见 control/）
 tools/control-store.json
 
+# ---- 集控（control/）----
+# 注意：gitignore 不支持行内注释（`pattern  # 说明` 会被当成整条模式），注释必须独占一行。
+# 运行时数据：SQLite、截图、冒烟临时目录
+control/data/
+# 编译产物（单二进制，11MB，走 GitHub Release 分发而不是入库）
+control/dist/
+control/web/node_modules/
+# 前端构建产物
+control/web/dist/
+# 前端产物会被 make web 拷进 embed 目录；只保留占位文件，避免把构建产物提交进仓库
+control/internal/webassets/dist/*
+!control/internal/webassets/dist/.gitkeep
+
+
+# ---- Playwright 浏览器（150MB，本机装在工作区内）----
+control/.pw-browsers/
+control/data/e2e/
+control/data/e2e-shots/
+control/web/test-results/
+control/web/playwright-report/

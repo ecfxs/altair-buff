@@ -1,0 +1,133 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  api:
+    name: 后端（Go）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: control
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache-dependency-path: control/go.sum
+
+      - name: 依赖
+        run: go mod download
+
+      - name: 编译
+        run: go build ./...
+
+      - name: 静态检查
+        run: go vet ./...
+
+      - name: 单元测试
+        run: go test ./... -race -count=1
+
+      # 这是本项目最重要的一道关：它真的起服务、按设备协议上报、跑完面板全链路
+      # （含旧协议安全网、路径穿越防护、超限拒绝）。旧实现靠 check-assets.sh
+      # 正则抠 JS + 手写 DOM 桩，那套已随重构退休。
+      # 这一步用占位前端页，只验 Go 侧；前端的硬门禁在 e2e job。
+      - name: 端到端冒烟验收（Go 侧）
+        run: bash scripts/smoke.sh
+
+  web:
+    name: 前端（React）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: control/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: control/web/pnpm-lock.yaml
+
+      - name: 依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 生成 API 类型（契约漂移检查）
+        run: |
+          pnpm gen
+          if ! git diff --exit-code -- src/api/schema.d.ts; then
+            echo "::error::src/api/schema.d.ts 与 control/api/openapi.yaml 不一致，请在本地跑 pnpm gen 后提交"
+            exit 1
+          fi
+
+      - name: 类型检查
+        run: pnpm exec tsc --noEmit
+
+      - name: 构建
+        run: pnpm build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: control/web/dist
+
+  e2e:
+    name: 端到端（内嵌前端）
+    runs-on: ubuntu-latest
+    needs: [api, web]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache-dependency-path: control/go.sum
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: control/web/pnpm-lock.yaml
+
+      # 把前端真正打进二进制，然后要求冒烟验收必须看到真实 SPA 与其 JS 产物
+      - name: 构建前端并拷进 embed 目录
+        run: make -C control web
+
+      - name: 端到端冒烟验收（协议与接口层，要求内嵌前端）
+        run: REQUIRE_WEB=1 bash control/scripts/smoke.sh
+
+      - name: 前端依赖（Playwright）
+        run: pnpm install --frozen-lockfile
+        working-directory: control/web
+
+      - name: 安装 E2E 浏览器
+        run: pnpm exec playwright install --with-deps chromium
+        working-directory: control/web
+
+      # 界面层验收：真浏览器渲染、点击、状态跟随，并把截图存档
+      - name: 界面层 E2E（真浏览器）
+        run: pnpm exec playwright test
+        working-directory: control/web
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-screenshots
+          path: control/data/e2e-shots
+          if-no-files-found: ignore
+
+      - name: 交叉编译 Linux 单二进制（部署产物）
+        run: make -C control release

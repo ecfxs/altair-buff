@@ -12,42 +12,68 @@ import java.net.URLEncoder
 import java.util.UUID
 
 /**
- * 集控（多设备统一管理）—— 设备端
- * ================================
+ * 集控（多设备统一管理）—— 设备端（**协议 v1**）
+ * ============================================
  *
  * ## 架构约束：为什么是「设备主动上报」而不是「服务器推送」
  * 云手机跑在机房 NAT 后面，**没有公网 IP，服务器无法主动连它**。
- * 所以只能反过来：设备定时**上报状态** + 定时**拉取配置**。
+ * 所以只能反过来：设备定时**上报状态**，指令搭在**上报的响应**里带回来。
  * 这也顺带解决了防火墙问题 —— 设备侧只需要能出网。
  *
  * ```
- *   控制端（你的服务器）                     设备端（云手机 APK）
- *   ┌──────────────────────┐               ┌──────────────────────┐
- *   │ GET  /api/config     │ ◀── 定时拉取 ── │ ConfigPuller         │
- *   │ POST /api/report     │ ◀── 定时上报 ── │ StateReporter        │
- *   │ Web 面板             │                │ 告警 → 钉钉/飞书      │
- *   └──────────────────────┘               └──────────────────────┘
+ *   控制端（altaird）                        设备端（云手机 APK）
+ *   ┌───────────────────────────────┐        ┌──────────────────────────┐
+ *   │ POST /api/v1/device/report    │ ◀───── │ 一轮往返：               │
+ *   │   响应带回 desired /          │        │  · 上报状态与心跳        │
+ *   │   configRevision /            │        │  · 收启停与一次性指令    │
+ *   │   nextReportInMs / commands   │        │  · 执行并回报            │
+ *   │ GET  /api/v1/device/config    │ ◀───── │ 仅当 revision 变化时拉配置│
+ *   │ POST /api/v1/device/screenshot│ ◀───── │ 截图上传（点播或主动）   │
+ *   └───────────────────────────────┘        └──────────────────────────┘
  * ```
  *
- * ## 协议
- * 上报（设备 → 服务器）  POST {server}/api/report
+ * ## 与旧协议（v0）的差别
+ * 1. **合并往返**：v0 每轮固定两次请求（`POST /api/report` + `GET /api/config`）；
+ *    v1 把期望状态、配置版本、下次上报周期、一次性指令全塞进上报响应 ——
+ *    启停延迟从「≤1 周期 + 1 次轮询」降到「≤1 周期」，流量减半。
+ * 2. **上报周期由服务端下发**（`nextReportInMs`）：面板上改周期即时生效，不用重发 APK。
+ * 3. **心跳**：电量/充电/温度/可用内存/网络延迟，面板能看出哪台机器在发烫或掉网。
+ * 4. **截图上传统**：服务端可点播，也可本地触发。
+ * 5. **回执**：一次性指令带 id，设备执行后在下次上报里用 `ackedCommands` 确认，服务端据此去重。
+ *
+ * ## 上报体（设备 → 服务器）  POST {server}/api/v1/device/report
  * ```json
  * {
- *   "deviceId": "a1b2c3d4", "ts": 1699999999999,
- *   "versionCode": 18, "versionName": "0.18.0",
+ *   "deviceId": "a1b2c3d4", "protocolVersion": 1, "ts": 1699999999999,
+ *   "versionCode": 24, "versionName": "0.24.0",
  *   "targetPkg": "com.nexon.mod", "foreground": "com.nexon.mod",
- *   "armed": true, "uptimeMs": 123456,
- *   "logTail": ["...", "..."]
+ *   "armed": true, "uptimeMs": 123456, "appliedRevision": "r17",
+ *   "engine": { "running": true, "state": "WAITING", "cycleCount": 12, "buffs": [] },
+ *   "heartbeat": { "batteryPct": 87, "charging": true, "thermalC": 38.5, "memFreeMb": 1204, "netRttMs": 42 },
+ *   "logTail": ["...", "..."], "ackedCommands": ["c_8f3a"]
  * }
  * ```
  *
- * 配置（服务器 → 设备）  GET {server}/api/config?deviceId=xxx
+ * ## 上报响应（服务器 → 设备）
+ * ```json
+ * {
+ *   "ok": true, "ts": 1699999999999,
+ *   "desired": { "running": true, "rev": 7 },
+ *   "configRevision": "r17",
+ *   "nextReportInMs": 30000,
+ *   "commands": [{ "id": "c_8f3a", "action": "screenshot" }]
+ * }
+ * ```
+ *
+ * 配置（服务器 → 设备）  GET {server}/api/v1/device/config?deviceId=xxx
  * ```json
  * {
  *   "revision": "r7",
  *   "targetPkg": "com.nexon.mod",
  *   "pressMs": 90,
  *   "skillPoints": [[0.7416,0.5673],[0.8041,0.5756]],
+ *   "buff": [{ "idx": 1, "enabled": true, "key": 1, "durationMin": 5 }],
+ *   "desired": { "running": true, "rev": 7 },
  *   "notes": "方案A"
  * }
  * ```
@@ -65,10 +91,33 @@ class Management(private val ctx: Context, private val sh: RootShell) {
         private const val KEY_DESIRED_REV = "desiredRev"
         private const val KEY_REVISION = "appliedRevision"
         const val DEFAULT_INTERVAL_MS = 60_000L
+
+        /** 设备协议版本：v1 = 合并往返 + 心跳 + 截图 + 服务端下发上报周期。 */
+        const val PROTOCOL_VERSION = 1
+
+        /** 上报周期由服务端通过 nextReportInMs 下发，设备侧只做钳制。 */
+        const val MIN_INTERVAL_MS = 15_000L
+        const val MAX_INTERVAL_MS = 300_000L
+
         const val CONFIG_FILE = "pulled_config.json"
     }
 
     private fun sp() = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+
+    // ------------------------------------------------------------ v1 运行时状态
+
+    /** 指令回执队列：搭下一次上报带回（省一次往返），**上报成功后才清**，失败不丢回执。 */
+    private val ackQueue = java.util.Collections.synchronizedList(mutableListOf<String>())
+
+    /** 本次上报实际写进了哪些回执 id（成功后按这批清队列）。 */
+    @Volatile private var reportAcks: List<String> = emptyList()
+
+    /** 最近一次上报的往返耗时（毫秒），作为 netRttMs 上报。 */
+    @Volatile private var lastRttMs: Int = 0
+
+    /** 服务端下发的上报周期（服务端说了算，改周期不用重新下发 APK）。 */
+    @Volatile var nextIntervalMs: Long = DEFAULT_INTERVAL_MS
+        private set
 
     // ------------------------------------------------------------ 配置项
 
@@ -114,23 +163,77 @@ class Management(private val ctx: Context, private val sh: RootShell) {
 
     // ------------------------------------------------------------ 状态上报
 
-    /** 上报一次。返回给人看的结果文本。 */
+    /** 上报一次（供界面按钮用），返回给人看的结果文本。 */
     fun reportOnce(): String {
-        val base = server
-        if (base.isBlank()) return "未配置集控服务器地址"
-        val url = "$base/api/report"
         return try {
-            val body = buildReport().toString()
-            val resp = httpPostJson(url, body)
-            "上报成功 → $url\n  deviceId=${deviceId}\n  服务器响应: ${resp.take(200)}"
+            val o = postReport()
+            "上报成功 → $server/api/v1/device/report\n  deviceId=$deviceId\n  服务器响应: ${o?.toString()?.take(200) ?: "(空)"}"
         } catch (t: Throwable) {
             "上报失败: ${t.javaClass.simpleName}: ${t.message}"
         }
     }
 
+    /** 真正发一次上报，返回解析后的响应；成功时清掉已带回的回执。 */
+    private fun postReport(): JSONObject? {
+        val base = server
+        if (base.isBlank()) throw IllegalStateException("未配置集控服务器地址")
+        val url = "$base/api/v1/device/report"
+        val body = buildReport().toString()
+        val t0 = System.currentTimeMillis()
+        val resp = httpPostJson(url, body)
+        lastRttMs = (System.currentTimeMillis() - t0).toInt()
+        val sent = reportAcks
+        if (sent.isNotEmpty()) synchronized(ackQueue) { ackQueue.removeAll(sent.toSet()) }
+        return runCatching { JSONObject(resp) }.getOrNull()
+    }
+
+    /**
+     * 一个完整的集控周期（v1 合并往返）。
+     *
+     * 旧实现每轮固定两次请求：`POST /api/report` + `GET /api/config`。
+     * v1 把 desired / configRevision / nextReportInMs / commands 直接塞进上报响应，
+     * 所以正常情况下**一轮就够** —— 启停延迟从「≤1 个上报周期 + 1 次轮询」降到「≤1 个上报周期」，
+     * 设备流量也少一半。只有配置版本变了才多一次拉取。
+     */
+    private fun cycleOnce(): String {
+        val sb = StringBuilder()
+        val o = postReport() ?: return "上报成功（响应不可解析）"
+        sb.append("上报成功")
+
+        applyDesired(o)?.let { sb.append("\n  ").append(it) }
+
+        val cfgRev = o.optString("configRevision", "")
+        val applied = sp().getString(KEY_REVISION, "") ?: ""
+        if (cfgRev.isNotBlank() && cfgRev != applied) {
+            sb.append("\n  ").append(pullConfigOnce().lineSequence().first())
+        }
+
+        val next = o.optInt("nextReportInMs", 0)
+        if (next > 0) nextIntervalMs = next.toLong().coerceIn(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
+
+        o.optJSONArray("commands")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val c = arr.optJSONObject(i) ?: continue
+                val id = c.optString("id", "")
+                when (c.optString("action", "")) {
+                    "screenshot" -> {
+                        val r = uploadScreenshot(label = "点播")
+                        sb.append("\n  截图指令 ${id}: ${r.lineSequence().first()}")
+                        // 只有真的传上去了才回执，否则服务端会以为成功
+                        if (id.isNotBlank() && r.startsWith("截图已上传")) {
+                            synchronized(ackQueue) { ackQueue.add(id) }
+                        }
+                    }
+                }
+            }
+        }
+        return sb.toString()
+    }
+
     private fun buildReport(): JSONObject {
         val o = JSONObject()
         o.put("deviceId", deviceId)
+        o.put("protocolVersion", PROTOCOL_VERSION)
         o.put("ts", System.currentTimeMillis())
         o.put("uptimeMs", android.os.SystemClock.elapsedRealtime())
         runCatching {
@@ -146,6 +249,13 @@ class Management(private val ctx: Context, private val sh: RootShell) {
         }
         // 引擎状态 —— 监控台据此显示 BUFF 进度
         runCatching { o.put("engine", Engine.statusJson()) }
+        // 已应用的配置版本：服务端据此判断设备是否还停在旧配置上（面板会显示"配置未生效"）
+        runCatching {
+            val rev = sp().getString(KEY_REVISION, "") ?: ""
+            if (rev.isNotBlank()) o.put("appliedRevision", rev)
+        }
+        // 心跳：面板上能一眼看出哪台机器在发烫 / 掉网 / 快没电
+        runCatching { heartbeat()?.let { o.put("heartbeat", it) } }
         runCatching {
             val target = OverlayService.targetPkgOf(ctx)
             o.put("targetPkg", target)
@@ -160,7 +270,50 @@ class Management(private val ctx: Context, private val sh: RootShell) {
             tail.forEach { arr.put(it.take(200)) }
             o.put("logTail", arr)
         }
+        // 指令回执：搭在下一次上报里带回，省一次往返。
+        // 只有上报成功后才清队列（见 cycleOnce），否则失败会丢回执。
+        reportAcks = synchronized(ackQueue) { ackQueue.toList() }
+        if (reportAcks.isNotEmpty()) {
+            val arr = JSONArray()
+            reportAcks.forEach { arr.put(it) }
+            o.put("ackedCommands", arr)
+        }
         return o
+    }
+
+    /**
+     * 设备心跳。
+     *
+     * 电池/温度走 BatteryManager 的粘性广播（不需要注册长期接收者）；
+     * 内存走 ActivityManager.MemoryInfo；网络延迟用一次上报的往返时间来估。
+     */
+    private fun heartbeat(): JSONObject? {
+        val o = JSONObject()
+        runCatching {
+            // 粘性广播：不需要注册长期接收者，读一次就有当前值
+            val it2 = ctx.registerReceiver(null,
+                android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+            if (it2 != null) {
+                val level = it2.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
+                val scale = it2.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1)
+                if (level >= 0 && scale > 0) o.put("batteryPct", level * 100 / scale)
+                val status = it2.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1)
+                o.put("charging", status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+                        status == android.os.BatteryManager.BATTERY_STATUS_FULL)
+                val t = it2.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, -1)
+                if (t > 0) o.put("thermalC", t / 10.0)
+            }
+        }
+        runCatching {
+            val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+            if (am != null) {
+                val mi = android.app.ActivityManager.MemoryInfo()
+                am.getMemoryInfo(mi)
+                o.put("memFreeMb", (mi.availMem / 1024 / 1024).toInt())
+            }
+        }
+        if (lastRttMs > 0) o.put("netRttMs", lastRttMs)
+        return if (o.length() == 0) null else o
     }
 
     // ------------------------------------------------------------ 配置拉取
@@ -169,7 +322,7 @@ class Management(private val ctx: Context, private val sh: RootShell) {
     fun pullConfigOnce(): String {
         val base = server
         if (base.isBlank()) return "未配置集控服务器地址"
-        val url = "$base/api/config?deviceId=${URLEncoder.encode(deviceId, "UTF-8")}"
+        val url = "$base/api/v1/device/config?deviceId=${URLEncoder.encode(deviceId, "UTF-8")}"
         return try {
             val text = httpGet(url)
             if (text.isBlank()) return "拉取失败：服务器无响应"
@@ -193,23 +346,32 @@ class Management(private val ctx: Context, private val sh: RootShell) {
         }
     }
 
+    /**
+     * 应用期望状态（远程启停）。返回描述文本；无变化返回 null。
+     *
+     * rev 去重：只有 rev 变了才执行，避免每轮都重复启停。
+     * **rev == 0 表示服务端从未下发过**（例如新设备刚接入），此时绝不能动引擎 ——
+     * 早期实现会把它当成"下发停止"，结果新设备一连上就被强制停掉。
+     */
+    private fun applyDesired(o: JSONObject): String? {
+        val d = o.optJSONObject("desired") ?: return null
+        val rev = d.optInt("rev", 0)
+        if (rev <= 0) return null
+        val applied = sp().getInt(KEY_DESIRED_REV, 0)
+        if (rev == applied) return null
+        val want = d.optBoolean("running", false)
+        if (want) Engine.start(ctx) else Engine.stop("监控台下发停止")
+        sp().edit().putInt(KEY_DESIRED_REV, rev).apply()
+        return "远程指令：${if (want) "启动" else "停止"}（rev=$rev）"
+    }
+
     /** 应用配置里我们认识的字段；不认识的只记录，不报错。 */
     private fun applyConfig(o: JSONObject): List<String> {
         val msgs = mutableListOf<String>()
 
         // ---- 远程启停（desired state 模式）----
         // 云手机在 NAT 后服务器连不上它，所以命令搭在设备轮询的返回里。
-        // 用 rev 去重：只有 rev 变了才执行，避免每轮都重复启停。
-        o.optJSONObject("desired")?.let { d ->
-            val rev = d.optInt("rev", 0)
-            val applied = sp().getInt(KEY_DESIRED_REV, -1)
-            if (rev != applied) {
-                val want = d.optBoolean("running", false)
-                if (want) Engine.start(ctx) else Engine.stop("监控台下发停止")
-                sp().edit().putInt(KEY_DESIRED_REV, rev).apply()
-                msgs += "远程指令：${if (want) "启动" else "停止"}（rev=$rev）"
-            }
-        }
+        applyDesired(o)?.let { msgs += it }
         o.optString("targetPkg", "").takeIf { it.isNotBlank() }?.let {
             OverlayService.setTargetPkgOf(ctx, it)
             msgs += "targetPkg = $it"
@@ -228,6 +390,9 @@ class Management(private val ctx: Context, private val sh: RootShell) {
             }
             if (pts.isNotEmpty()) {
                 OverlayService.savePickedPointsOf(ctx, pts)
+                // ★ 必须通知悬浮窗刷新：它内存里那份采集点是 onCreate 时读的，
+                //   不通知的话 ROI 与「点1..4」会一直用旧坐标，直到重启悬浮窗。
+                OverlayService.notifyPicksChanged()
                 msgs += "skillPoints 共 ${pts.size} 个"
             }
         }
@@ -253,6 +418,13 @@ class Management(private val ctx: Context, private val sh: RootShell) {
             ed.apply()
             if (n > 0) msgs += "BUFF 配置已更新 $n 项"
         }
+        // 回城模式：每轮补完 BUFF 自动进自由市场
+        if (o.has("autoFreeMarket")) {
+            val on = o.optBoolean("autoFreeMarket", false)
+            ctx.getSharedPreferences("buff", Context.MODE_PRIVATE)
+                .edit().putBoolean("autoFreeMarket", on).apply()
+            msgs += "回城模式（自动进自由市场）= ${if (on) "开" else "关"}"
+        }
         o.optString("notes", "").takeIf { it.isNotBlank() }?.let { msgs += "notes: $it" }
         if (msgs.isEmpty()) msgs += "(配置里没有本版本认识的字段)"
         return msgs
@@ -270,18 +442,17 @@ class Management(private val ctx: Context, private val sh: RootShell) {
         if (server.isBlank()) { LogBus.emit("集控：未配置服务器地址，未启动"); return }
         running = true
         worker = Thread {
-            LogBus.emit("集控：已启动，每 ${intervalMs / 1000} 秒上报一次（deviceId=$deviceId）")
+            LogBus.emit("集控：已启动（协议 v${PROTOCOL_VERSION}），上报周期由服务端下发（初始 ${intervalMs / 1000} 秒）")
             while (running) {
                 try {
-                    // 上报交给外层日志，避免刷屏
-                    val r = reportOnce()
-                    LogBus.emit("集控上报: ${r.lineSequence().first()}")
-                    val c = pullConfigOnce()
-                    if (!c.startsWith("配置 revision")) LogBus.emit("集控配置: ${c.lineSequence().first()}")
+                    // 上报 + 收指令一轮完成；服务端说改周期就改周期
+                    val r = cycleOnce()
+                    LogBus.emit("集控: ${r.lineSequence().first()}")
                 } catch (t: Throwable) {
                     LogBus.emit("集控循环异常: ${t.message}")
                 }
-                try { Thread.sleep(intervalMs) } catch (_: InterruptedException) { break }
+                val sleepMs = if (nextIntervalMs > 0) nextIntervalMs else intervalMs
+                try { Thread.sleep(sleepMs) } catch (_: InterruptedException) { break }
             }
         }.apply { isDaemon = true; name = "mgmt-loop" }
         worker?.start()
@@ -292,6 +463,91 @@ class Management(private val ctx: Context, private val sh: RootShell) {
         worker?.interrupt()
         worker = null
         LogBus.emit("集控：已停止")
+    }
+
+    // ------------------------------------------------------------ 截图上传
+
+    /**
+     * 截图并上传。服务端可以通过 commands 点播，本地界面也可以直接调。
+     *
+     * 通道与 Probe 里验证过的一致：root 下 `screencap -p`。
+     * PNG 转 JPEG(80) 再传 —— 云手机的上行带宽比服务器磁盘更贵；
+     * 超过服务端 2MB 上限时自动降档重压一次。
+     */
+    fun uploadScreenshot(label: String = ""): String {
+        val base = server
+        if (base.isBlank()) return "截图上传失败: 未配置集控服务器地址"
+        val ts = System.currentTimeMillis()
+        val dir = File(ctx.cacheDir, "shots").apply { mkdirs() }
+        val png = File(dir, "shot_$ts.png")
+        val jpg = File(dir, "shot_$ts.jpg")
+        return try {
+            if (!ShellCore.ensureRoot()) return "截图上传失败: 无 root 权限"
+            ShellCore.root.timedExec("screencap -p ${png.absolutePath}", 12_000)
+            if (!png.exists() || png.length() == 0L) return "截图上传失败: screencap 没产出文件（可能黑屏或通道不可用）"
+
+            val bmp = android.graphics.BitmapFactory.decodeFile(png.absolutePath)
+                ?: return "截图上传失败: 图片解码失败"
+            var quality = 80
+            var bytes: ByteArray
+            while (true) {
+                java.io.FileOutputStream(jpg).use { out ->
+                    bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, out)
+                }
+                bytes = jpg.readBytes()
+                if (bytes.size <= 2 * 1024 * 1024 || quality <= 30) break
+                quality -= 20
+            }
+            bmp.recycle()
+
+            httpPostMultipart("$base/api/v1/device/screenshot", jpg, ts, label)
+            "截图已上传（${bytes.size / 1024} KB，质量 $quality）"
+        } catch (t: Throwable) {
+            "截图上传失败: ${t.javaClass.simpleName}: ${t.message}"
+        } finally {
+            png.delete()
+            jpg.delete()
+        }
+    }
+
+    /** 发一个 multipart/form-data（meta 字段是 JSON，file 字段是图片）。 */
+    private fun httpPostMultipart(url: String, file: File, ts: Long, label: String): String {
+        val boundary = "----altair" + System.nanoTime()
+        val meta = JSONObject().apply {
+            put("deviceId", deviceId)
+            put("ts", ts)
+            if (label.isNotBlank()) put("label", label)
+        }.toString()
+        val c = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 10_000
+            readTimeout = 30_000
+            doOutput = true
+            setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+            setRequestProperty("User-Agent", "altair-probe")
+            if (token.isNotBlank()) setRequestProperty("X-Altair-Token", token)
+        }
+        try {
+            java.io.DataOutputStream(c.outputStream).use { out ->
+                fun text(s: String) = out.write(s.toByteArray(Charsets.UTF_8))
+                text("--$boundary\r\n")
+                text("Content-Disposition: form-data; name=\"meta\"\r\n\r\n")
+                text(meta + "\r\n")
+                text("--$boundary\r\n")
+                text("Content-Disposition: form-data; name=\"file\"; filename=\"shot.jpg\"\r\n")
+                text("Content-Type: image/jpeg\r\n\r\n")
+                file.inputStream().use { it.copyTo(out) }
+                text("\r\n--$boundary--\r\n")
+            }
+            val code = c.responseCode
+            val text = (if (code in 200..299) c.inputStream else c.errorStream)
+                ?.bufferedReader()?.readText() ?: ""
+            if (code == 401) throw RuntimeException("HTTP 401 鉴权失败 —— 请检查「集控 Token」")
+            if (code !in 200..299) throw RuntimeException("HTTP $code ${text.take(120)}")
+            return text
+        } finally {
+            runCatching { c.disconnect() }
+        }
     }
 
     // ------------------------------------------------------------ HTTP

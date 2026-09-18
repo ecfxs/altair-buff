@@ -87,6 +87,29 @@ class OverlayService : Service() {
             prefs(ctx).edit().putString("pickedPoints", arr.toString()).apply()
         }
 
+        private val picksListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+        /**
+         * 注册「采集点已变化」回调。
+         *
+         * 为什么需要它：采集点有两来源 —— 悬浮窗上手动采点，以及**集控下发的 skillPoints**。
+         * 后者只写进 SharedPreferences，而悬浮窗的内存副本是 onCreate 时读一次的。
+         * 不通知的话，从监控台下发的技能坐标在**重启悬浮窗之前根本不会显示在 ROI 上**
+         * （这正是「ROI 看不到技能 1-4 标点」的根因）。
+         */
+        fun addPicksListener(l: () -> Unit) {
+            picksListeners.add(l)
+        }
+
+        fun removePicksListener(l: () -> Unit) {
+            picksListeners.remove(l)
+        }
+
+        /** 采集点变化后调用。Management 应用 skillPoints 后必须调它。 */
+        fun notifyPicksChanged() {
+            picksListeners.forEach { runCatching { it() } }
+        }
+
         /** 读取采集点。 */
         fun pickedPointsOf(ctx: Context): List<Pair<Float, Float>> {
             val raw = prefs(ctx).getString("pickedPoints", "") ?: ""
@@ -107,6 +130,8 @@ class OverlayService : Service() {
     private var roiView: RoiView? = null
     private var pickView: PickView? = null
     private var lastPicks: List<Pair<Float, Float>> = emptyList()
+    /** 采集点变化回调（自己注册自己，onDestroy 时注销，避免泄漏）。 */
+    private var picksListener: (() -> Unit)? = null
     private var panelParams: WindowManager.LayoutParams? = null
     private var statusTvRef: TextView? = null
     private var statusPill: TextView? = null
@@ -151,6 +176,20 @@ class OverlayService : Service() {
         ShellCore.init(this)
         targetPkg = targetPkgOf(this)
         lastPicks = pickedPointsOf(this)
+        MarketFlow.init(this)
+        // 集控下发 skillPoints 后立刻反映到 ROI 与「点1..4」，不用重启悬浮窗
+        // （显式声明成 () -> Unit：最后一句 Handler.post 返回 Boolean，不标注会类型不匹配）
+        val onPicksChanged: () -> Unit = {
+            lastPicks = pickedPointsOf(this)
+            LogBus.emit("采集点已更新：共 ${lastPicks.size} 个（ROI 已刷新）")
+            if (roiEnabled) {
+                removeRoi()
+                syncRoiWithForeground(lastFg)
+            }
+            ui.post { refreshStatus() }
+        }
+        picksListener = onPicksChanged
+        addPicksListener(onPicksChanged)
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         startForeground(NOTIF_ID, buildNotification())
         LogBus.add(logListener)
@@ -168,6 +207,8 @@ class OverlayService : Service() {
         running = false
         ui.removeCallbacks(statusLoop)
         LogBus.remove(logListener)
+        picksListener?.let { removePicksListener(it) }
+        picksListener = null
         panel?.let { runCatching { wm.removeView(it) } }
         roiView?.let { runCatching { wm.removeView(it) } }
         panel = null
@@ -308,9 +349,18 @@ class OverlayService : Service() {
             "点3" to { tapPick(2) },
             "点4" to { tapPick(3) }
         ))
+        // 「菜单 / 自由市场」是**进出市场的完整流程**（见 MarketFlow）：
+        // 点菜单 → 等菜单出现 → 点自由市场 → 等过图黑屏 → 走到出口。
+        // 「传送点」保留为裸点，方便单独验证第 7 个采点对不对。
         content.addView(row(
             "菜单" to { tapPick(4) },
-            "自由市场" to { tapPick(5) },
+            "自由市场▶" to { runMarketFlow() },
+            "传送点" to { tapPick(6) },
+            "出市场" to { runExitMarket() }
+        ))
+        content.addView(row(
+            "记出口" to { recordExitHere() },
+            "看血条" to { probeHpBar() },
             "按法" to { cyclePressMode() }
         ))
 
@@ -578,7 +628,48 @@ class OverlayService : Service() {
         }
     }
 
-    // ------------------------------------------------------------ ROI 覆盖层    // ------------------------------------------------------------ ROI 覆盖层
+    /** 「自由市场▶」：完整进市场流程（点菜单 → 等菜单 → 点自由市场 → 等过图 → 走到出口）。 */
+    private fun runMarketFlow() {
+        Thread {
+            LogBus.emit("▸ 进自由市场（完整流程）")
+            val (ok, msg) = MarketFlow.enterMarketAndWalkToExit { LogBus.emit(it) }
+            LogBus.emit(if (ok) "   ✅ $msg" else "   ❌ $msg")
+            ui.post { refreshStatus() }
+        }.apply { isDaemon = true }.start()
+    }
+
+    /**
+     * 「记出口」：把**当前**位置记成光圈门口。
+     * 用法：手动走到门口的传送点前站定 → 点这个 → 之后「自由市场▶」结尾就会闭环对齐到这里。
+     */
+    private fun recordExitHere() {
+        Thread {
+            LogBus.emit("▸ 记出口：读取当前血条位置")
+            val (ok, msg) = MarketFlow.recordExitHere { LogBus.emit("   $it") }
+            LogBus.emit(if (ok) "   ✅ $msg" else "   ❌ $msg")
+            if (ok && roiEnabled) { removeRoi(); syncRoiWithForeground(lastFg) }
+            ui.post { refreshStatus() }
+        }.apply { isDaemon = true }.start()
+    }
+
+    /** 「看血条」：现场确认血条检测在这台机器/这个画面上有没有效。 */
+    private fun probeHpBar() {
+        Thread {
+            LogBus.emit("▸ 探血条：${MarketFlow.probeHpBar()}")
+        }.apply { isDaemon = true }.start()
+    }
+
+    /** 「出市场」：按方向键上出市场，并等过图。 */
+    private fun runExitMarket() {
+        Thread {
+            LogBus.emit("▸ 出自由市场")
+            val (ok, msg) = MarketFlow.exitMarket { LogBus.emit(it) }
+            LogBus.emit(if (ok) "   ✅ $msg" else "   ❌ $msg")
+            ui.post { refreshStatus() }
+        }.apply { isDaemon = true }.start()
+    }
+
+    // ------------------------------------------------------------ ROI 覆盖层
 
     private fun toggleRoi() {
         roiEnabled = !roiEnabled
@@ -599,7 +690,7 @@ class OverlayService : Service() {
     private fun addRoi() {
         if (roiView != null) return
         // 把采集点传进去，ROI 上就会按语义标注「技能1..4 / 菜单 / 自由市场」
-        val v = RoiView(this, lastPicks)
+        val v = RoiView(this, lastPicks, MarketFlow.exitXNorm)
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -651,7 +742,9 @@ class OverlayService : Service() {
 class RoiView(
     ctx: Context,
     /** 采集到的点：0-3=技能键 4=菜单 5=自由市场（按采点顺序） */
-    private val picked: List<Pair<Float, Float>> = emptyList()
+    private val picked: List<Pair<Float, Float>> = emptyList(),
+    /** 已标定的出口 x（归一化）；< 0 表示没标定 */
+    private val exitX: Double = -1.0
 ) : View(ctx) {
 
     /** 采集点的语义标签（按采点顺序）。 */
@@ -718,7 +811,8 @@ class RoiView(
                 0, 1, 2, 3 -> Color.parseColor("#FFFFC53D")   // 技能键 = 黄
                 4 -> Color.parseColor("#FFB07CFF")            // 菜单 = 紫
                 5 -> Color.parseColor("#FF3BD16F")            // 自由市场 = 绿
-                else -> Color.parseColor("#FF3BC9D1")
+                6 -> Color.parseColor("#FF3BC9D1")            // 传送点 = 青（出市场的口）
+                else -> Color.parseColor("#FF9AA7B6")         // 备用 = 灰
             }
             stroke.color = c
             stroke.strokeWidth = 4f
@@ -733,6 +827,36 @@ class RoiView(
             canvas.drawText(label, cx + 35f, cy - 28f, text)
         }
 
+        // ---- 还没采的点：画成暗色虚线位，一眼看出「缺哪个」----
+        // 之前只有采过的点才画，导致「ROI 上什么都没有」时无法判断是没采点还是图层没生效。
+        pickLabels.forEachIndexed { i, label ->
+            if (i < picked.size) return@forEachIndexed
+            val c = Color.parseColor("#66FFFFFF")
+            stroke.color = c
+            stroke.strokeWidth = 2f
+            // 未采的点没有坐标，沿屏幕底部等距排开示意
+            val cx = w * (0.12f + 0.085f * i)
+            val cy = h * 0.965f
+            canvas.drawCircle(cx, cy, 18f, stroke)
+            text.color = c
+            canvas.drawText("未采", cx - 24f, cy - 26f, text)
+            text.color = Color.parseColor("#99FFFFFF")
+            canvas.drawText(label, cx - 26f, cy + 40f, text)
+        }
+
+        // ---- 出口目标线（闭环走位的对齐目标）----
+        if (exitX >= 0) {
+            val x = (exitX * w).toFloat()
+            stroke.color = Color.parseColor("#FF3BD16F")
+            stroke.strokeWidth = 3f
+            canvas.drawLine(x, h * 0.45f, x, h * 0.70f, stroke)
+            fill.color = Color.parseColor("#FF3BD16F")
+            val tw = text.measureText("出口") + 10f
+            canvas.drawRect(x - tw / 2, h * 0.40f, x + tw / 2, h * 0.40f + 26f, fill)
+            text.color = Color.BLACK
+            canvas.drawText("出口", x - tw / 2 + 5f, h * 0.40f + 19f, text)
+        }
+
         // ---- 屏幕中心 ----
         stroke.color = Color.parseColor("#FF3BC9D1")
         stroke.strokeWidth = 2f
@@ -740,7 +864,12 @@ class RoiView(
 
         // ---- 尺寸标注 ----
         text.color = Color.parseColor("#FF3BC9D1")
-        canvas.drawText("${width}x${height} ${if (width > height) "横屏" else "竖屏"}  采集点 ${picked.size}",
-            12f, h - 14f, text)
+        val missing = pickLabels.drop(picked.size).take(8 - picked.size)
+        canvas.drawText(
+            "${width}x${height} ${if (width > height) "横屏" else "竖屏"}  已采 ${picked.size}/8" +
+                if (missing.isEmpty()) "（技能1-4/菜单/自由市场/传送点 齐了）"
+                else "（缺：${missing.joinToString("/")}）",
+            12f, h - 14f, text
+        )
     }
 }

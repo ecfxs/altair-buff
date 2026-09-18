@@ -7,6 +7,9 @@
 #   .toolchain/gradle-8.2       Gradle 8.2
 #   .toolchain/android-sdk      Android SDK (cmdline-tools + platform-tools + platforms/build-tools)
 #   .toolchain/gradle-home      GRADLE_USER_HOME（依赖缓存也留在工作区内）
+#   .toolchain/go               Go 工具链（集控服务端 control/ 用）
+#   .toolchain/go-path          GOPATH / GOMODCACHE
+#   .toolchain/go-cache         GOCACHE（Go 构建缓存）
 #
 # 用法: bash tools/setup-toolchain.sh
 # ---------------------------------------------------------------------------
@@ -158,6 +161,43 @@ else
   SDK_OK=0
 fi
 
+# ---------------------------------------------------------------- 4.5) Go 工具链
+# 集控服务端 control/（Go）用。装在工作区内，不碰 /opt/homebrew 或 /usr/local。
+GO_DIR="$TC/go"
+if [ -x "$GO_DIR/bin/go" ]; then
+  log "Go 已存在，跳过"
+else
+  # 版本动态取官方 VERSION 端点，失败则用下面的兜底版本，避免脚本随版本过期。
+  GO_VER_FALLBACK="1.27.1"
+  GO_VER="$(curl -fsS --max-time 20 'https://go.dev/VERSION?m=text' 2>/dev/null | head -1)"
+  [ -n "$GO_VER" ] || GO_VER="go$GO_VER_FALLBACK"
+  case "$(uname -m)" in
+    arm64|aarch64) GO_ARCH="arm64" ;;
+    x86_64|amd64)  GO_ARCH="amd64" ;;
+    *)             log "!! 不认识的架构: $(uname -m)"; GO_ARCH="arm64" ;;
+  esac
+  GO_URL="https://go.dev/dl/${GO_VER}.darwin-${GO_ARCH}.tar.gz"
+  GO_URL_FALLBACK="https://mirrors.aliyun.com/golang/${GO_VER}.darwin-${GO_ARCH}.tar.gz"
+  log "下载 Go ${GO_VER} (darwin-${GO_ARCH}) ..."
+  rm -f gotool.tar.gz
+  curl -L --fail --retry 2 -o gotool.tar.gz "$GO_URL" \
+    || { log "官方源失败，回退阿里云镜像 ..."; curl -L --fail -o gotool.tar.gz "$GO_URL_FALLBACK"; } \
+    || { log "Go 下载失败"; exit 1; }
+  log "解压 Go ..."
+  rm -rf "$GO_DIR"
+  tar xzf gotool.tar.gz -C "$TC" || { log "Go 解压失败"; exit 1; }
+  rm -f gotool.tar.gz
+fi
+export GOROOT="$GO_DIR"
+# 关键：GOPATH/GOMODCACHE/GOCACHE 必须留在工作区内。
+# 默认值落在 ~/go 与 ~/Library/Caches/go-build，受限环境下不可写，会让 go build 直接失败。
+export GOPATH="$TC/go-path"
+export GOMODCACHE="$GOPATH/pkg/mod"
+export GOCACHE="$TC/go-cache"
+export PATH="$GOROOT/bin:$PATH"
+mkdir -p "$GOPATH" "$GOCACHE"
+log "Go: $("$GO_DIR/bin/go" version)"
+
 # ---------------------------------------------------------------- 5) 汇总
 echo
 log "================ 工具链就绪 ================"
@@ -165,6 +205,8 @@ echo "JAVA_HOME        = $JAVA_HOME"
 echo "ANDROID_SDK_ROOT = $SDK"
 echo "GRADLE_USER_HOME = $GRADLE_USER_HOME"
 echo "gradle           = $GRADLE_DIR/bin/gradle"
+echo "GOROOT           = $GO_DIR"
+echo "GOMODCACHE       = $GOPATH/pkg/mod"
 echo
 echo "已安装 SDK 组件:"
 ls "$SDK" 2>/dev/null | sed 's/^/  /'
@@ -180,6 +222,12 @@ export PATH="\$JAVA_HOME/bin:$SDK/platform-tools:$SDK/build-tools/33.0.1:\$PATH"
 # AGP 需要可写的 Android 首选项目录（默认在 ~/.android，受限环境不可写）。
 # 只能设 ANDROID_USER_HOME 一个 —— 同时设 ANDROID_SDK_HOME 会让 AGP 报路径冲突。
 export ANDROID_USER_HOME="$TC/android-home"
+# ---- Go（集控服务端 control/ 用）----
+export GOROOT="$GO_DIR"
+export GOPATH="$TC/go-path"
+export GOMODCACHE="\$GOPATH/pkg/mod"
+export GOCACHE="$TC/go-cache"
+export PATH="\$GOROOT/bin:\$PATH"
 EOF
 echo "  已写入 $TC/env.sh"
 du -sh "$TC" 2>/dev/null | sed 's/^/总占用: /'

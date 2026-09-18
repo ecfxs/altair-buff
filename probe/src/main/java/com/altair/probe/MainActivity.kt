@@ -414,7 +414,7 @@ class MainActivity : Activity() {
         // ---------- 集控 ----------
         c.addView(section("集控（多设备统一管理）"))
         mgmtField = EditText(this).apply {
-            hint = "服务器地址，如 http://1.2.3.4:8899"
+            hint = "服务器地址，如 https://control.example.com"
             setText(mgmt.server)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             styleEdit()
@@ -427,7 +427,7 @@ class MainActivity : Activity() {
         }
         c.addView(mgmtToken)
         mgmtChk = CheckBox(this).apply {
-            text = "启用集控定期上报（设备主动上报 + 拉配置）"
+            text = "启用集控定期上报（协议 v1：一次上报即收启停指令，周期由服务端下发）"
             isChecked = mgmt.enabled
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTextColor(Color.parseColor("#8FA3B8"))
@@ -436,6 +436,7 @@ class MainActivity : Activity() {
         c.addView(buttonRow(
             "上报一次" to { runMgmtReport() },
             "拉取配置" to { runMgmtPull() },
+            "截图上传" to { runMgmtScreenshot() },
             "设备ID" to { showDeviceId() }
         ))
 
@@ -786,6 +787,12 @@ class MainActivity : Activity() {
     private fun runMgmtPull() {
         saveMgmtFields()
         act("集控拉配置") { mgmt.pullConfigOnce() }
+    }
+
+    /** 手动截图并上传（服务端也能点播，走同一段代码）。 */
+    private fun runMgmtScreenshot() {
+        saveMgmtFields()
+        act("集控截图上传") { mgmt.uploadScreenshot(label = "手动") }
     }
 
     private fun showDeviceId() {

@@ -73,6 +73,14 @@ object Engine {
         }
     }
 
+    /** 回城模式：补完 BUFF 自动进自由市场等待（配置项 autoFreeMarket，默认关）。 */
+    private fun autoFreeMarket(): Boolean =
+        ctx!!.getSharedPreferences("buff", Context.MODE_PRIVATE)
+            .getBoolean("autoFreeMarket", false)
+
+    /** 当前是否停在自由市场里。只在本进程内维护 —— 重启后按"未知"处理，下一轮会先尝试出市场。 */
+    @Volatile private var inMarket = false
+
     private fun inputMethod(): String =
         ctx!!.getSharedPreferences("overlay", Context.MODE_PRIVATE)
             .getString("inputMethod", "keyevent") ?: "keyevent"
@@ -88,6 +96,7 @@ object Engine {
     fun start(context: Context) {
         if (running) { LogBus.emit("引擎已在运行"); return }
         ctx = context.applicationContext
+        MarketFlow.init(context)
         val period = cyclePeriodMs()
         if (period <= 0) {
             LogBus.emit("⛔ 无法启动：没有任何 BUFF 被启用，或时长未填。请到「设置」页配置。")
@@ -99,6 +108,21 @@ object Engine {
             LogBus.emit("⛔ 无法启动：输入方式为触摸，但还没采集技能键坐标（需 4 个点）。")
             state = State.ERROR; lastError = "触摸方式但缺技能键坐标"
             return
+        }
+        // 回城模式先守「采点齐不齐」：宁可启动时明确拒绝，
+        // 也不要每轮都在"进不去市场"里静默失败、还把日志刷满。
+        if (autoFreeMarket()) {
+            val picks = OverlayService.pickedPointsOf(ctx!!).size
+            val need = if (MarketFlow.walkMode == "tap") 7 else 6
+            if (picks < need) {
+                LogBus.emit(
+                    "⛔ 无法启动：开了回城模式，但采点不足（当前 $picks 个，需要 $need 个：" +
+                        "技能1-4 → 菜单 → 自由市场" + (if (need == 7) " → 传送点" else "") +
+                        "）。请到悬浮窗「★采点」依次补采。"
+                )
+                state = State.ERROR; lastError = "回城模式但采点不足（$picks/$need）"
+                return
+            }
         }
         running = true
         failStreak = 0
@@ -157,6 +181,22 @@ object Engine {
             return
         }
 
+        // 回城模式：BUFF 必须在野外补（自由市场是等待区，技能打不出来）。
+        // 所以先出市场再补 —— 这一步失败就记一次失败，绝不在市场里硬按技能。
+        if (autoFreeMarket() && inMarket) {
+            LogBus.emit("── 回城模式：先出自由市场 ──")
+            val (ok, msg) = MarketFlow.exitMarket { LogBus.emit("  $it") }
+            inMarket = false
+            if (!ok) {
+                failStreak++
+                lastResult = "出自由市场失败：$msg"
+                LogBus.emit("  ❌ $lastResult")
+                nextDueAt = System.currentTimeMillis() + 30_000L * failStreak
+                state = State.WAITING
+                return
+            }
+        }
+
         val enabled = buffConfig().filter { it.enabled }
         LogBus.emit("── 第 ${cycleCount + 1} 轮：开始补 ${enabled.size} 个 BUFF ──")
         var ok = 0
@@ -176,6 +216,15 @@ object Engine {
             nextDueAt = lastCastAt + period
             state = State.WAITING
             LogBus.emit("✅ 第 $cycleCount 轮完成，下次 ${period / 60000.0} 分钟后")
+
+            // 回城模式：补完就回自由市场等待，并走到出口待命
+            if (autoFreeMarket()) {
+                LogBus.emit("── 回城模式：进自由市场并走到出口 ──")
+                val (mOk, mMsg) = MarketFlow.enterMarketAndWalkToExit { LogBus.emit("  $it") }
+                inMarket = mOk
+                lastResult += if (mOk) "；已回自由市场" else "；回城失败"
+                LogBus.emit(if (mOk) "  ↩ $mMsg" else "  ⚠ $mMsg（下一轮按仍在野外处理）")
+            }
         } else {
             failStreak++
             lastResult = "本轮 $ok/${enabled.size}"
@@ -230,6 +279,8 @@ object Engine {
         o.put("lastError", lastError)
         o.put("lastResult", lastResult)
         o.put("inputMethod", if (ctx == null) "?" else inputMethod())
+        o.put("autoFreeMarket", if (ctx == null) false else autoFreeMarket())
+        o.put("inMarket", inMarket)
         o.put("cyclePeriodMs", cyclePeriodMs())
         if (nextDueAt > 0) o.put("nextDueAt", nextDueAt)
         if (lastCastAt > 0) o.put("lastCastAt", lastCastAt)
