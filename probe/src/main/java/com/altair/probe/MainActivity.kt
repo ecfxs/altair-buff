@@ -101,6 +101,11 @@ class MainActivity : Activity() {
         Engine.init(this)   // ★ 必须早于任何读引擎配置的代码（否则「更新后一打开就闪退」）
         buildUi()
         LogBus.add(logListener)
+        // 技能 1-4 的坐标是固定 UI，用实机采点实测值内置好，不再要求手动采点
+        if (SkillBar.ensureDefaults(this)) {
+            log("已内置技能 1-4 的实测坐标：" + SkillBar.describe(this))
+            log("（悬浮窗「技能位」可按 74px 周期在技能带内自动吸附校正）")
+        }
         // 把之前累积的日志倒进来
         LogBus.dump().lines().forEach { if (it.isNotEmpty()) renderLog(it) }
         log("阿尔泰挂机 v" + updater.currentVersionName())

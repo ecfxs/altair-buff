@@ -1024,16 +1024,35 @@ class Probe(
     }
 
     /**
-     * 找**角色头顶血条**的中心 x（归一化 0..1）。找不到返回 null。
+     * 给视觉检测用的一次性原始画面（RGB 打包）。返回 Triple(w, h, rgb)，失败 null。
      *
-     * 这是设备端唯一可靠的「角色现在在哪」信号 —— 设计文档 6.6 的闭环走位就靠它。
-     * （试过小地图角色点，太小、和场景杂点混在一起，实测分辨不出来。）
+     * 注意：整屏 RGB 是 w*h 个 Int（1280x720 ≈ 3.7MB）。只在**手动触发/低频**检测里用，
+     * 不要放进每帧循环。
+     */
+    fun captureRawForVision(): Triple<Int, Int, IntArray>? {
+        if (!ensureShell()) return null
+        val d = if (bestDisplayId >= 0) bestDisplayId else 0
+        val f = File(cache, "vision.raw")
+        f.delete()
+        sh.timedExec("screencap -d $d ${f.absolutePath}", 12000)
+        val hdr = parseRawHeader(f) ?: return null
+        val w = hdr[0]; val h = hdr[1]; val hb = hdr[4]
+        val rgb = readRawRoiRgb(f, w, h, hb, 0, 0, w, h) ?: return null
+        return Triple(w, h, rgb)
+    }
+
+    /**
+     * 找**角色头顶血条**，返回归一化 [x, y, w, h]（左上角 + 宽高）。找不到返回 null。
      *
-     * 扫描范围只取角色头顶可能出现的那条横带（默认 y 50%~60%），
-     * 逐行找「红像素连续段」，再验竖向厚度 4~10px、宽 20~120px。
+     * 这是设备端唯一可靠的「角色现在在哪」信号 —— 闭环走位与 ROI 动态显示都靠它。
+     * （试过小地图角色点：太小、和场景杂点混在一起，实测分辨不出来。）
+     *
+     * 签名来自实机实测（详细设计 F-17）：主体纯红渐变 R195..249 / G0 / B0，
+     * 外圈浅粉描边 R255 / G96 / B96。扫描只取角色头顶可能出现的那条横带
+     * （默认 y 50%~60%），逐行找「红像素连续段」，再验竖向厚度 4~10px、宽 20~120px。
      * 宽度下限放到 20 是因为角色贴屏幕边缘时血条会被裁掉一截。
      */
-    fun findHeadHpBarX(bandLo: Double = 0.50, bandHi: Double = 0.60): Double? {
+    fun findHeadHpBarBox(bandLo: Double = 0.50, bandHi: Double = 0.60): FloatArray? {
         if (!ensureShell()) return null
         val d = if (bestDisplayId >= 0) bestDisplayId else 0
         val f = File(cache, "hpbar.raw")
@@ -1047,7 +1066,7 @@ class Probe(
         val bh = y1 - y0
 
         var bestScore = 0
-        var bestCx = -1
+        var bx = -1; var by = -1; var bwd = 0; var bht = 0
         for (ry in 0 until bh) {
             var x = 0
             while (x < w) {
@@ -1068,15 +1087,25 @@ class Probe(
                         val score = runW * thick
                         if (score > bestScore) {
                             bestScore = score
-                            bestCx = (x + xe) / 2
+                            bx = x; by = ry; bwd = runW; bht = thick
                         }
                     }
                 }
                 x = xe + 1
             }
         }
-        return if (bestCx >= 0) bestCx.toDouble() / w else null
+        if (bx < 0) return null
+        return floatArrayOf(
+            bx.toFloat() / w,
+            (y0 + by).toFloat() / h,
+            bwd.toFloat() / w,
+            bht.toFloat() / h,
+        )
     }
+
+    /** 头顶血条中心 x（归一化）。ROI 对齐与闭环走位用。 */
+    fun findHeadHpBarX(bandLo: Double = 0.50, bandHi: Double = 0.60): Double? =
+        findHeadHpBarBox(bandLo, bandHi)?.let { (it[0] + it[2] / 2f).toDouble() }
 
     /** 从 raw 文件里只读一个矩形区域的亮度值。row-major RGBA_8888。 */
     private fun readRawRoi(

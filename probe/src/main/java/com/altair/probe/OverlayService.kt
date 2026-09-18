@@ -150,12 +150,34 @@ class OverlayService : Service() {
         Triple("长250", 250, "swipe"),
         Triple("自绘150", 150, "motionevent")
     )
-    private var pressIdx = 1
+    /**
+     * 按压档位下标。
+     *
+     * ★ 必须持久化：引擎（Engine.pressSkill）也要用同一套参数。
+     * 之前它只是内存字段，引擎读不到、只能用 tapNorm 的默认档 ——
+     * 于是出现「悬浮窗点1 生效、引擎触摸点击无效」这种诡异现象：
+     * 用户是靠切「按法」把点击调通的，而引擎永远用默认档。
+     */
+    private var pressIdx: Int
+        get() = prefs().getInt("pressIdx", 1).coerceIn(0, pressModes.size - 1)
+        set(v) {
+            val i = v.coerceIn(0, pressModes.size - 1)
+            val m = pressModes[i]
+            // 一次写入三个键：引擎直接读 pressMs/pressMethod，不依赖悬浮窗对象
+            prefs().edit()
+                .putInt("pressIdx", i)
+                .putInt("pressMs", m.second)
+                .putString("pressMethod", m.third)
+                .apply()
+        }
     private var pressBtn: Button? = null
     /** 门禁：目标游戏包名。只有它在前台时，输入类动作才允许执行。 */
     private var targetPkg: String = "com.nexon.mod"
     /** ROI 的用户意图（≠ 实际是否显示：实际显示还要满足「游戏在前台」）。 */
     private var roiEnabled = false
+    /** ROI 上动态显示的血条框（归一化 [x,y,w,h]），null = 还没识别到。 */
+    @Volatile private var hpBox: FloatArray? = null
+    @Volatile private var hpPolling = false
     /** 最近一次检测到的前台包名。 */
     private var lastFg: String = "?"
     private var statusTv: TextView? = null
@@ -361,7 +383,8 @@ class OverlayService : Service() {
         content.addView(row(
             "记出口" to { recordExitHere() },
             "看血条" to { probeHpBar() },
-            "按法" to { cyclePressMode() }
+            "按法:${pressModes[pressIdx].first}" to { cyclePressMode() },
+            "技能位" to { autoDetectSkills() }
         ))
 
         contentBox = content
@@ -471,6 +494,9 @@ class OverlayService : Service() {
     private fun updatePressBtn() {
         pressBtn?.text = "按法:${pressModes[pressIdx].first}"
     }
+
+    /** 当前档位的按压参数（引擎也用这一套）。 */
+    fun currentPress(): Triple<String, Int, String> = pressModes[pressIdx]
 
     private fun row(vararg btns: Pair<String, () -> Unit>): LinearLayout {
         val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -652,6 +678,22 @@ class OverlayService : Service() {
         }.apply { isDaemon = true }.start()
     }
 
+    /**
+     * 「技能位」：把 1-4 号技能坐标重置为**实机采点实测值**（不再要求手动采点），
+     * 并报告带内相位观测值（仅诊断，不自动应用 —— 原因见 SkillBar 类注释）。
+     */
+    private fun autoDetectSkills() {
+        Thread {
+            LogBus.emit("▸ 自动识别技能位")
+            val (ok, msg) = SkillBar.resetToMeasured(this) { LogBus.emit("   $it") }
+            LogBus.emit(if (ok) "   ✅ $msg" else "   ❌ $msg")
+            LogBus.emit("   技能位：" + SkillBar.describe(this))
+            lastPicks = pickedPointsOf(this)
+            if (roiEnabled) { removeRoi(); syncRoiWithForeground(lastFg) }
+            ui.post { refreshStatus() }
+        }.apply { isDaemon = true }.start()
+    }
+
     /** 「看血条」：现场确认血条检测在这台机器/这个画面上有没有效。 */
     private fun probeHpBar() {
         Thread {
@@ -683,13 +725,38 @@ class OverlayService : Service() {
     }
 
     private fun removeRoi() {
+        stopHpPolling()
         roiView?.let { runCatching { wm.removeView(it) } }
         roiView = null
+    }
+
+    /**
+     * ROI 开着时，后台低频检测角色血条位置并画在画面上。
+     *
+     * 周期取 1.2s：一次检测要截图 + 扫一条带（约 100~300ms），
+     * 太密会和游戏抢 CPU，太疏又看不出"角色在移动"。
+     */
+    private fun startHpPolling() {
+        if (hpPolling) return
+        hpPolling = true
+        Thread {
+            while (hpPolling) {
+                val box = runCatching { ShellCore.probe.findHeadHpBarBox() }.getOrNull()
+                hpBox = box
+                ui.post { roiView?.setHpBar(box) }
+                try { Thread.sleep(1200) } catch (_: InterruptedException) { break }
+            }
+        }.apply { isDaemon = true; name = "roi-hpbar" }.start()
+    }
+
+    private fun stopHpPolling() {
+        hpPolling = false
     }
 
     private fun addRoi() {
         if (roiView != null) return
         // 把采集点传进去，ROI 上就会按语义标注「技能1..4 / 菜单 / 自由市场」
+        startHpPolling()
         val v = RoiView(this, lastPicks, MarketFlow.exitXNorm)
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -759,6 +826,14 @@ class RoiView(
         typeface = Typeface.MONOSPACE
     }
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+
+    /** 动态识别的角色血条框（归一化 [x,y,w,h]）；null = 本次没识别到。 */
+    private var hpBox: FloatArray? = null
+
+    fun setHpBar(box: FloatArray?) {
+        hpBox = box
+        invalidate()
+    }
 
     /**
      * 静态 ROI —— 全部为实机实测值。
@@ -842,6 +917,34 @@ class RoiView(
             canvas.drawText("未采", cx - 24f, cy - 26f, text)
             text.color = Color.parseColor("#99FFFFFF")
             canvas.drawText(label, cx - 26f, cy + 40f, text)
+        }
+
+        // ---- 动态识别的角色血条（闭环走位的"角色在哪"信号）----
+        val hb = hpBox
+        if (hb != null) {
+            val rx = hb[0] * w
+            val ry = hb[1] * h
+            val rw = hb[2] * w
+            val rh = hb[3] * h
+            val c = Color.parseColor("#FFFF4444")
+            stroke.color = c
+            stroke.strokeWidth = 3f
+            canvas.drawRect(rx - 3f, ry - 3f, rx + rw + 3f, ry + rh + 3f, stroke)
+            // 中心 x 画一条竖线：这就是闭环走位要对齐到的"角色 x"
+            val cx = rx + rw / 2f
+            stroke.strokeWidth = 2f
+            canvas.drawLine(cx, 0f, cx, h, stroke)
+            fill.color = c
+            val label = "血条 x=%.3f".format(hb[0] + hb[2] / 2f)
+            val tw = text.measureText(label) + 10f
+            canvas.drawRect(rx, ry - 30f, rx + tw, ry - 4f, fill)
+            text.color = Color.BLACK
+            canvas.drawText(label, rx + 5f, ry - 10f, text)
+        } else {
+            fill.color = Color.parseColor("#88FF4444")
+            canvas.drawRect(12f, h * 0.47f, 12f + text.measureText("血条：未识别到") + 12f, h * 0.47f + 26f, fill)
+            text.color = Color.BLACK
+            canvas.drawText("血条：未识别到", 18f, h * 0.47f + 19f, text)
         }
 
         // ---- 出口目标线（闭环走位的对齐目标）----

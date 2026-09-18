@@ -147,6 +147,13 @@ object Engine {
             "启用 ${buffConfig().count { it.enabled }} 个 BUFF")
         worker = Thread { loop() }.apply { isDaemon = true; name = "engine" }
         worker?.start()
+
+        // 技能位：只保证有实测坐标（启动时已内置），**不做自动位移**。
+        // 原因见 SkillBar 类注释：带内能稳定找到的相位是按钮"边缘"，应用了会把点推离中心。
+        // 需要校正时用悬浮窗「技能位」按钮 —— 它重置为实测值并报告观测偏移。
+        if (SkillBar.ensureDefaults(context)) {
+            LogBus.emit("技能位：已内置实测坐标（悬浮窗「技能位」可重置/查看）")
+        }
     }
 
     fun stop(reason: String = "手动停止") {
@@ -269,8 +276,16 @@ object Engine {
             "touch" -> {
                 val pts = OverlayService.pickedPointsOf(c)
                 val p = pts.getOrNull(idx) ?: return false to "没有第 ${idx + 1} 个采集点"
-                val r = ShellCore.probe.tapNorm(p.first.toDouble(), p.second.toDouble(), "技能${idx + 1}")
-                if (r.contains("点击")) true to "点击(%.4f, %.4f)".format(p.first, p.second)
+                // ★ 必须和悬浮窗「按法」用同一套按压参数。
+                //   之前引擎固定用 tapNorm 默认档（90ms/swipe），而用户往往是靠切「按法」
+                //   才把点击调通的 —— 结果就是「面板点1 生效、引擎触摸点击无效」。
+                val op = c.getSharedPreferences("overlay", Context.MODE_PRIVATE)
+                val ms = op.getInt("pressMs", 90)
+                val method = op.getString("pressMethod", "swipe") ?: "swipe"
+                val r = ShellCore.probe.tapNorm(
+                    p.first.toDouble(), p.second.toDouble(), "技能${idx + 1}", ms, method
+                )
+                if (r.contains("点击")) true to "点击(%.4f, %.4f) $method/${ms}ms".format(p.first, p.second)
                 else false to r.take(80)
             }
             else -> {
