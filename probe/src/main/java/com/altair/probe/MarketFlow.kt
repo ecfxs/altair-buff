@@ -147,12 +147,15 @@ object MarketFlow {
         set(v) = setLong("alignTolMilli", (v * 1000).toLong())
 
     /**
-     * 原地走动的横向距离（归一化，占屏宽比例）。默认 0.05 ≈ 1280 下 64px。
-     * 太短看不出在动、太长会走出等待区，所以做成可调而不是写死。
+     * 原地走动的横向距离（**像素**，默认 100px —— 用户指定"左右走大概 100 像素"）。
+     *
+     * 用像素而不是屏宽比例：换分辨率时"走多少路"的体感不变，
+     * 而比例写法在 720p/1080p 上实际位移会差一倍。
+     * 运行时按 [ShellCore.probe.screenWidthPx] 换算成归一化坐标。
      */
-    var strollDistanceNorm: Double
-        get() = getLong("strollDistMilli", 50L) / 1000.0
-        set(v) = setLong("strollDistMilli", (v * 1000).toLong())
+    var strollDistancePx: Int
+        get() = getLong("strollPx", 100L).toInt()
+        set(v) = setLong("strollPx", v.toLong())
 
     /** 来回几趟。默认 1 趟（左去右回）。 */
     var strollRounds: Int
@@ -333,42 +336,46 @@ object MarketFlow {
      * 后者在卡顿时会越走越偏，几次循环就跑出原地了。
      */
     fun strollAndReturn(log: (String) -> Unit): Pair<Boolean, String> {
+        // ① 标定当前位置：读一次角色血条 x，作为"走回这里"的原点
         val origin = hpX() ?: return false to "没识别到角色血条，跳过原地走动（直接补 BUFF）"
-        val dist = strollDistanceNorm
+        val screenW = ShellCore.probe.screenWidthPx.coerceAtLeast(1)
+        val dist = strollDistancePx.toDouble() / screenW      // 100px → 归一化
         val tol = 0.012
+        log("① 已标定当前位置：血条 x=${"%.3f".format(origin)}（屏幕 ${screenW}px，本次走 ${strollDistancePx}px ≈ ${"%.3f".format(dist)}）")
+
         var x = origin
         var steps = 0
-
         repeat(strollRounds) { round ->
-            // ---- 左腿：往左走到 origin - dist ----
+            // ② 左腿：往左走 strollDistancePx
             var i = 0
             while (i < maxWalkSteps) {
                 x = hpX() ?: break
-                if (origin - x >= dist) break          // 走够距离了
+                if (origin - x >= dist) break
                 walkStep(-1, log)
                 i++; steps++
             }
-            log("  第 ${round + 1} 趟左腿：x=${"%.3f".format(x)}（目标 ≤ ${"%.3f".format(origin - dist)}，走了 $i 步）")
+            log("② 左腿：x=${"%.3f".format(x)}（目标 ≤ ${"%.3f".format(origin - dist)}，走了 $i 步）")
 
-            // ---- 右腿：回到原点（闭环，不靠步数）----
+            // ③ 右腿：走回原点（闭环，不靠步数）
             var j = 0
             while (j < maxWalkSteps) {
                 x = hpX() ?: break
-                if (x >= origin - tol) break           // 已回到原位附近
+                if (x >= origin - tol) break
                 walkStep(+1, log)
                 j++; steps++
             }
-            log("  第 ${round + 1} 趟右腿：x=${"%.3f".format(x)}（目标 ≥ ${"%.3f".format(origin - tol)}，走了 $j 步）")
+            log("③ 右腿：x=${"%.3f".format(x)}（目标 ≥ ${"%.3f".format(origin - tol)}，走了 $j 步）")
         }
 
         val back = kotlin.math.abs(x - origin) <= 0.02
-        return true to ("原地走动完成：原点 x=${"%.3f".format(origin)}，回位 x=${"%.3f".format(x)}，" +
-            "共 $steps 步" + if (back) "（已回原位）" else "（⚠ 未完全回位，仍继续补 BUFF）")
+        return true to ("④ 原地走动完成：原点 x=${"%.3f".format(origin)}，回位 x=${"%.3f".format(x)}，" +
+            "共 $steps 步" + if (back) "（已回原位，接着补 BUFF）" else "（⚠ 未完全回位，仍继续补 BUFF）")
     }
 
     /**
      * 走一步：dir = -1 左 / +1 右。
-     * 默认用左下角摇杆（按下→拖偏移→保持→松手），可选退回方向键。
+     *
+     * 默认**方向键**（用户实测"方向键版本能略微走动"），需要时切 joystick 走左下角摇杆。
      */
     private fun walkStep(dir: Int, log: (String) -> Unit = {}) {
         if (walkMethod == "key") {
@@ -483,8 +490,8 @@ object MarketFlow {
 
     /** 供界面显示当前参数。 */
     fun describeStroll(): String =
-        "原地走动：距离 ${"%.3f".format(strollDistanceNorm)}（≈${"%.0f".format(strollDistanceNorm * 1280)}px）× " +
-            "${strollRounds} 趟；走法=" + if (walkMethod == "key") {
+        "原地走动：标定当前位置 → 走 ${strollDistancePx}px × ${strollRounds} 趟 → 回原位；走法=" +
+            if (walkMethod == "key") {
                 "方向键"
             } else {
                 "摇杆 中心(${"%.3f".format(joystickCenterX)},${"%.3f".format(joystickCenterY)}) " +

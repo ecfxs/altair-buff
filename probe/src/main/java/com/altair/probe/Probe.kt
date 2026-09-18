@@ -42,7 +42,12 @@ class Probe(
     var frameVariance = 0.0; private set
     var frameEntropy = 0.0; private set
     var blackScreen = false; private set
-    var displayCount = 0; private set
+    var displayCount = 0
+    /** 最近一次截图解析出的屏幕宽/高（像素）。供"走 N 像素"这类按像素计算的需求换算。 */
+    @Volatile var screenWidthPx: Int = 1280
+        private set
+    @Volatile var screenHeightPx: Int = 720
+        private set
 
     private val cache: File get() = ctx.cacheDir
 
@@ -1119,6 +1124,7 @@ class Probe(
         sh.timedExec("screencap -d $d ${f.absolutePath}", 12000)
         val hdr = parseRawHeader(f) ?: return null
         val w = hdr[0]; val h = hdr[1]; val hb = hdr[4]
+        screenWidthPx = w; screenHeightPx = h
         val y0 = (h * bandLo).toInt().coerceIn(0, h - 1)
         val y1 = (h * bandHi).toInt().coerceIn(y0 + 1, h)
         val band = readRawRoiRgb(f, w, h, hb, 0, y0, w, y1) ?: return null

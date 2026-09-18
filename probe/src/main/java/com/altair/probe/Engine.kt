@@ -81,6 +81,8 @@ object Engine {
 
     /** 当前是否停在自由市场里。只在本进程内维护 —— 重启后按"未知"处理，下一轮会先尝试出市场。 */
     @Volatile private var inMarket = false
+    /** "回城模式已暂停"只提示一次，别每轮刷屏。 */
+    @Volatile private var pausedMarketNotified = false
 
     private fun inputMethod(): String =
         ctx?.getSharedPreferences("overlay", Context.MODE_PRIVATE)
@@ -202,9 +204,11 @@ object Engine {
             return
         }
 
-        // 回城模式：BUFF 必须在野外补（自由市场是等待区，技能打不出来）。
-        // 所以先出市场再补 —— 这一步失败就记一次失败，绝不在市场里硬按技能。
-        if (autoFreeMarket() && inMarket) {
+        // 【暂时停用】回城模式（进出自由市场）。
+        // 用户要求：先只保留「技能位 + 角色血条」两项识别与「原地走动 + 补 BUFF」，
+        // 菜单/自由市场/传送门/过图那套识别**代码保留但不再启用**，后续再优化。
+        // 真要用时把下面这段的 false 改成 autoFreeMarket() 即可恢复。
+        if (false && autoFreeMarket() && inMarket) {
             LogBus.emit("── 回城模式：先出自由市场 ──")
             val (ok, msg) = MarketFlow.exitMarket { LogBus.emit("  $it") }
             inMarket = false
@@ -218,10 +222,12 @@ object Engine {
             }
         }
 
-        // 原地等待模式：放技能前左右走动一下再回原位（不勾"自动进自由市场"时的循环）
-        if (!autoFreeMarket()) {
-            val (_, msg) = MarketFlow.strollAndReturn { LogBus.emit("  $it") }
-            LogBus.emit("  $msg")
+        // 补 BUFF 前：先标定当前位置 → 左右走一段 → 回原位（用户确认的循环）
+        val (_, strollMsg) = MarketFlow.strollAndReturn { LogBus.emit("  $it") }
+        LogBus.emit("  $strollMsg")
+        if (autoFreeMarket() && !pausedMarketNotified) {
+            pausedMarketNotified = true
+            LogBus.emit("ℹ 回城模式（自动进自由市场）暂时停用：当前只做「原地走动 + 补 BUFF」，后续再启用")
         }
 
         val enabled = buffConfig().filter { it.enabled }
@@ -244,8 +250,8 @@ object Engine {
             state = State.WAITING
             LogBus.emit("✅ 第 $cycleCount 轮完成，下次 ${period / 60000.0} 分钟后")
 
-            // 回城模式：补完就回自由市场等待，并走到出口待命
-            if (autoFreeMarket()) {
+            // 【暂时停用】补完就回自由市场等待（同上，代码保留不启用）
+            if (false && autoFreeMarket()) {
                 LogBus.emit("── 回城模式：进自由市场并走到出口 ──")
                 // 显式写 log = ：尾随 lambda 会绑到最后一个参数（leaveAfter），这里不能省
                 val (mOk, mMsg) = MarketFlow.enterMarketAndWalkToExit(

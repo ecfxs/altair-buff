@@ -401,49 +401,21 @@ class OverlayService : Service() {
         //   技能键 1-4 的模拟点击
         // 其余（截图、诊断、键扫描、复制日志、申请Root）都移到主界面的日志页，
         // 因为那些是排查时用的，不是挂在游戏上天天点的。
+        // ---------------------------------------------------------------- 面板按钮
+        // 用户要求：**只留 7 个**。其余（点1-4 / 菜单 / 自由市场 / 传送点 / 出市场 /
+        // 记出口 / 看血条 / 按法 / 技能位 / 走法 / 摇杆档 / 校菜单·市场·传送 / 走动距离）
+        // 全部撤掉 —— 面板要挂在游戏上天天用，按钮多了反而找不到。
+        // 这些能力没删：单点校准、市场流程、摇杆走位等代码都还在，需要时可用主界面或再挂回来。
         content.addView(row(
             "ROI显示" to { toggleRoi() },
             "★采点" to { togglePick() },
             "清点" to { clearPicks() },
-            "标定" to { calibrateTarget() }
+            "启动" to { startEngineFromPanel() }
         ))
         content.addView(row(
-            "点1" to { tapPick(0) },
-            "点2" to { tapPick(1) },
-            "点3" to { tapPick(2) },
-            "点4" to { tapPick(3) }
-        ))
-        // 「菜单 / 自由市场」是**进出市场的完整流程**（见 MarketFlow）：
-        // 点菜单 → 等菜单出现 → 点自由市场 → 等过图黑屏 → 走到出口。
-        // 「传送点」保留为裸点，方便单独验证第 7 个采点对不对。
-        content.addView(row(
-            "菜单" to { tapPick(4) },
-            "自由市场▶" to { runMarketFlow() },
-            "传送点" to { tapPick(6) },
-            "出市场" to { runExitMarket() }
-        ))
-        content.addView(row(
-            "记出口" to { recordExitHere() },
-            "看血条" to { probeHpBar() },
-            "按法:${pressModes[pressIdx].first}" to { cyclePressMode() },
-            "技能位" to { autoDetectSkills() }
-        ))
-        content.addView(row(
-            "原地走动" to { testStroll() },
-            "走法:${if (MarketFlow.walkMethod == "key") "键" else "摇杆"}" to { cycleWalkMethod() },
-            "校摇杆" to { startSlotPick(SLOT_JOYSTICK) },
-            "摇杆档" to { cycleJoystickPreset() }
-        ))
-        content.addView(row(
-            "走动距离" to { cycleStrollDistance() },
-            "记出口" to { recordExitHere() }
-        ))
-        // 单点校准：只改一个槽位，不用整批重采
-        content.addView(row(
-            "校菜单" to { startSlotPick(4) },
-            "校市场" to { startSlotPick(5) },
-            "校传送" to { startSlotPick(6) },
-            "校备用" to { startSlotPick(7) }
+            "停止" to { stopEngineFromPanel() },
+            "标记摇杆" to { startSlotPick(SLOT_JOYSTICK) },
+            "原地走动" to { testStroll() }
         ))
 
         contentBox = content
@@ -861,13 +833,36 @@ class OverlayService : Service() {
 
     /** 「走动距离」：循环切换原地走动的距离档位（0.03 / 0.05 / 0.08 / 0.12 屏宽）。 */
     private fun cycleStrollDistance() {
-        val levels = doubleArrayOf(0.03, 0.05, 0.08, 0.12)
-        val cur = MarketFlow.strollDistanceNorm
-        val next = levels.firstOrNull { it > cur + 1e-6 } ?: levels[0]
-        MarketFlow.strollDistanceNorm = next
-        val msg = "走动距离 -> ${"%.3f".format(next)}（≈${"%.0f".format(next * 1280)}px）"
+        val levels = intArrayOf(60, 100, 150, 200)
+        val cur = MarketFlow.strollDistancePx
+        val next = levels.firstOrNull { it > cur } ?: levels[0]
+        MarketFlow.strollDistancePx = next
+        val msg = "走动距离 -> ${next}px"
         LogBus.emit(msg)
         flashStatus(msg)
+    }
+
+    /** 「启动」：直接起挂机引擎（等于主界面的启动，省得来回切 App）。 */
+    private fun startEngineFromPanel() {
+        runCatching { Engine.start(this) }
+        // 引擎启动失败是**设状态**而不是抛异常（比如"没启用任何 BUFF"），所以看状态
+        val text = if (Engine.isRunning) {
+            "✅ 引擎已启动，周期 ${"%.1f".format(Engine.cyclePeriodMs() / 60000.0)} 分钟"
+        } else {
+            "❌ 启动失败：" + Engine.lastError.ifBlank { "原因见主界面日志" }
+        }
+        LogBus.emit(text)
+        flashStatus(text)
+        ui.post { refreshStatus() }
+    }
+
+    /** 「停止」：停挂机引擎。 */
+    private fun stopEngineFromPanel() {
+        Engine.stop("悬浮窗停止")
+        val msg = "⏹ 引擎已停止"
+        LogBus.emit(msg)
+        flashStatus(msg)
+        ui.post { refreshStatus() }
     }
 
     /** 「走法」：在摇杆（默认）与方向键之间切换。 */
