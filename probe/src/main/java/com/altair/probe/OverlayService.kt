@@ -87,6 +87,9 @@ class OverlayService : Service() {
             prefs(ctx).edit().putString("pickedPoints", arr.toString()).apply()
         }
 
+        /** 单点校准的特殊目标：摇杆中心（不属于采点列表）。 */
+        const val SLOT_JOYSTICK = -2
+
         /** 当前活着的悬浮窗实例。供「采图时临时隐藏 ROI」用。 */
         @Volatile private var live: OverlayService? = null
 
@@ -153,7 +156,7 @@ class OverlayService : Service() {
     private var panel: View? = null
     private var roiView: RoiView? = null
     private var pickView: PickView? = null
-    /** 单点校准的目标槽位；-1 表示当前是整批采点模式。 */
+    /** 单点校准的目标槽位；-1 = 整批采点模式，-2 = 摇杆中心（不属于采点列表）。 */
     private var slotPickTarget = -1
     private var lastPicks: List<Pair<Float, Float>> = emptyList()
     /** 采集点变化回调（自己注册自己，onDestroy 时注销，避免泄漏）。 */
@@ -427,6 +430,11 @@ class OverlayService : Service() {
         ))
         content.addView(row(
             "原地走动" to { testStroll() },
+            "走法:${if (MarketFlow.walkMethod == "key") "键" else "摇杆"}" to { cycleWalkMethod() },
+            "校摇杆" to { startSlotPick(SLOT_JOYSTICK) },
+            "摇杆档" to { cycleJoystickPreset() }
+        ))
+        content.addView(row(
             "走动距离" to { cycleStrollDistance() },
             "记出口" to { recordExitHere() }
         ))
@@ -681,6 +689,20 @@ class OverlayService : Service() {
         pickView = null
 
         // ---- 单点校准：只写目标槽位，其余槽位原样保留 ----
+        if (slotPickTarget == SLOT_JOYSTICK) {
+            slotPickTarget = -1
+            val p = v.points.lastOrNull()
+            if (p != null) {
+                MarketFlow.joystickCenterX = p.first.toDouble()
+                MarketFlow.joystickCenterY = p.second.toDouble()
+                val msg = "✅ 摇杆中心已校准 = [%.4f, %.4f]".format(p.first, p.second)
+                LogBus.emit(msg); flashStatus(msg)
+            } else {
+                flashStatus("⚠ 没采到点，摇杆中心未变")
+            }
+            ui.post { refreshStatus() }
+            return
+        }
         if (slotPickTarget >= 0) {
             val slot = slotPickTarget
             slotPickTarget = -1
@@ -721,13 +743,14 @@ class OverlayService : Service() {
      */
     private fun startSlotPick(slot: Int) {
         val cur = pickedPointsOf(this)
-        if (slot != cur.size) {
+        if (slot != SLOT_JOYSTICK && slot != cur.size) {
             flashStatus("⚠ 当前该校准的是「${pickName(cur.size)}」（要按顺序补）")
             return
         }
         if (pickView != null) stopPick()
         val v = PickView(this)
-        v.onPick = { _, nx, ny -> LogBus.emit("校准 ${pickName(slot)}: [%.4f, %.4f]".format(nx, ny)) }
+        val label = if (slot == SLOT_JOYSTICK) "摇杆中心" else pickName(slot)
+        v.onPick = { _, nx, ny -> LogBus.emit("校准 $label: [%.4f, %.4f]".format(nx, ny)) }
         v.onFinish = { ui.post { stopPick() } }
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -743,7 +766,7 @@ class OverlayService : Service() {
                 pickView = v
                 slotPickTarget = slot
                 panel?.let { pnl -> panelParams?.let { pp -> runCatching { wm.addView(pnl, pp) } } }
-                val msg = "校准「${pickName(slot)}」：点它的位置，再点「完成采点」"
+                val msg = "校准「$label」：点它的位置，再点「完成采点」"
                 LogBus.emit(msg)
                 flashStatus(msg)
             }
@@ -845,6 +868,28 @@ class OverlayService : Service() {
         val msg = "走动距离 -> ${"%.3f".format(next)}（≈${"%.0f".format(next * 1280)}px）"
         LogBus.emit(msg)
         flashStatus(msg)
+    }
+
+    /** 「走法」：在摇杆（默认）与方向键之间切换。 */
+    private fun cycleWalkMethod() {
+        MarketFlow.walkMethod = if (MarketFlow.walkMethod == "joystick") "key" else "joystick"
+        val msg = "走法 -> " + if (MarketFlow.walkMethod == "joystick") "摇杆（左下角）" else "方向键"
+        LogBus.emit(msg); flashStatus(msg)
+    }
+
+    /** 「摇杆档」：推杆幅度 + 按住时长（=走动时长）三档循环。 */
+    private fun cycleJoystickPreset() {
+        val presets = listOf(
+            Triple(0.04, 300L, "短"),
+            Triple(0.06, 450L, "中"),
+            Triple(0.09, 700L, "长"),
+        )
+        val cur = MarketFlow.joystickHoldMs
+        val next = presets.firstOrNull { it.second > cur } ?: presets[0]
+        MarketFlow.joystickRadius = next.first
+        MarketFlow.joystickHoldMs = next.second
+        val msg = "摇杆 -> ${next.third}档（推杆 ${next.first} / 按住 ${next.second}ms）"
+        LogBus.emit(msg); flashStatus(msg)
     }
 
     /** 「看血条」：现场确认血条检测在这台机器/这个画面上有没有效。 */

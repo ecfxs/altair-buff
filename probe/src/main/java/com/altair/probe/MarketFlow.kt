@@ -82,6 +82,38 @@ object MarketFlow {
         set(v) = setStr("walkMode", v)
 
     /**
+     * 走位方式：`joystick`（默认）| `key`。
+     *
+     * 默认摇杆 —— 用户实测方向键走位不好用，左下角摇杆才是游戏自己的移动入口。
+     * 保留 key 作为兜底（某些环境下触摸通道不可用）。
+     */
+    var walkMethod: String
+        get() = getStr("walkMethod", "joystick")
+        set(v) = setStr("walkMethod", v)
+
+    /**
+     * 摇杆中心（归一化）。默认取左下角常见位置；
+     * 用悬浮窗「校摇杆」在游戏里点一下摇杆正中心即可精确标定。
+     */
+    var joystickCenterX: Double
+        get() = getLong("joyCxMilli", 120L) / 1000.0
+        set(v) = setLong("joyCxMilli", (v * 1000).toLong())
+
+    var joystickCenterY: Double
+        get() = getLong("joyCyMilli", 800L) / 1000.0
+        set(v) = setLong("joyCyMilli", (v * 1000).toLong())
+
+    /** 推杆幅度（归一化，相对摇杆中心）。越大走得越快。 */
+    var joystickRadius: Double
+        get() = getLong("joyRadiusMilli", 60L) / 1000.0
+        set(v) = setLong("joyRadiusMilli", (v * 1000).toLong())
+
+    /** 每一步按住摇杆的时长（毫秒）= 走动时长。 */
+    var joystickHoldMs: Long
+        get() = getLong("joyHoldMs", 450L)
+        set(v) = setLong("joyHoldMs", v)
+
+    /**
      * 方向键：19=上 20=下 21=左 22=右。
      * 默认**左**（21）—— 用户确认自由市场的出口在左侧（"走到左侧出口出"）。
      */
@@ -289,8 +321,7 @@ object MarketFlow {
                     return true to "已贴到左侧边界（血条 x=${"%.3f".format(x)}），应为出口"
                 }
             }
-            runCatching { ShellCore.probe.sendKey(KEY_LEFT) }
-            sleep(walkGapMs)
+            walkStep(-1, log)
         }
         return false to "往左走了 $steps 步仍未贴到边界（最后 x=${"%.3f".format(prev)}）"
     }
@@ -314,8 +345,7 @@ object MarketFlow {
             while (i < maxWalkSteps) {
                 x = hpX() ?: break
                 if (origin - x >= dist) break          // 走够距离了
-                runCatching { ShellCore.probe.sendKey(KEY_LEFT) }
-                sleep(walkGapMs)
+                walkStep(-1, log)
                 i++; steps++
             }
             log("  第 ${round + 1} 趟左腿：x=${"%.3f".format(x)}（目标 ≤ ${"%.3f".format(origin - dist)}，走了 $i 步）")
@@ -325,8 +355,7 @@ object MarketFlow {
             while (j < maxWalkSteps) {
                 x = hpX() ?: break
                 if (x >= origin - tol) break           // 已回到原位附近
-                runCatching { ShellCore.probe.sendKey(KEY_RIGHT) }
-                sleep(walkGapMs)
+                walkStep(+1, log)
                 j++; steps++
             }
             log("  第 ${round + 1} 趟右腿：x=${"%.3f".format(x)}（目标 ≥ ${"%.3f".format(origin - tol)}，走了 $j 步）")
@@ -335,6 +364,26 @@ object MarketFlow {
         val back = kotlin.math.abs(x - origin) <= 0.02
         return true to ("原地走动完成：原点 x=${"%.3f".format(origin)}，回位 x=${"%.3f".format(x)}，" +
             "共 $steps 步" + if (back) "（已回原位）" else "（⚠ 未完全回位，仍继续补 BUFF）")
+    }
+
+    /**
+     * 走一步：dir = -1 左 / +1 右。
+     * 默认用左下角摇杆（按下→拖偏移→保持→松手），可选退回方向键。
+     */
+    private fun walkStep(dir: Int, log: (String) -> Unit = {}) {
+        if (walkMethod == "key") {
+            runCatching { ShellCore.probe.sendKey(if (dir < 0) KEY_LEFT else KEY_RIGHT) }
+            sleep(walkGapMs)
+            return
+        }
+        val cx = joystickCenterX
+        val cy = joystickCenterY
+        val mx = (cx + dir * joystickRadius).coerceIn(0.02, 0.98)
+        val r = runCatching {
+            ShellCore.probe.joystickWalk(cx, cy, mx, cy, joystickHoldMs.toInt())
+        }.getOrDefault("摇杆调用失败")
+        log("   摇杆走${if (dir < 0) "左" else "右"}：$r")
+        sleep(walkGapMs)
     }
 
     /** 读一次血条中心 x（失败返回 null）。 */
@@ -370,10 +419,8 @@ object MarketFlow {
                 return false to "走位卡住：血条 x 连续 ${stuck} 步停在 ${"%.3f".format(x)}"
             }
             lastX = x
-            val key = if (dx > 0) KEY_RIGHT else KEY_LEFT
-            log("   第 ${i + 1} 步：血条 x=${"%.3f".format(x)} → 目标 ${"%.3f".format(target)}，按 ${if (dx > 0) "右" else "左"}")
-            runCatching { ShellCore.probe.sendKey(key) }
-            sleep(walkGapMs)
+            log("   第 ${i + 1} 步：血条 x=${"%.3f".format(x)} → 目标 ${"%.3f".format(target)}，往${if (dx > 0) "右" else "左"}")
+            walkStep(if (dx > 0) 1 else -1, log)
         }
         return false to "走满 $maxWalkSteps 步仍未对齐（最后 x=${"%.3f".format(lastX)}，目标 ${"%.3f".format(target)}）"
     }
@@ -437,12 +484,17 @@ object MarketFlow {
     /** 供界面显示当前参数。 */
     fun describeStroll(): String =
         "原地走动：距离 ${"%.3f".format(strollDistanceNorm)}（≈${"%.0f".format(strollDistanceNorm * 1280)}px）× " +
-            "${strollRounds} 趟，步间隔 ${walkGapMs}ms"
+            "${strollRounds} 趟；走法=" + if (walkMethod == "key") {
+                "方向键"
+            } else {
+                "摇杆 中心(${"%.3f".format(joystickCenterX)},${"%.3f".format(joystickCenterY)}) " +
+                    "推杆 ${"%.3f".format(joystickRadius)} 保持 ${joystickHoldMs}ms"
+            }
 
     /** 供界面显示当前参数。 */
     fun describe(): String =
         "进市场：菜单等待 ${menuWaitMs}ms / 过图等待 ${loadingWaitMs}ms；" +
-            "走位=" + if (exitXNorm >= 0) {
+            "走位=" + (if (walkMethod == "key") "方向键" else "摇杆") + " " + if (exitXNorm >= 0) {
                 "闭环对齐血条 → 出口 x=${"%.3f".format(exitXNorm)}"
             } else {
                 if (walkMode == "tap") "点传送点（未标定出口）" else "开环方向键 $walkKeyCode ×$walkRepeats（未标定出口）"

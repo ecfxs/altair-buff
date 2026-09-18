@@ -801,6 +801,60 @@ class Probe(
         return "${tag}点击 ($px, $py)  归一化($nx4, $ny4)  画面 ${w}x${h}  方式=$method 按压 ${pressMs}ms  ${ms}ms  ${err.take(40)}"
     }
 
+    /**
+     * 摇杆走一步：在摇杆中心按下 → 拖到偏移点 → **保持** holdMs → 松手。
+     *
+     * 为什么不用方向键：用户实测 `input keyevent 21/22` 走位不好用
+     * （游戏大概没把移动绑在方向键上）。左下角摇杆是游戏自己的移动入口，最可靠。
+     *
+     * 手势语义是这里的关键 —— 摇杆要的是「按住不放」：
+     *   DOWN 中心 → MOVE 偏移点 → sleep 保持 → UP
+     * 而 `input swipe` 的拖动过程本身占满整个 duration（线性插值），
+     * 角色是在"拖动过程中"走的，所以兜底用 swipe 时时长就等于要走动的时长。
+     *
+     * 优先 motionevent（能精确表达"按住不动"这段），不支持它的旧系统自动退回 swipe。
+     */
+    fun joystickWalk(
+        centerX: Double, centerY: Double,   // 归一化：摇杆中心
+        moveX: Double, moveY: Double,       // 归一化：推到该点（=方向与幅度）
+        holdMs: Int,
+        method: String = "motionevent",
+    ): String {
+        if (!ensureShell()) return "无 root"
+        val d = if (bestDisplayId >= 0) bestDisplayId else 0
+        val ref = File(cache, "joy.raw")
+        ref.delete()
+        sh.timedExec("screencap -d $d ${ref.absolutePath}", 12000)
+        val hdr = parseRawHeader(ref)
+        val w = hdr?.get(0) ?: 1280
+        val h = hdr?.get(1) ?: 720
+        val cx = (centerX * w).toInt().coerceIn(0, w - 1)
+        val cy = (centerY * h).toInt().coerceIn(0, h - 1)
+        val mx = (moveX * w).toInt().coerceIn(0, w - 1)
+        val my = (moveY * h).toInt().coerceIn(0, h - 1)
+        val sec = "%.2f".format(holdMs / 1000.0)
+
+        fun swipeCmd() = "input swipe $cx $cy $mx $my $holdMs"
+        fun meCmd() =
+            "input motionevent DOWN $cx $cy; input motionevent MOVE $mx $my; sleep $sec; input motionevent UP $mx $my"
+
+        // 明确的 swipe 档位直接走兜底
+        if (method == "swipe") {
+            val (ms, err) = sh.timedExec(swipeCmd(), (8000 + holdMs).toLong())
+            return "摇杆(swipe) ($cx,$cy)→($mx,$my) ${holdMs}ms  ${ms}ms ${err.take(40)}"
+        }
+
+        val (ms, err) = sh.timedExec(meCmd(), (8000 + holdMs).toLong())
+        val failed = err.contains("not found", true) || err.contains("Unknown", true) ||
+            err.contains("Error", true) || err.contains("inaccessible", true)
+        if (!failed) {
+            return "摇杆(motionevent) ($cx,$cy)→($mx,$my) 保持 ${holdMs}ms  ${ms}ms ${err.take(40)}"
+        }
+        // 该机型的 input 没有 motionevent 子命令 → 退回 swipe
+        val (ms2, err2) = sh.timedExec(swipeCmd(), (8000 + holdMs).toLong())
+        return "摇杆(swipe兜底，motionevent 不可用) ($cx,$cy)→($mx,$my) ${holdMs}ms  ${ms2}ms ${err2.take(40)}"
+    }
+
     // ------------------------------------------------------------ 前台应用检测
 
     /**
