@@ -386,10 +386,9 @@ object MarketFlow {
      * 后者在卡顿时会越走越偏，几次循环就跑出原地了。
      */
     fun strollAndReturn(log: (String) -> Unit): Pair<Boolean, String> {
-        // ① 标定当前位置：读一次血条 x **仅作日志参考** —— 走动时长是给定的（600ms），
-        //    不再用"走到某个 x"来判定，所以识别不到血条也不影响走动。
-        val here = hpX()
-        log("① 当前位置：" + (here?.let { "血条 x=%.3f".format(it) } ?: "未识别到血条（不影响走动）"))
+        // ① 不再读血条定当前位置：走动是**纯时长驱动**（左右各一次 600ms），
+        //    既不需要"角色在哪"，也就不必为此截一次图（截图会和按键抢 root shell）。
+        log("① 原地走动开始（纯时长驱动，不依赖血条识别）")
 
         // ② 左右各一次，各 600ms ± 30ms
         val leftMs = jitter(strollHoldMs)

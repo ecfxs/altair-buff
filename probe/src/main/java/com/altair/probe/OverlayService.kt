@@ -204,9 +204,6 @@ class OverlayService : Service() {
     private var targetPkg: String = "com.nexon.mod"
     /** ROI 的用户意图（≠ 实际是否显示：实际显示还要满足「游戏在前台」）。 */
     private var roiEnabled = false
-    /** ROI 上动态显示的血条框（归一化 [x,y,w,h]），null = 还没识别到。 */
-    @Volatile private var hpBox: FloatArray? = null
-    @Volatile private var hpPolling = false
     /** 最近一次检测到的前台包名。 */
     private var lastFg: String = "?"
     private var statusTv: TextView? = null
@@ -983,46 +980,16 @@ class OverlayService : Service() {
     }
 
     private fun removeRoi() {
-        stopHpPolling()
         roiView?.let { runCatching { wm.removeView(it) } }
         roiView = null
-    }
-
-    /**
-     * ROI 开着时，后台低频检测角色血条位置并画在画面上。
-     *
-     * 周期取 3s，且补 BUFF 期间完全跳过：一次检测要截图 + 扫一条带，
-     * 而**所有 shell 命令共用一个常驻 root shell** —— 实测它会把引擎的按键调用
-     * 堵上好几秒（日志里 keyevent 变成 6101ms）。宁可显示刷新慢一点。
-     */
-    private fun startHpPolling() {
-        if (hpPolling) return
-        hpPolling = true
-        Thread {
-            while (hpPolling) {
-                // 补 BUFF 期间不抢 root shell：所有命令共用一个常驻 shell，
-                // 一次 screencap 能把引擎的按键调用堵上好几秒（实机日志里 keyevent 变成 6 秒）。
-                if (Engine.state == Engine.State.CASTING) {
-                    try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
-                    continue
-                }
-                val box = runCatching { ShellCore.probe.findHeadHpBarBox() }.getOrNull()
-                hpBox = box
-                ui.post { roiView?.setHpBar(box) }
-                // 3 秒一次足够看"角色在哪"，对 shell 的压力只有原来的 1/3
-                try { Thread.sleep(3000) } catch (_: InterruptedException) { break }
-            }
-        }.apply { isDaemon = true; name = "roi-hpbar" }.start()
-    }
-
-    private fun stopHpPolling() {
-        hpPolling = false
     }
 
     private fun addRoi() {
         if (roiView != null) return
         // 把采集点传进去，ROI 上就会按语义标注「技能1..4 / 菜单 / 自由市场」
-        startHpPolling()
+        // 不再启动血条轮询：走动已改为纯时长驱动，不依赖"角色在哪"；
+        // 而每次检测都要 screencap，和引擎按键抢同一个 root shell（把按键堵成 6 秒的元凶之一）。
+        // Probe.findHeadHpBarBox 代码保留，将来要用再挂回来。
         val v = RoiView(this, lastPicks, MarketFlow.exitXNorm)
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -1092,14 +1059,6 @@ class RoiView(
         typeface = Typeface.MONOSPACE
     }
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-
-    /** 动态识别的角色血条框（归一化 [x,y,w,h]）；null = 本次没识别到。 */
-    private var hpBox: FloatArray? = null
-
-    fun setHpBar(box: FloatArray?) {
-        hpBox = box
-        invalidate()
-    }
 
     /**
      * 静态 ROI —— 全部为实机实测值。
@@ -1183,36 +1142,6 @@ class RoiView(
             canvas.drawText("未采", cx - 24f, cy - 26f, text)
             text.color = Color.parseColor("#99FFFFFF")
             canvas.drawText(label, cx - 26f, cy + 40f, text)
-        }
-
-        // ---- 动态识别的角色血条（闭环走位的"角色在哪"信号）----
-        val hb = hpBox
-        if (hb != null) {
-            val rx = hb[0] * w
-            val ry = hb[1] * h
-            val rw = hb[2] * w
-            val rh = hb[3] * h
-            // 用洋红而不是红：血条检测认的是"R 高、G/B 低"，红框会被它自己检出来（自我污染）。
-            // 洋红 B=255 天然不满足判据，等于上了第二道保险。
-            val c = Color.parseColor("#FFFF00FF")
-            stroke.color = c
-            stroke.strokeWidth = 3f
-            canvas.drawRect(rx - 3f, ry - 3f, rx + rw + 3f, ry + rh + 3f, stroke)
-            // 中心 x 画一条竖线：这就是闭环走位要对齐到的"角色 x"
-            val cx = rx + rw / 2f
-            stroke.strokeWidth = 2f
-            canvas.drawLine(cx, 0f, cx, h, stroke)
-            fill.color = c
-            val label = "血条 x=%.3f".format(hb[0] + hb[2] / 2f)
-            val tw = text.measureText(label) + 10f
-            canvas.drawRect(rx, ry - 30f, rx + tw, ry - 4f, fill)
-            text.color = Color.BLACK
-            canvas.drawText(label, rx + 5f, ry - 10f, text)
-        } else {
-            fill.color = Color.parseColor("#88FF00FF")
-            canvas.drawRect(12f, h * 0.47f, 12f + text.measureText("血条：未识别到") + 12f, h * 0.47f + 26f, fill)
-            text.color = Color.BLACK
-            canvas.drawText("血条：未识别到", 18f, h * 0.47f + 19f, text)
         }
 
         // ---- 出口目标线（闭环走位的对齐目标）----
