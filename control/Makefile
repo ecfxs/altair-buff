@@ -58,7 +58,7 @@ release: ## 交叉编译 Linux amd64 单二进制（纯 Go SQLite，无需 cgo�
 run: build ## 本机跑单文件版本（用内嵌前端产物）
 	./$(BIN)
 
-fake: ## 起 3 台假设备造流量
+fake: ## 起 3 台假设备造流量（仅开发/CI 用；已加护栏，拒绝打非本机地址）
 	go run ./cmd/altaird fake-device --n 3 --interval 5s
 
 pw-install: ## 装 E2E 用的浏览器（装在工作区 .pw-browsers/，不污染系统）

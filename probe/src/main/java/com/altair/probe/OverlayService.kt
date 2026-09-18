@@ -425,6 +425,11 @@ class OverlayService : Service() {
             "按法:${pressModes[pressIdx].first}" to { cyclePressMode() },
             "技能位" to { autoDetectSkills() }
         ))
+        content.addView(row(
+            "原地走动" to { testStroll() },
+            "走动距离" to { cycleStrollDistance() },
+            "记出口" to { recordExitHere() }
+        ))
         // 单点校准：只改一个槽位，不用整批重采
         content.addView(row(
             "校菜单" to { startSlotPick(4) },
@@ -818,6 +823,28 @@ class OverlayService : Service() {
             if (roiEnabled) { removeRoi(); syncRoiWithForeground(lastFg) }
             ui.post { refreshStatus() }
         }.apply { isDaemon = true }.start()
+    }
+
+    /** 「原地走动」：手动试一次"左右走一段再回原位"（不补 BUFF，纯验证走位闭环）。 */
+    private fun testStroll() {
+        Thread {
+            LogBus.emit("▸ 原地走动：${MarketFlow.describeStroll()}")
+            val (ok, msg) = MarketFlow.strollAndReturn { LogBus.emit(it) }
+            LogBus.emit(if (ok) "   ✅ $msg" else "   ⚠ $msg")
+            flashStatus(if (ok) "✅ $msg" else "⚠ $msg")
+            ui.post { refreshStatus() }
+        }.apply { isDaemon = true }.start()
+    }
+
+    /** 「走动距离」：循环切换原地走动的距离档位（0.03 / 0.05 / 0.08 / 0.12 屏宽）。 */
+    private fun cycleStrollDistance() {
+        val levels = doubleArrayOf(0.03, 0.05, 0.08, 0.12)
+        val cur = MarketFlow.strollDistanceNorm
+        val next = levels.firstOrNull { it > cur + 1e-6 } ?: levels[0]
+        MarketFlow.strollDistanceNorm = next
+        val msg = "走动距离 -> ${"%.3f".format(next)}（≈${"%.0f".format(next * 1280)}px）"
+        LogBus.emit(msg)
+        flashStatus(msg)
     }
 
     /** 「看血条」：现场确认血条检测在这台机器/这个画面上有没有效。 */

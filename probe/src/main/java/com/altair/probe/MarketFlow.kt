@@ -114,6 +114,19 @@ object MarketFlow {
         get() = getLong("alignTolMilli", 20L) / 1000.0
         set(v) = setLong("alignTolMilli", (v * 1000).toLong())
 
+    /**
+     * 原地走动的横向距离（归一化，占屏宽比例）。默认 0.05 ≈ 1280 下 64px。
+     * 太短看不出在动、太长会走出等待区，所以做成可调而不是写死。
+     */
+    var strollDistanceNorm: Double
+        get() = getLong("strollDistMilli", 50L) / 1000.0
+        set(v) = setLong("strollDistMilli", (v * 1000).toLong())
+
+    /** 来回几趟。默认 1 趟（左去右回）。 */
+    var strollRounds: Int
+        get() = getLong("strollRounds", 1L).toInt()
+        set(v) = setLong("strollRounds", v.toLong())
+
     /** 闭环最多走几步（每步一次截图，别无限走）。 */
     var maxWalkSteps: Int
         get() = getLong("maxWalkSteps", 24L).toInt()
@@ -289,26 +302,43 @@ object MarketFlow {
      * 后者在卡顿时会越走越偏，几次循环就跑出原地了。
      */
     fun strollAndReturn(log: (String) -> Unit): Pair<Boolean, String> {
-        val origin = runCatching { ShellCore.probe.findHeadHpBarX() }.getOrNull()
-            ?: return false to "没识别到角色血条，跳过原地走动"
-        log("先往左走 3 步")
-        repeat(3) {
-            runCatching { ShellCore.probe.sendKey(KEY_LEFT) }
-            sleep(walkGapMs)
-        }
-        var i = 0
+        val origin = hpX() ?: return false to "没识别到角色血条，跳过原地走动（直接补 BUFF）"
+        val dist = strollDistanceNorm
+        val tol = 0.012
         var x = origin
-        while (i < 12) {
-            x = runCatching { ShellCore.probe.findHeadHpBarX() }.getOrNull() ?: break
-            if (x >= origin - 0.01) break
-            runCatching { ShellCore.probe.sendKey(KEY_RIGHT) }
-            sleep(walkGapMs)
-            i++
+        var steps = 0
+
+        repeat(strollRounds) { round ->
+            // ---- 左腿：往左走到 origin - dist ----
+            var i = 0
+            while (i < maxWalkSteps) {
+                x = hpX() ?: break
+                if (origin - x >= dist) break          // 走够距离了
+                runCatching { ShellCore.probe.sendKey(KEY_LEFT) }
+                sleep(walkGapMs)
+                i++; steps++
+            }
+            log("  第 ${round + 1} 趟左腿：x=${"%.3f".format(x)}（目标 ≤ ${"%.3f".format(origin - dist)}，走了 $i 步）")
+
+            // ---- 右腿：回到原点（闭环，不靠步数）----
+            var j = 0
+            while (j < maxWalkSteps) {
+                x = hpX() ?: break
+                if (x >= origin - tol) break           // 已回到原位附近
+                runCatching { ShellCore.probe.sendKey(KEY_RIGHT) }
+                sleep(walkGapMs)
+                j++; steps++
+            }
+            log("  第 ${round + 1} 趟右腿：x=${"%.3f".format(x)}（目标 ≥ ${"%.3f".format(origin - tol)}，走了 $j 步）")
         }
+
         val back = kotlin.math.abs(x - origin) <= 0.02
-        return true to ("原地走动完成：原点 x=${"%.3f".format(origin)}，回位 x=${"%.3f".format(x)}" +
-            if (back) "（已回原位）" else "（⚠ 未完全回位）")
+        return true to ("原地走动完成：原点 x=${"%.3f".format(origin)}，回位 x=${"%.3f".format(x)}，" +
+            "共 $steps 步" + if (back) "（已回原位）" else "（⚠ 未完全回位，仍继续补 BUFF）")
     }
+
+    /** 读一次血条中心 x（失败返回 null）。 */
+    private fun hpX(): Double? = runCatching { ShellCore.probe.findHeadHpBarX() }.getOrNull()
 
     /**
      * 闭环走位：每步重新找血条 x，朝目标步进。
@@ -403,6 +433,11 @@ object MarketFlow {
         } catch (_: InterruptedException) {
         }
     }
+
+    /** 供界面显示当前参数。 */
+    fun describeStroll(): String =
+        "原地走动：距离 ${"%.3f".format(strollDistanceNorm)}（≈${"%.0f".format(strollDistanceNorm * 1280)}px）× " +
+            "${strollRounds} 趟，步间隔 ${walkGapMs}ms"
 
     /** 供界面显示当前参数。 */
     fun describe(): String =

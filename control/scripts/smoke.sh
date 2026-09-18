@@ -15,6 +15,8 @@ cd "$CTRL"
 PORT="${PORT:-8899}"
 BASE="http://127.0.0.1:$PORT"
 
+# 必须显式建父目录：mktemp -d 不会创建父级，而 data/ 会被清理（这个坑踩过一次）
+mkdir -p "$CTRL/data"
 WORK="$(mktemp -d "$CTRL/data/smoke.XXXXXX")"
 JAR="$WORK/cookies.txt"
 SRVLOG="$WORK/server.log"

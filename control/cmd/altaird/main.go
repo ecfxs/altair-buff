@@ -18,7 +18,9 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -312,8 +314,18 @@ func runFakeDevice(args []string) error {
 	interval := fs.Duration("interval", 5*time.Second, "上报周期")
 	server := fs.String("server", "http://127.0.0.1:8788", "目标服务器")
 	token := fs.String("token", "", "设备 Token（默认从库里读）")
+	force := fs.Bool("force", false, "允许向非本机地址发送假设备流量（危险，仅限测试环境）")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	// ★ 硬护栏：假设备只能打到本机。
+	// 假设备是为了开发/验收才存在的，一旦指向生产服务器，面板里就会混进一堆
+	// fake01/fake02 把真实设备淹掉（而且它们还会被下发配置、占容量）。
+	if !*force && !isLoopbackURL(*server) {
+		return fmt.Errorf(
+			"拒绝向非本机地址 %s 发送假设备流量。\n"+
+				"  假设备仅供开发/验收：打到生产服务器会把真实设备淹掉。\n"+
+				"  确实要在测试环境这么做，请显式加 --force", *server)
 	}
 	tok := *token
 	if tok == "" {
@@ -334,6 +346,20 @@ func runFakeDevice(args []string) error {
 		return nil
 	}
 	return err
+}
+
+// isLoopbackURL 判断目标是不是本机（127.0.0.0/8、localhost、::1）。
+func isLoopbackURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" || host == "::1" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func envOr(key, def string) string {
