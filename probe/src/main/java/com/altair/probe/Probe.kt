@@ -1052,7 +1052,12 @@ class Probe(
      * （默认 y 50%~60%），逐行找「红像素连续段」，再验竖向厚度 4~10px、宽 20~120px。
      * 宽度下限放到 20 是因为角色贴屏幕边缘时血条会被裁掉一截。
      */
-    fun findHeadHpBarBox(bandLo: Double = 0.50, bandHi: Double = 0.60): FloatArray? {
+    fun findHeadHpBarBox(bandLo: Double = 0.50, bandHi: Double = 0.60): FloatArray? =
+        // ★ 必须藏起 ROI 再抓图：否则 ROI 自己画的红框会被当成血条，检测位置越走越偏
+        //   （用户反馈"第一次准、之后往右上漂"）。见 OverlayService.withRoiHidden。
+        OverlayService.withRoiHidden { findHeadHpBarBoxRaw(bandLo, bandHi) }
+
+    private fun findHeadHpBarBoxRaw(bandLo: Double, bandHi: Double): FloatArray? {
         if (!ensureShell()) return null
         val d = if (bestDisplayId >= 0) bestDisplayId else 0
         val f = File(cache, "hpbar.raw")

@@ -87,6 +87,30 @@ class OverlayService : Service() {
             prefs(ctx).edit().putString("pickedPoints", arr.toString()).apply()
         }
 
+        /** 当前活着的悬浮窗实例。供「采图时临时隐藏 ROI」用。 */
+        @Volatile private var live: OverlayService? = null
+
+        /**
+         * 采图期间临时隐藏 ROI 覆盖层。
+         *
+         * ★ 为什么必须要：ROI 画的元素是**画在屏幕上的**，而 `screencap` 抓的是合成后的画面 ——
+         * 于是血条检测会把 ROI 自己画的那个红框当成血条，下一轮又在自己画的框上再画一个，
+         * 结果检测位置**越走越偏**（"第一次定位准、之后慢慢往右上漂"就是这个原因）。
+         * 藏一帧再抓，就彻底断掉这条自我污染的回路。
+         */
+        fun <T> withRoiHidden(block: () -> T): T {
+            val svc = live ?: return block()
+            val v = svc.roiView ?: return block()
+            if (v.visibility != android.view.View.VISIBLE) return block()
+            svc.ui.post { v.visibility = android.view.View.INVISIBLE }
+            try {
+                Thread.sleep(160)          // 等一帧合成完成（60Hz 下一帧 ~17ms，留足余量）
+                return block()
+            } finally {
+                svc.ui.post { v.visibility = android.view.View.VISIBLE }
+            }
+        }
+
         private val picksListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
 
         /**
@@ -196,6 +220,7 @@ class OverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         ShellCore.init(this)
+        live = this
         targetPkg = targetPkgOf(this)
         lastPicks = pickedPointsOf(this)
         MarketFlow.init(this)
@@ -226,6 +251,7 @@ class OverlayService : Service() {
     }
 
     override fun onDestroy() {
+        live = null
         running = false
         ui.removeCallbacks(statusLoop)
         LogBus.remove(logListener)
@@ -279,6 +305,17 @@ class OverlayService : Service() {
         val showing = roiView != null
         if (shouldShow && !showing) addRoi()
         else if (!shouldShow && showing) removeRoi()
+    }
+
+    /**
+     * 在面板状态行上"闪现"一条消息，几秒后恢复。
+     *
+     * 为什么需要：悬浮面板**早就不显示日志了**（logListener 是 no-op），
+     * 于是"点5 还没采点"这类提示只写到主界面日志页 —— 用户在悬浮窗上看到的就是"点了没反应"。
+     */
+    private fun flashStatus(msg: String) {
+        ui.post { statusTv?.text = msg }
+        ui.postDelayed({ refreshStatus() }, 3500)
     }
 
     private fun refreshStatus() {
@@ -612,7 +649,13 @@ class OverlayService : Service() {
             .onSuccess {
                 pickView = v
                 panel?.let { pnl -> panelParams?.let { pp -> runCatching { wm.addView(pnl, pp) } } }
-                LogBus.emit("采点模式：已开启 —— 在游戏画面上依次点技能键位置；点完点画面下方的「完成采点」")
+                val next = pickName(lastPicks.size)
+                LogBus.emit(
+                    "采点模式：已开启 —— 当前已有 ${lastPicks.size} 个点，" +
+                        "下一个是「$next」（顺序：技能1-4 → 菜单 → 自由市场 → 传送点）；" +
+                        "点完点画面下方的「完成采点」"
+                )
+                flashStatus("采点：下一个是「$next」（已有 ${lastPicks.size} 个）")
             }
             .onFailure { LogBus.emit("采点层添加失败: ${it.message}") }
     }
@@ -635,6 +678,11 @@ class OverlayService : Service() {
         LogBus.emit("已清空采集点")
     }
 
+    /** 采集槽位的语义名（与 RoiView.pickLabels 一致）。 */
+    private fun pickName(idx: Int) = listOf(
+        "技能1", "技能2", "技能3", "技能4", "菜单", "自由市场", "传送点", "备用"
+    ).getOrElse(idx) { "点${idx + 1}" }
+
     /** 点击第 idx 个采集点（从 0 开始）。 */
     private fun tapPick(idx: Int, pressMs: Int = -1, method: String = "") {
         // 未显式指定时，用「按法」按钮当前选中的档位
@@ -645,7 +693,10 @@ class OverlayService : Service() {
         // 采点层开着时也能点：先从它拿；关掉时从最后一次的副本拿
         val pts = v?.points ?: lastPicks
         if (idx >= pts.size) {
-            LogBus.emit("点${idx + 1}：还没采集到该位置（当前共 ${pts.size} 个）")
+            val name = pickName(idx)
+            val msg = "⚠ $name 还没有坐标（当前共 ${pts.size} 个点）—— 点「★采点」补采"
+            LogBus.emit("点${idx + 1}：$msg")
+            flashStatus(msg)
             return
         }
         val (nx, ny) = pts[idx]
@@ -660,6 +711,7 @@ class OverlayService : Service() {
             LogBus.emit("▸ 进自由市场（完整流程）")
             val (ok, msg) = MarketFlow.enterMarketAndWalkToExit { LogBus.emit(it) }
             LogBus.emit(if (ok) "   ✅ $msg" else "   ❌ $msg")
+            flashStatus(if (ok) "✅ 进市场：$msg" else "❌ 进市场失败：$msg")
             ui.post { refreshStatus() }
         }.apply { isDaemon = true }.start()
     }
@@ -673,6 +725,7 @@ class OverlayService : Service() {
             LogBus.emit("▸ 记出口：读取当前血条位置")
             val (ok, msg) = MarketFlow.recordExitHere { LogBus.emit("   $it") }
             LogBus.emit(if (ok) "   ✅ $msg" else "   ❌ $msg")
+            flashStatus(if (ok) "✅ $msg" else "❌ $msg")
             if (ok && roiEnabled) { removeRoi(); syncRoiWithForeground(lastFg) }
             ui.post { refreshStatus() }
         }.apply { isDaemon = true }.start()
@@ -697,7 +750,9 @@ class OverlayService : Service() {
     /** 「看血条」：现场确认血条检测在这台机器/这个画面上有没有效。 */
     private fun probeHpBar() {
         Thread {
-            LogBus.emit("▸ 探血条：${MarketFlow.probeHpBar()}")
+            val r = MarketFlow.probeHpBar()
+            LogBus.emit("▸ 探血条：$r")
+            flashStatus("血条：" + r)
         }.apply { isDaemon = true }.start()
     }
 
@@ -926,7 +981,9 @@ class RoiView(
             val ry = hb[1] * h
             val rw = hb[2] * w
             val rh = hb[3] * h
-            val c = Color.parseColor("#FFFF4444")
+            // 用洋红而不是红：血条检测认的是"R 高、G/B 低"，红框会被它自己检出来（自我污染）。
+            // 洋红 B=255 天然不满足判据，等于上了第二道保险。
+            val c = Color.parseColor("#FFFF00FF")
             stroke.color = c
             stroke.strokeWidth = 3f
             canvas.drawRect(rx - 3f, ry - 3f, rx + rw + 3f, ry + rh + 3f, stroke)
@@ -941,7 +998,7 @@ class RoiView(
             text.color = Color.BLACK
             canvas.drawText(label, rx + 5f, ry - 10f, text)
         } else {
-            fill.color = Color.parseColor("#88FF4444")
+            fill.color = Color.parseColor("#88FF00FF")
             canvas.drawRect(12f, h * 0.47f, 12f + text.measureText("血条：未识别到") + 12f, h * 0.47f + 26f, fill)
             text.color = Color.BLACK
             canvas.drawText("血条：未识别到", 18f, h * 0.47f + 19f, text)

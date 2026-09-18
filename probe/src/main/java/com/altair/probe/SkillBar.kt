@@ -55,7 +55,16 @@ object SkillBar {
     private const val MAX_SNAP = 0.5
 
     /**
-     * 保证技能位已有值：采集点不足 4 个时，用实测默认值补齐前 4 个（技能位）。
+     * 菜单按钮候选坐标（标定产物里标着 `confidence: low`）。
+     *
+     * 备注原文：**"右上角圆形候选 pixelBox=[1219,28,38,38]，三张图位置一致但圆内纹理 std 高达 70~92，
+     * 不像平坦按钮。待人工确认"**。作为起始值填入，让「菜单」按钮可用、并能在 ROI 上核对；
+     * 若核对下来不在菜单键上，重新采点即可覆盖。
+     */
+    val MENU_CANDIDATE = 0.9672f to 0.0653f
+
+    /**
+     * 保证已知的固定 UI 坐标都有值：技能 1-4 用实测值、菜单用候选值。
      *
      * 为什么放在这里而不是让用户采点：技能位置在 UI 上是固定的，装好就已知；
      * 让用户为固定 UI 手工采点既多余又容易采歪（历史上就采偏过）。
@@ -64,14 +73,23 @@ object SkillBar {
      */
     fun ensureDefaults(ctx: Context): Boolean {
         val pts = OverlayService.pickedPointsOf(ctx)
-        if (pts.size >= 4) return false
-        // 保留已有的前几个点（用户可能已经采过菜单/自由市场等），只补齐缺的技能位
         val merged = ArrayList<Pair<Float, Float>>(8)
+        var changed = false
         for (i in 0 until 4) {
-            merged.add(pts.getOrNull(i) ?: DEFAULT[i])
+            val existing = pts.getOrNull(i)
+            if (existing == null) { merged.add(DEFAULT[i]); changed = true } else merged.add(existing)
         }
-        for (i in 4 until pts.size) merged.add(pts[i])
+        // 槽位 4 = 菜单。以前这里空着 → 悬浮窗「菜单」按钮点了没反应
+        // （它只写日志，而悬浮面板早就不显示日志了，用户看到的就是"没反应"）。
+        val menu = pts.getOrNull(4)
+        if (menu == null) { merged.add(MENU_CANDIDATE); changed = true } else merged.add(menu)
+        // 槽位 5 起（自由市场 / 传送点）标定产物里只有占位值 [0.5,0.5]，没法用 —— 必须人工采点。
+        for (i in 5 until pts.size) merged.add(pts[i])
+        if (!changed) return false
         OverlayService.savePickedPointsOf(ctx, merged)
+        // ★ 必须通知悬浮窗：它内存里的 lastPicks 是独立的副本，
+        //   只写 prefs 的话「菜单/点N」按钮仍会用旧列表（同类 bug 之前刚修过一次）。
+        OverlayService.notifyPicksChanged()
         return true
     }
 
@@ -85,6 +103,7 @@ object SkillBar {
     fun resetToMeasured(ctx: Context, log: (String) -> Unit): Pair<Boolean, String> {
         val rest = OverlayService.pickedPointsOf(ctx).drop(4)
         OverlayService.savePickedPointsOf(ctx, DEFAULT + rest)
+        OverlayService.notifyPicksChanged()
 
         val shift = runCatching { detectShiftPx() }.getOrNull()
         if (shift == null) {
@@ -150,8 +169,11 @@ object SkillBar {
     }
 
     fun describe(ctx: Context): String {
-        val pts = OverlayService.pickedPointsOf(ctx).take(4)
-        if (pts.isEmpty()) return "技能位未初始化"
-        return pts.mapIndexed { i, p -> "${i + 1}:(%.4f,%.4f)".format(p.first, p.second) }.joinToString(" ")
+        val names = listOf("技能1", "技能2", "技能3", "技能4", "菜单", "自由市场", "传送点", "备用")
+        val pts = OverlayService.pickedPointsOf(ctx)
+        if (pts.isEmpty()) return "未初始化"
+        val have = pts.mapIndexed { i, p -> "${names.getOrElse(i) { "点${i + 1}" }}(%.3f,%.3f)".format(p.first, p.second) }
+        val missing = names.drop(pts.size)
+        return have.joinToString(" ") + if (missing.isEmpty()) "" else "  ⚠ 缺：" + missing.joinToString("/")
     }
 }
