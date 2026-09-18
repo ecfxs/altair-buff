@@ -807,6 +807,27 @@ class Probe(
     }
 
     /**
+     * 一次 shell 调用里**连发**多次方向键。
+     *
+     * 为什么必须合并：每次 `input keyevent` 都是独立的进程调用，在云手机上单次可达**数秒**
+     * —— 实机日志里就是"连发 1 次 / 实际 6101ms"。N 次分开调用 = N 次 shell 往返，
+     * 合并成一条命令只往返一次，这才是"600ms 连发 6 次"能真正跑出 6 次的前提。
+     */
+    fun repeatKey(keyCode: Int, times: Int, gapMs: Long): String {
+        if (!ensureShell()) return "无 root"
+        val n = times.coerceIn(1, 40)
+        val gapSec = "%.2f".format(gapMs / 1000.0)
+        val sb = StringBuilder()
+        for (i in 0 until n) {
+            if (i > 0) sb.append("; sleep ").append(gapSec).append("; ")
+            sb.append("input keyevent ").append(keyCode)
+        }
+        val budget = (4000 + n * (gapMs + 400)).toLong()
+        val (ms, err) = sh.timedExec(sb.toString(), budget)
+        return "连发 $n 次 key=$keyCode 间隔 ${gapMs}ms  实际 ${ms}ms ${err.take(30)}"
+    }
+
+    /**
      * 摇杆走一步：在摇杆中心按下 → 拖到偏移点 → **保持** holdMs → 松手。
      *
      * 为什么不用方向键：用户实测 `input keyevent 21/22` 走位不好用

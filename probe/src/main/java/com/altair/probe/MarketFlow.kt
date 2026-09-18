@@ -57,6 +57,11 @@ object MarketFlow {
 
     private fun getStr(k: String, def: String): String = prefs()?.getString(k, def) ?: def
 
+    /** 技能触发方式：keyevent / touch。与 Engine.inputMethod() 同一个键。 */
+    private fun inputMethodOf(): String =
+        ctx?.getSharedPreferences("overlay", android.content.Context.MODE_PRIVATE)
+            ?.getString("inputMethod", "keyevent") ?: "keyevent"
+
     private fun setStr(k: String, v: String) {
         prefs()?.edit()?.putString(k, v)?.apply()
     }
@@ -88,12 +93,22 @@ object MarketFlow {
      * 保留 key 作为兜底（某些环境下触摸通道不可用）。
      */
     var walkMethod: String
-        // ★ 键名带 V2，默认**方向键**：
-        //   · 用户实测方向键版本能走、摇杆版本不稳
-        //   · 旧键 walkMethod 里存着 0.24.6「走法」按钮写下的 "joystick"，
-        //     复用它会让旧值永远盖住新默认值（这个坑我踩过一次，换键名才算真改掉）
-        get() = getStr("walkMethodV2", "key")
-        set(v) = setStr("walkMethodV2", v)
+        /**
+         * 走法**跟随触发方式**（用户指定的规则）：
+         *   · 技能触发用键盘（inputMethod=keyevent）→ 走路也用**键盘方向键**
+         *   · 技能触发用触摸（inputMethod=touch）   → 走路用**左下角摇杆**
+         *
+         * 这两条路走的是同一套输入通道，所以"触发方式"和"走法"跟着一致最稳：
+         * 触摸通道可用说明触摸事件这条路是通的，摇杆就能走；反之键盘那条通就走方向键。
+         *
+         * 想强制指定时写 prefs `walkMethodForce`（"key"/"joystick"），留空则自动跟随。
+         */
+        get() {
+            val force = prefs()?.getString("walkMethodForce", "") ?: ""
+            if (force == "key" || force == "joystick") return force
+            return if (inputMethodOf() == "touch") "joystick" else "key"
+        }
+        set(v) = setStr("walkMethodForce", v)
 
     /**
      * 摇杆中心（归一化）。默认取左下角常见位置；
@@ -402,22 +417,22 @@ object MarketFlow {
     private fun walkFor(dir: Int, ms: Long, log: (String) -> Unit) {
         val side = if (dir < 0) "左" else "右"
         if (walkMethod == "key") {
-            val t0 = System.currentTimeMillis()
-            var n = 0
-            while (System.currentTimeMillis() - t0 < ms) {
-                runCatching { ShellCore.probe.sendKey(if (dir < 0) KEY_LEFT else KEY_RIGHT) }
-                n++
-                sleep(strollPressGapMs)
-            }
-            val used = System.currentTimeMillis() - t0
-            log("   方向键$side：连发 $n 次 / 实际 ${used}ms")
+            // 次数按时长换算（600ms / 100ms = 6 次），**一次 shell 调用发完**：
+            // 分开调用时云手机单次 keyevent 要好几秒，根本按不出 6 次。
+            val times = (ms / strollPressGapMs).toInt().coerceIn(1, 40)
+            val r = runCatching {
+                ShellCore.probe.repeatKey(if (dir < 0) KEY_LEFT else KEY_RIGHT, times, strollPressGapMs)
+            }.getOrDefault("按键失败")
+            log("   方向键$side：$r")
             return
         }
         val cx = joystickCenterX
         val cy = joystickCenterY
         val mx = (cx + dir * joystickRadius).coerceIn(0.02, 0.98)
+        // 用 swipe 而不是 motionevent：后者要三次进程调用（DOWN/MOVE/UP），
+        // 云手机上实测 0.7~8.6 秒；swipe 只有一次调用。
         val r = runCatching {
-            ShellCore.probe.joystickWalk(cx, cy, mx, cy, ms.toInt())
+            ShellCore.probe.joystickWalk(cx, cy, mx, cy, ms.toInt(), method = "swipe")
         }.getOrDefault("摇杆调用失败")
         log("   摇杆$side：$r")
     }

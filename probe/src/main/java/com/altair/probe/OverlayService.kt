@@ -991,18 +991,26 @@ class OverlayService : Service() {
     /**
      * ROI 开着时，后台低频检测角色血条位置并画在画面上。
      *
-     * 周期取 1.2s：一次检测要截图 + 扫一条带（约 100~300ms），
-     * 太密会和游戏抢 CPU，太疏又看不出"角色在移动"。
+     * 周期取 3s，且补 BUFF 期间完全跳过：一次检测要截图 + 扫一条带，
+     * 而**所有 shell 命令共用一个常驻 root shell** —— 实测它会把引擎的按键调用
+     * 堵上好几秒（日志里 keyevent 变成 6101ms）。宁可显示刷新慢一点。
      */
     private fun startHpPolling() {
         if (hpPolling) return
         hpPolling = true
         Thread {
             while (hpPolling) {
+                // 补 BUFF 期间不抢 root shell：所有命令共用一个常驻 shell，
+                // 一次 screencap 能把引擎的按键调用堵上好几秒（实机日志里 keyevent 变成 6 秒）。
+                if (Engine.state == Engine.State.CASTING) {
+                    try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
+                    continue
+                }
                 val box = runCatching { ShellCore.probe.findHeadHpBarBox() }.getOrNull()
                 hpBox = box
                 ui.post { roiView?.setHpBar(box) }
-                try { Thread.sleep(1200) } catch (_: InterruptedException) { break }
+                // 3 秒一次足够看"角色在哪"，对 shell 的压力只有原来的 1/3
+                try { Thread.sleep(3000) } catch (_: InterruptedException) { break }
             }
         }.apply { isDaemon = true; name = "roi-hpbar" }.start()
     }
