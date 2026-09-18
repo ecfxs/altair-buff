@@ -287,17 +287,37 @@ class OverlayService : Service() {
         lastFg = fg.ifBlank { "?" }
         syncRoiWithForeground(fg)
         val armed = fg == targetPkg
+        // 引擎跑起来后，标题胶囊直接写「运行中」——一眼知道现在在挂机
+        val running = Engine.isRunning
         ui.post {
-            statusPill?.text = if (armed) "🟢 游戏中" else "🔴 非游戏"
+            statusPill?.text = when {
+                !armed -> "🔴 非游戏"
+                running -> "🟢 运行中"
+                else -> "🟢 游戏中"
+            }
             statusPill?.setTextColor(
-                Color.parseColor(if (armed) "#7FD18B" else "#FFB454")
+                Color.parseColor(
+                    when {
+                        !armed -> "#FFB454"
+                        running -> "#3BD16F"
+                        else -> "#7FD18B"
+                    }
+                )
             )
         }
         return buildString {
-            append(if (armed) "🟢 游戏中 · 动作已启用" else "🔴 非游戏 · 动作已禁用")
+            when {
+                !armed -> append("🔴 非游戏 · 动作已禁用")
+                running -> append("🟢 运行中 · 已补 ${Engine.cycleCount} 轮")
+                else -> append("🟢 游戏中 · 引擎未启动")
+            }
             append('\n')
             append("前台: ").append(if (fg.isBlank()) "未知" else fg)
             append('\n').append("目标: ").append(targetPkg)
+            if (running && Engine.nextDueAt > 0) {
+                val left = Engine.nextDueAt - System.currentTimeMillis()
+                append(" · 距下次 ").append(if (left > 0) "${left / 1000}s" else "即将")
+            }
         }
     }
 

@@ -143,10 +143,12 @@ object Engine {
         running = true
         failStreak = 0
         lastError = ""
-        nextDueAt = System.currentTimeMillis() + period
+        // 启动**立刻执行一次**（用户要求），不等第一个周期：
+        // 否则点完启动要干等 4.7 分钟才看到第一个动作，看不出到底有没有生效。
+        nextDueAt = System.currentTimeMillis()
         state = State.WAITING
         LogBus.emit("▶ 引擎启动：周期 ${period / 60000.0} 分钟，输入方式=${inputMethod()}，" +
-            "启用 ${buffConfig().count { it.enabled }} 个 BUFF")
+            "启用 ${buffConfig().count { it.enabled }} 个 BUFF —— 立即执行第一轮")
         worker = Thread { loop() }.apply { isDaemon = true; name = "engine" }
         worker?.start()
 

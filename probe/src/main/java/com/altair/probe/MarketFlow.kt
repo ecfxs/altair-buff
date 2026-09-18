@@ -155,6 +155,24 @@ object MarketFlow {
         set(v) = setLong("strollOpenSteps", v.toLong())
 
     /**
+     * 每次走动的**持续时长**（毫秒）。用户指定"每次持续 600ms 左右"。
+     * 方向键走位是"连发按键"实现的（游戏按方向键持续移动），所以时长 = 连发多久。
+     */
+    var strollHoldMs: Long
+        get() = getLong("strollHoldMs", 600L)
+        set(v) = setLong("strollHoldMs", v)
+
+    /** 时长抖动 ±毫秒（用户指定"上下浮动 30ms"）——避免每次都精确同一个时长。 */
+    var strollJitterMs: Long
+        get() = getLong("strollJitterMs", 30L)
+        set(v) = setLong("strollJitterMs", v)
+
+    /** 连发按键的间隔（毫秒）。越小越接近"按住"。 */
+    var strollPressGapMs: Long
+        get() = getLong("strollPressGapMs", 80L)
+        set(v) = setLong("strollPressGapMs", v)
+
+    /**
      * 原地走动的横向距离（**像素**，默认 100px —— 用户指定"左右走大概 100 像素"）。
      *
      * 用像素而不是屏宽比例：换分辨率时"走多少路"的体感不变，
@@ -344,53 +362,55 @@ object MarketFlow {
      * 后者在卡顿时会越走越偏，几次循环就跑出原地了。
      */
     fun strollAndReturn(log: (String) -> Unit): Pair<Boolean, String> {
-        // ① 标定当前位置：读一次角色血条 x，作为"走回这里"的原点
-        // （分两步赋值：下面 repeat 的闭包要捕获它，可空变量无法被智能转换）
-        val originOrNull = hpX()
-        if (originOrNull == null) {
-            // 识别不到血条时**不再直接放弃** —— 退化为开环步进：
-            // 往一个方向按 N 次，再按反方向 N 次（对称，能回到大致原位）。
-            // 同时把带内诊断打出来，便于定位"为什么识别不到"。
-            log("⚠ 没识别到角色血条 → 退化为开环步进（左右各 ${strollOpenLoopSteps} 次）")
-            log("   诊断：" + runCatching { ShellCore.probe.diagnoseHpBar() }.getOrDefault("诊断不可用"))
-            repeat(strollOpenLoopSteps) { walkStep(-1, log) }
-            repeat(strollOpenLoopSteps) { walkStep(+1, log) }
-            return true to ("原地走动完成（开环）：左右各 $strollOpenLoopSteps 次；" +
-                "血条识别不可用，建议查诊断行")
-        }
-        val origin: Double = originOrNull
-        val screenW = ShellCore.probe.screenWidthPx.coerceAtLeast(1)
-        val dist = strollDistancePx.toDouble() / screenW      // 100px → 归一化
-        val tol = 0.012
-        log("① 已标定当前位置：血条 x=${"%.3f".format(origin)}（屏幕 ${screenW}px，本次走 ${strollDistancePx}px ≈ ${"%.3f".format(dist)}）")
+        // ① 标定当前位置：读一次血条 x **仅作日志参考** —— 走动时长是给定的（600ms），
+        //    不再用"走到某个 x"来判定，所以识别不到血条也不影响走动。
+        val here = hpX()
+        log("① 当前位置：" + (here?.let { "血条 x=%.3f".format(it) } ?: "未识别到血条（不影响走动）"))
 
-        var x = origin
-        var steps = 0
-        repeat(strollRounds) { round ->
-            // ② 左腿：往左走 strollDistancePx
-            var i = 0
-            while (i < maxWalkSteps) {
-                x = hpX() ?: break
-                if (origin - x >= dist) break
-                walkStep(-1, log)
-                i++; steps++
+        // ② 左右各一次，各 600ms ± 30ms
+        val leftMs = jitter(strollHoldMs)
+        val rightMs = jitter(strollHoldMs)
+        walkFor(-1, leftMs, log)
+        walkFor(+1, rightMs, log)
+        return true to ("② 原地走动完成：左 ${leftMs}ms → 右 ${rightMs}ms（各一次，" +
+            "基准 ${strollHoldMs}ms 抖动 ±${strollJitterMs}ms）")
+    }
+
+    /** 基准时长加随机抖动。 */
+    private fun jitter(base: Long): Long {
+        if (strollJitterMs <= 0) return base
+        val d = java.util.concurrent.ThreadLocalRandom.current()
+            .nextLong(-strollJitterMs, strollJitterMs + 1)
+        return (base + d).coerceAtLeast(50L)
+    }
+
+    /**
+     * 朝一个方向走 [ms] 毫秒。
+     *
+     * 方向键走位 = **连发按键**（游戏按方向键持续移动），所以"走 ms 毫秒"就是
+     * "每 [strollPressGapMs] 毫秒按一次，持续 ms"。摇杆走位则是一次按住 ms 的手势。
+     */
+    private fun walkFor(dir: Int, ms: Long, log: (String) -> Unit) {
+        val side = if (dir < 0) "左" else "右"
+        if (walkMethod == "key") {
+            val t0 = System.currentTimeMillis()
+            var n = 0
+            while (System.currentTimeMillis() - t0 < ms) {
+                runCatching { ShellCore.probe.sendKey(if (dir < 0) KEY_LEFT else KEY_RIGHT) }
+                n++
+                sleep(strollPressGapMs)
             }
-            log("② 左腿：x=${"%.3f".format(x)}（目标 ≤ ${"%.3f".format(origin - dist)}，走了 $i 步）")
-
-            // ③ 右腿：走回原点（闭环，不靠步数）
-            var j = 0
-            while (j < maxWalkSteps) {
-                x = hpX() ?: break
-                if (x >= origin - tol) break
-                walkStep(+1, log)
-                j++; steps++
-            }
-            log("③ 右腿：x=${"%.3f".format(x)}（目标 ≥ ${"%.3f".format(origin - tol)}，走了 $j 步）")
+            val used = System.currentTimeMillis() - t0
+            log("   方向键$side：连发 $n 次 / 实际 ${used}ms")
+            return
         }
-
-        val back = kotlin.math.abs(x - origin) <= 0.02
-        return true to ("④ 原地走动完成：原点 x=${"%.3f".format(origin)}，回位 x=${"%.3f".format(x)}，" +
-            "共 $steps 步" + if (back) "（已回原位，接着补 BUFF）" else "（⚠ 未完全回位，仍继续补 BUFF）")
+        val cx = joystickCenterX
+        val cy = joystickCenterY
+        val mx = (cx + dir * joystickRadius).coerceIn(0.02, 0.98)
+        val r = runCatching {
+            ShellCore.probe.joystickWalk(cx, cy, mx, cy, ms.toInt())
+        }.getOrDefault("摇杆调用失败")
+        log("   摇杆$side：$r")
     }
 
     /**
@@ -511,7 +531,7 @@ object MarketFlow {
 
     /** 供界面显示当前参数。 */
     fun describeStroll(): String =
-        "原地走动：标定当前位置 → 走 ${strollDistancePx}px × ${strollRounds} 趟 → 回原位；走法=" +
+        "原地走动：左右各一次，各 ${strollHoldMs}ms（±${strollJitterMs}ms）；走法=" +
             if (walkMethod == "key") {
                 "方向键"
             } else {
