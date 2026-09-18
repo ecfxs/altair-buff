@@ -293,7 +293,9 @@ class MainActivity : Activity() {
 
     private fun periodText(): String {
         val p = Engine.cyclePeriodMs()
-        return if (p <= 0) "未配置（设置页填 BUFF 时长后自动算）" else "%.1f 分钟".format(p / 60000.0)
+        if (p <= 0) return "未配置（设置页填 BUFF 时长后自动算）"
+        val sec = p / 1000
+        return if (sec < 60) "${sec} 秒" else "%d 分 %02d 秒".format(sec / 60, sec % 60)
     }
 
     private fun inputMethodLabel(): String =
@@ -356,16 +358,16 @@ class MainActivity : Activity() {
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
             val dur = EditText(this).apply {
-                setText("5")
+                setText("${Engine.DEFAULT_DUR_SEC}")   // 默认 280 秒
                 inputType = InputType.TYPE_CLASS_NUMBER
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 setTextColor(Color.parseColor("#C9D4E0"))
                 setBackgroundColor(Color.parseColor("#0B0E12"))
-                layoutParams = LinearLayout.LayoutParams(dp(64), LinearLayout.LayoutParams.WRAP_CONTENT)
+                layoutParams = LinearLayout.LayoutParams(dp(84), LinearLayout.LayoutParams.WRAP_CONTENT)
                     .apply { marginStart = dp(6) }
             }
             val unit = TextView(this).apply {
-                text = " 分钟"
+                text = " 秒"
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 setTextColor(Color.parseColor("#8FA3B8"))
             }
@@ -764,7 +766,11 @@ class MainActivity : Activity() {
         buffRows.forEachIndexed { i, (en, key, dur) ->
             en.isChecked = sp.getBoolean("enabled$i", i == 0)
             key.setSelection(sp.getInt("key$i", i).coerceIn(0, 3))
-            dur.setText(sp.getInt("dur$i", 5).toString())
+            // 新键是秒；旧键 dur$i 存的是分钟 → ×60 迁移（复用同键会把 5 分钟读成 5 秒）
+            val sec = sp.getInt("durSec$i", -1).let { v ->
+                if (v > 0) v else sp.getInt("dur$i", 0).takeIf { it > 0 }?.times(60) ?: Engine.DEFAULT_DUR_SEC
+            }
+            dur.setText(sec.toString())
         }
     }
 
@@ -773,15 +779,15 @@ class MainActivity : Activity() {
         buffRows.forEachIndexed { i, (en, key, dur) ->
             sp.putBoolean("enabled$i", en.isChecked)
             sp.putInt("key$i", key.selectedItemPosition)
-            sp.putInt("dur$i", dur.text.toString().toIntOrNull()?.coerceIn(1, 240) ?: 5)
+            sp.putInt("durSec$i", dur.text.toString().toIntOrNull()?.coerceIn(10, 86400) ?: Engine.DEFAULT_DUR_SEC)
         }
         sp.apply()
         val enabled = buffRows.count { it.first.isChecked }
         val durs = buffRows.filter { it.first.isChecked }
             .map { it.third.text.toString().toIntOrNull() ?: 5 }
-        val cycle = durs.minOrNull() ?: 0
+        val cycleSec = durs.minOrNull() ?: 0
         log("BUFF 配置已保存：启用 $enabled 个" +
-            (if (cycle > 0) "，最短时长 ${cycle} 分钟 → 建议循环周期 ${(cycle * 0.94).toInt()} 分钟" else ""))
+            (if (cycleSec > 0) "，最短时长 ${cycleSec} 秒 → 循环周期 ${(cycleSec * 0.94).toInt()} 秒" else ""))
     }
 
     // ---- 集控 ----

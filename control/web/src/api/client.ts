@@ -255,8 +255,8 @@ export const api = {
 /** 默认配置的兜底（后端未返回 buff 时前端补齐 3 行，编号 1..3）。 */
 export function defaultBuffs(): Buff[] {
   return [
-    { idx: 1, enabled: true, key: 1, durationMin: 5 },
-    { idx: 2, enabled: false, key: 2, durationMin: 5 },
-    { idx: 3, enabled: false, key: 3, durationMin: 5 },
+    { idx: 1, enabled: true, key: 1, durationSec: 280 },
+    { idx: 2, enabled: false, key: 2, durationSec: 280 },
+    { idx: 3, enabled: false, key: 3, durationSec: 280 },
   ];
 }

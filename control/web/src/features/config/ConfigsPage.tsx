@@ -29,12 +29,27 @@ function normalizeBuffs(buffs: Buff[] | undefined | null): Buff[] {
             idx: i + 1,
             enabled: Boolean(src.enabled),
             key: src.key >= 1 && src.key <= 4 ? src.key : i + 1,
-            durationMin: src.durationMin >= 1 && src.durationMin <= 240 ? src.durationMin : 5,
+            durationSec: pickDurationSec(src),
           }
-        : { idx: i + 1, enabled: false, key: i + 1, durationMin: 5 },
+        : { idx: i + 1, enabled: false, key: i + 1, durationSec: DEFAULT_DUR_SEC },
     );
   }
   return out;
+}
+
+/** BUFF 时长默认值（秒）——与设备端 Engine.DEFAULT_DUR_SEC 保持一致。 */
+const DEFAULT_DUR_SEC = 280;
+
+/**
+ * 取 BUFF 时长（秒）。老配置里只有 durationMin（分钟）→ ×60 迁移。
+ * 单位串台比报错更难查：同一个字段名换单位会把"5 分钟"读成"5 秒"。
+ */
+function pickDurationSec(b: { durationSec?: number; durationMin?: number }): number {
+  const sec = b.durationSec ?? 0;
+  if (sec >= 10 && sec <= 86400) return sec;
+  const min = b.durationMin ?? 0;
+  if (min >= 1 && min <= 1440) return min * 60;
+  return DEFAULT_DUR_SEC;
 }
 
 const EMPTY_CONFIG: DeviceConfig = {
@@ -84,9 +99,9 @@ export function ConfigsPage() {
   }, [devices.data]);
 
   const cycle = useMemo(() => {
-    const mins = form.buff.filter((b) => b.enabled && b.durationMin > 0).map((b) => b.durationMin);
-    if (!mins.length) return null;
-    return Math.round(Math.min(...mins) * 60_000 * 0.94);
+    const secs = form.buff.filter((b) => b.enabled && (b.durationSec ?? 0) > 0).map((b) => b.durationSec ?? 0);
+    if (!secs.length) return null;
+    return Math.round(Math.min(...secs) * 1000 * 0.94);
   }, [form.buff]);
 
   function patch<K extends keyof DeviceConfig>(key: K, value: DeviceConfig[K]) {
@@ -226,13 +241,15 @@ export function ConfigsPage() {
                   持续
                   <input
                     type="number"
-                    min={1}
-                    max={240}
-                    className="w-[62px] rounded-input border border-line-2 bg-inset px-[9px] py-1.5 text-xs text-input-fg outline-none focus:border-brand"
-                    value={b.durationMin}
-                    onChange={(e) => patchBuff(i, { durationMin: Number.parseInt(e.target.value, 10) || 5 })}
+                    min={10}
+                    max={86400}
+                    className="w-[78px] rounded-input border border-line-2 bg-inset px-[9px] py-1.5 text-xs text-input-fg outline-none focus:border-brand"
+                    value={b.durationSec ?? DEFAULT_DUR_SEC}
+                    onChange={(e) =>
+                      patchBuff(i, { durationSec: Number.parseInt(e.target.value, 10) || DEFAULT_DUR_SEC })
+                    }
                   />
-                  分钟
+                  秒
                 </span>
               </div>
             ))}
@@ -316,7 +333,7 @@ export function ConfigsPage() {
                   <td>{r.createdBy || '—'}</td>
                   <td className="max-w-[420px] truncate">
                     {r.config?.targetPkg || '—'} · {r.config?.inputMethod || '—'} · BUFF{' '}
-                    {(r.config?.buff ?? []).filter((b) => b.enabled).map((b) => `键${b.key}/${b.durationMin}分`).join(' ') ||
+                    {(r.config?.buff ?? []).filter((b) => b.enabled).map((b) => `键${b.key}/${b.durationSec}秒`).join(' ') ||
                       '全关'}
                     {r.config?.notes ? ` · ${r.config.notes}` : ''}
                   </td>

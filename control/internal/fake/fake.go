@@ -116,9 +116,9 @@ func (d *Device) report(ctx context.Context) (time.Duration, error) {
 			"lastResult":    "补 BUFF1 成功",
 			"lastError":     "",
 			"buffs": []map[string]any{
-				{"idx": 1, "enabled": true, "key": 1, "durationMin": 5},
-				{"idx": 2, "enabled": false, "key": 2, "durationMin": 5},
-				{"idx": 3, "enabled": false, "key": 3, "durationMin": 5},
+				{"idx": 1, "enabled": true, "key": 1, "durationSec": 280},
+				{"idx": 2, "enabled": false, "key": 2, "durationSec": 280},
+				{"idx": 3, "enabled": false, "key": 3, "durationSec": 280},
 			},
 		},
 		"heartbeat": map[string]any{

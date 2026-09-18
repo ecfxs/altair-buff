@@ -125,7 +125,7 @@ export function DeviceEditModal({ device, defaultRevision, onClose }: Props) {
                       <span className="inline-flex items-center gap-2">
                         <span className="text-[12px] text-fg">BUFF{b.idx}</span>
                         <span className="num text-[11px] text-muted-2">
-                          键 {b.key} · 持续 {b.durationMin} 分
+                          键 {b.key} · 持续 {b.durationSec ?? (b.durationMin ?? 0) * 60} 秒
                         </span>
                       </span>
                     }

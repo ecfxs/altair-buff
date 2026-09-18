@@ -5,12 +5,20 @@
 package model
 
 // Buff 是一条 BUFF 补键配置。
+//
+// 时长单位是**秒**（v0.24.10 起，设置界面从分钟改为秒，默认 280 秒）。
+// 旧字段 DurationMin 保留并同时下发：万一线上还是老版本 APK / 老面板，
+// 读 durationMin 也不会拿到 0（兼容期过了再删）。
 type Buff struct {
 	Idx         int  `json:"idx"`
 	Enabled     bool `json:"enabled"`
 	Key         int  `json:"key"`
-	DurationMin int  `json:"durationMin"`
+	DurationSec int  `json:"durationSec"`
+	DurationMin int  `json:"durationMin,omitempty"`
 }
+
+// DefaultBuffDurationSec 是 BUFF 时长的默认值（秒）。
+const DefaultBuffDurationSec = 280
 
 // Engine 是设备挂机引擎的状态。
 type Engine struct {
@@ -77,9 +85,9 @@ func DefaultConfig() Config {
 		InputMethod:    "keyevent",
 		AutoFreeMarket: false,
 		Buff: []Buff{
-			{Idx: 1, Enabled: true, Key: 1, DurationMin: 5},
-			{Idx: 2, Enabled: false, Key: 2, DurationMin: 5},
-			{Idx: 3, Enabled: false, Key: 3, DurationMin: 5},
+			{Idx: 1, Enabled: true, Key: 1, DurationSec: DefaultBuffDurationSec},
+			{Idx: 2, Enabled: false, Key: 2, DurationSec: DefaultBuffDurationSec},
+			{Idx: 3, Enabled: false, Key: 3, DurationSec: DefaultBuffDurationSec},
 		},
 		Notes: "初始配置",
 	}

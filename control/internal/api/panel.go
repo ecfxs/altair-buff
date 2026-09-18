@@ -579,8 +579,20 @@ func normalizeConfig(c model.Config) model.Config {
 		if fixed[i].Key < 1 || fixed[i].Key > 4 {
 			fixed[i].Key = i + 1
 		}
-		if fixed[i].DurationMin < 1 || fixed[i].DurationMin > 240 {
-			fixed[i].DurationMin = 5
+		// 时长单位统一成秒。老配置只有 durationMin（分钟）→ ×60 迁移。
+		if fixed[i].DurationSec <= 0 && fixed[i].DurationMin > 0 {
+			fixed[i].DurationSec = fixed[i].DurationMin * 60
+		}
+		if fixed[i].DurationSec <= 0 {
+			fixed[i].DurationSec = model.DefaultBuffDurationSec
+		}
+		if fixed[i].DurationSec < 10 || fixed[i].DurationSec > 86400 {
+			fixed[i].DurationSec = model.DefaultBuffDurationSec
+		}
+		// 同时下发分钟值，兼容老读者（向下取整，最小 1）
+		fixed[i].DurationMin = fixed[i].DurationSec / 60
+		if fixed[i].DurationMin < 1 {
+			fixed[i].DurationMin = 1
 		}
 	}
 	c.Buff = fixed

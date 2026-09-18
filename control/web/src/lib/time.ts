@@ -118,11 +118,13 @@ export const CYCLE_FACTOR = 0.94;
 
 /** 启用的 BUFF 里取最短时长 × 0.94 = 循环周期（旧面板提示语）。 */
 export function cyclePeriodFromBuffs(
-  buffs: Array<{ enabled: boolean; durationMin: number }> | null | undefined,
+  buffs: Array<{ enabled: boolean; durationSec?: number; durationMin?: number }> | null | undefined,
 ): number | null {
-  const mins = (buffs ?? [])
-    .filter((b) => b.enabled && Number.isFinite(b.durationMin) && b.durationMin > 0)
-    .map((b) => b.durationMin);
-  if (mins.length === 0) return null;
-  return Math.round(Math.min(...mins) * 60_000 * CYCLE_FACTOR);
+  // 优先用秒；老配置只有分钟 → ×60
+  const secs = (buffs ?? [])
+    .filter((b) => b.enabled)
+    .map((b) => b.durationSec ?? (b.durationMin ?? 0) * 60)
+    .filter((v) => Number.isFinite(v) && v > 0);
+  if (secs.length === 0) return null;
+  return Math.round(Math.min(...secs) * 1000 * CYCLE_FACTOR);
 }

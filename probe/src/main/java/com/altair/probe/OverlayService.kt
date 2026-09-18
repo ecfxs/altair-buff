@@ -422,18 +422,22 @@ class OverlayService : Service() {
         // 其余（截图、诊断、键扫描、复制日志、申请Root）都移到主界面的日志页，
         // 因为那些是排查时用的，不是挂在游戏上天天点的。
         // ---------------------------------------------------------------- 面板按钮
-        // 用户要求：**只留 7 个**。其余（点1-4 / 菜单 / 自由市场 / 传送点 / 出市场 /
-        // 记出口 / 看血条 / 按法 / 技能位 / 走法 / 摇杆档 / 校菜单·市场·传送 / 走动距离）
-        // 全部撤掉 —— 面板要挂在游戏上天天用，按钮多了反而找不到。
-        // 这些能力没删：单点校准、市场流程、摇杆走位等代码都还在，需要时可用主界面或再挂回来。
+        // 布局（用户指定）：
+        //   [  启动  ] [  停止  ]        ← 单独一行，按钮大一号
+        //   ───────── 分割线 ─────────
+        //   [ROI显示] [★采点] [清点]
+        //   [标记摇杆] [原地走动]
+        content.addView(rowBig(
+            "启动" to { startEngineFromPanel() },
+            "停止" to { stopEngineFromPanel() }
+        ))
+        content.addView(divider())
         content.addView(row(
             "ROI显示" to { toggleRoi() },
             "★采点" to { togglePick() },
-            "清点" to { clearPicks() },
-            "启动" to { startEngineFromPanel() }
+            "清点" to { clearPicks() }
         ))
         content.addView(row(
-            "停止" to { stopEngineFromPanel() },
             "标记摇杆" to { startSlotPick(SLOT_JOYSTICK) },
             "原地走动" to { testStroll() }
         ))
@@ -567,6 +571,35 @@ class OverlayService : Service() {
         }
         return r
     }
+
+    /** 大一号的按钮行（启动/停止单独一行用）。 */
+    private fun rowBig(vararg btns: Pair<String, () -> Unit>): LinearLayout {
+        val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        btns.forEach { (label, fn) ->
+            val b = Button(this).apply {
+                text = label
+                isAllCaps = false
+                setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f)
+                setPadding(dp(4), 0, dp(4), 0)
+                minWidth = 0
+                minimumWidth = 0
+                layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f)
+                    .apply { marginEnd = dp(3) }
+                setOnClickListener { fn() }
+            }
+            r.addView(b)
+        }
+        return r
+    }
+
+    /** 一条分割线，用来把"启停"和"调试按钮"分开。 */
+    private fun divider(): android.view.View =
+        android.view.View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(1)
+            ).apply { topMargin = dp(6); bottomMargin = dp(4) }
+            setBackgroundColor(Color.parseColor("#313A45"))
+        }
 
     private fun hidePanel() {
         panel?.let { runCatching { wm.removeView(it) } }

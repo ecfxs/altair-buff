@@ -1123,7 +1123,10 @@ export interface components {
             idx: number;
             enabled: boolean;
             key: number;
-            durationMin: number;
+            /** @description 持续时长（秒）；v0.24.10 起单位由分钟改为秒，默认 280 */
+            durationSec: number;
+            /** @description 已弃用，仅为兼容旧读者保留（= durationSec/60） */
+            durationMin?: number;
         };
         EngineStatus: {
             running?: boolean;

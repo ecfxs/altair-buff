@@ -54,23 +54,46 @@ object Engine {
     /** 连续失败多少次就熔断。 */
     private const val FAIL_LIMIT = 3
 
+    /** BUFF 之间的间隔（毫秒）——排队释放，用户指定 1.5 秒。 */
+    private const val BUFF_GAP_MS = 1500L
+
+    /** 原地走动是否每轮都做。默认 false：用户指定"启动时走一次，之后不必再走"。 */
+    private fun strollEveryRound(): Boolean =
+        buffPrefs()?.getBoolean("strollEveryRound", false) ?: false
+
+    /** 本次运行是否已经走过一次（首轮走动，后续轮次跳过）。 */
+    @Volatile private var strolledThisRun = false
+
     // ------------------------------------------------------------ 配置读取
 
     private fun buffPrefs(): android.content.SharedPreferences? =
         ctx?.getSharedPreferences("buff", Context.MODE_PRIVATE)
 
-    data class BuffCfg(val idx: Int, val enabled: Boolean, val key: Int, val durMin: Int)
+    /** 默认 BUFF 时长（秒）。 */
+    const val DEFAULT_DUR_SEC = 280
 
+    data class BuffCfg(val idx: Int, val enabled: Boolean, val key: Int, val durSec: Int)
+
+    /**
+     * BUFF 配置。**时长单位是秒**（用户要求：设置界面从分钟改成秒，默认 280 秒）。
+     *
+     * 键名用 `durSec$i` 而不是复用 `dur$i` —— 旧键存的是**分钟**，
+     * 复用同一个键会把"5 分钟"读成"5 秒"（这种单位串台比报错更难查）。
+     * 旧值做一次迁移：`dur$i`（分钟）× 60。
+     */
     fun buffConfig(): List<BuffCfg> {
         // 上下文没注入时返回空配置，**绝不抛异常** —— 界面启动时就要读它算周期，
         // 这里一崩就是整个 App 崩（后台线程里的未捕获异常会带走进程）。
         val sp = buffPrefs() ?: return emptyList()
         return (0 until 3).map { i ->
+            val sec = sp.getInt("durSec$i", -1).let { v ->
+                if (v > 0) v else sp.getInt("dur$i", 0).takeIf { it > 0 }?.times(60) ?: DEFAULT_DUR_SEC
+            }
             BuffCfg(
                 idx = i,
                 enabled = sp.getBoolean("enabled$i", i == 0),
                 key = sp.getInt("key$i", i),
-                durMin = sp.getInt("dur$i", 5)
+                durSec = sec
             )
         }
     }
@@ -88,10 +111,10 @@ object Engine {
         ctx?.getSharedPreferences("overlay", Context.MODE_PRIVATE)
             ?.getString("inputMethod", "keyevent") ?: "keyevent"
 
-    /** 循环周期 = 最短 BUFF 时长 × 0.94（留 6% 余量吸收抖动与卡顿）。 */
+    /** 循环周期 = 最短 BUFF 时长（秒）× 0.94（留 6% 余量吸收抖动与卡顿）。 */
     fun cyclePeriodMs(): Long {
-        val d = buffConfig().filter { it.enabled }.minOfOrNull { it.durMin } ?: 0
-        return if (d <= 0) 0L else (d * 60_000L * 0.94).toLong()
+        val sec = buffConfig().filter { it.enabled }.minOfOrNull { it.durSec } ?: 0
+        return if (sec <= 0) 0L else (sec * 1000L * 0.94).toLong()
     }
 
     // ------------------------------------------------------------ 生命周期
@@ -142,6 +165,7 @@ object Engine {
         }
         running = true
         failStreak = 0
+        strolledThisRun = false      // 新一次启动 → 首轮还要走一次
         lastError = ""
         // 启动**立刻执行一次**（用户要求），不等第一个周期：
         // 否则点完启动要干等 4.7 分钟才看到第一个动作，看不出到底有没有生效。
@@ -224,9 +248,16 @@ object Engine {
             }
         }
 
-        // 补 BUFF 前：先标定当前位置 → 左右走一段 → 回原位（用户确认的循环）
-        val (_, strollMsg) = MarketFlow.strollAndReturn { LogBus.emit("  $it") }
-        LogBus.emit("  $strollMsg")
+        // 补 BUFF 前：首轮做一次原地走动（标定当前位置 → 左右各一次）；
+        // 之后每轮**不再走动**（用户指定"不需要重新在原地走动"）。
+        // 想恢复成每轮都走，把 strollEveryRound 置 true 即可。
+        if (!strolledThisRun || strollEveryRound()) {
+            val (_, strollMsg) = MarketFlow.strollAndReturn { LogBus.emit("  $it") }
+            LogBus.emit("  $strollMsg")
+            strolledThisRun = true
+        } else {
+            LogBus.emit("  （跳过原地走动：本次运行已走过一次）")
+        }
         if (autoFreeMarket() && !pausedMarketNotified) {
             pausedMarketNotified = true
             LogBus.emit("ℹ 回城模式（自动进自由市场）暂时停用：当前只做「原地走动 + 补 BUFF」，后续再启用")
@@ -239,7 +270,8 @@ object Engine {
             val r = pressSkill(b.idx)
             if (r.first) { ok++; LogBus.emit("  ✅ BUFF${b.idx + 1}（键 ${b.key + 1}）${r.second}") }
             else LogBus.emit("  ❌ BUFF${b.idx + 1} 失败：${r.second}")
-            try { Thread.sleep(900) } catch (_: InterruptedException) { break }
+            // BUFF 排队释放：技能之间固定 1.5 秒（用户指定）
+            try { Thread.sleep(BUFF_GAP_MS) } catch (_: InterruptedException) { break }
         }
 
         if (ok == enabled.size) {
@@ -338,7 +370,8 @@ object Engine {
                 put("idx", b.idx + 1)
                 put("enabled", b.enabled)
                 put("key", b.key + 1)
-                put("durationMin", b.durMin)
+                put("durationSec", b.durSec)
+                put("durationMin", b.durSec / 60)   // 兼容老面板/老契约
             })
         }
         o.put("buffs", arr)
