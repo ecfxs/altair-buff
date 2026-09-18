@@ -153,6 +153,8 @@ class OverlayService : Service() {
     private var panel: View? = null
     private var roiView: RoiView? = null
     private var pickView: PickView? = null
+    /** 单点校准的目标槽位；-1 表示当前是整批采点模式。 */
+    private var slotPickTarget = -1
     private var lastPicks: List<Pair<Float, Float>> = emptyList()
     /** 采集点变化回调（自己注册自己，onDestroy 时注销，避免泄漏）。 */
     private var picksListener: (() -> Unit)? = null
@@ -423,6 +425,13 @@ class OverlayService : Service() {
             "按法:${pressModes[pressIdx].first}" to { cyclePressMode() },
             "技能位" to { autoDetectSkills() }
         ))
+        // 单点校准：只改一个槽位，不用整批重采
+        content.addView(row(
+            "校菜单" to { startSlotPick(4) },
+            "校市场" to { startSlotPick(5) },
+            "校传送" to { startSlotPick(6) },
+            "校备用" to { startSlotPick(7) }
+        ))
 
         contentBox = content
 
@@ -626,6 +635,7 @@ class OverlayService : Service() {
      */
     private fun togglePick() {
         if (pickView != null) { stopPick(); return }
+        slotPickTarget = -1
         val v = PickView(this)
         v.onPick = { idx, nx, ny ->
             LogBus.emit("采点 $idx: [%.4f, %.4f]".format(nx, ny))
@@ -664,6 +674,27 @@ class OverlayService : Service() {
         val v = pickView ?: return
         runCatching { wm.removeView(v) }
         pickView = null
+
+        // ---- 单点校准：只写目标槽位，其余槽位原样保留 ----
+        if (slotPickTarget >= 0) {
+            val slot = slotPickTarget
+            slotPickTarget = -1
+            val p = v.points.lastOrNull()
+            if (p != null) {
+                val cur = pickedPointsOf(this).toMutableList()
+                if (slot < cur.size) cur[slot] = p else cur.add(p)
+                savePickedPointsOf(this, cur)
+                notifyPicksChanged()
+                lastPicks = cur
+                val msg = "✅ ${pickName(slot)} 已校准 = [%.4f, %.4f]".format(p.first, p.second)
+                LogBus.emit(msg)
+                flashStatus(msg)
+            } else {
+                flashStatus("⚠ 没采到点，${pickName(slot)} 未变")
+            }
+            ui.post { refreshStatus() }
+            return
+        }
         lastPicks = v.points.toList()      // 关掉后仍能用来「点N」
         runCatching { savePickedPointsOf(this, lastPicks) }   // 持久化，重启后仍在
         if (roiEnabled) { removeRoi(); syncRoiWithForeground(lastFg) }   // ROI 立刻反映新点
@@ -671,6 +702,47 @@ class OverlayService : Service() {
         LogBus.emit(v.export())
         // 面板可能因为日志变长而需要重排，刷新一下状态
         ui.post { refreshStatus() }
+    }
+
+    /**
+     * 单点校准：只采**一个**点写进指定槽位，其余槽位不动。
+     *
+     * 为什么需要：原来的「★采点」是**整批重采**（stopPick 会整体替换坐标表），
+     * 只想改一个菜单坐标也得把所有点重采一遍 —— 代价太大，用户反馈菜单错了时就卡在这。
+     *
+     * 为什么限定"只能校准下一个槽位"：坐标是**按顺序排列的列表**，
+     * 跳过中间槽位就得填占位值，而占位值一旦被当成真实坐标点出去是危险的
+     * （会点到游戏里别的地方）。按顺序补就没有这个问题。
+     */
+    private fun startSlotPick(slot: Int) {
+        val cur = pickedPointsOf(this)
+        if (slot != cur.size) {
+            flashStatus("⚠ 当前该校准的是「${pickName(cur.size)}」（要按顺序补）")
+            return
+        }
+        if (pickView != null) stopPick()
+        val v = PickView(this)
+        v.onPick = { _, nx, ny -> LogBus.emit("校准 ${pickName(slot)}: [%.4f, %.4f]".format(nx, ny)) }
+        v.onFinish = { ui.post { stopPick() } }
+        val p = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        )
+        panel?.let { runCatching { wm.removeView(it) } }
+        runCatching { wm.addView(v, p) }
+            .onSuccess {
+                pickView = v
+                slotPickTarget = slot
+                panel?.let { pnl -> panelParams?.let { pp -> runCatching { wm.addView(pnl, pp) } } }
+                val msg = "校准「${pickName(slot)}」：点它的位置，再点「完成采点」"
+                LogBus.emit(msg)
+                flashStatus(msg)
+            }
+            .onFailure { flashStatus("采集层添加失败：${it.message}") }
     }
 
     private fun clearPicks() {
@@ -709,7 +781,8 @@ class OverlayService : Service() {
     private fun runMarketFlow() {
         Thread {
             LogBus.emit("▸ 进自由市场（完整流程）")
-            val (ok, msg) = MarketFlow.enterMarketAndWalkToExit { LogBus.emit(it) }
+            // 面板按钮 = 完整组合键：进市场 → 走到左侧出口 → 出市场（跑完应回到野外）
+            val (ok, msg) = MarketFlow.enterMarketAndWalkToExit({ LogBus.emit(it) }, leaveAfter = true)
             LogBus.emit(if (ok) "   ✅ $msg" else "   ❌ $msg")
             flashStatus(if (ok) "✅ 进市场：$msg" else "❌ 进市场失败：$msg")
             ui.post { refreshStatus() }

@@ -218,6 +218,12 @@ object Engine {
             }
         }
 
+        // 原地等待模式：放技能前左右走动一下再回原位（不勾"自动进自由市场"时的循环）
+        if (!autoFreeMarket()) {
+            val (_, msg) = MarketFlow.strollAndReturn { LogBus.emit("  $it") }
+            LogBus.emit("  $msg")
+        }
+
         val enabled = buffConfig().filter { it.enabled }
         LogBus.emit("── 第 ${cycleCount + 1} 轮：开始补 ${enabled.size} 个 BUFF ──")
         var ok = 0
@@ -241,7 +247,11 @@ object Engine {
             // 回城模式：补完就回自由市场等待，并走到出口待命
             if (autoFreeMarket()) {
                 LogBus.emit("── 回城模式：进自由市场并走到出口 ──")
-                val (mOk, mMsg) = MarketFlow.enterMarketAndWalkToExit { LogBus.emit("  $it") }
+                // 显式写 log = ：尾随 lambda 会绑到最后一个参数（leaveAfter），这里不能省
+                val (mOk, mMsg) = MarketFlow.enterMarketAndWalkToExit(
+                    log = { LogBus.emit("  $it") },
+                    leaveAfter = false,   // 回城模式停在出口待命，下一轮到点再出
+                )
                 inMarket = mOk
                 lastResult += if (mOk) "；已回自由市场" else "；回城失败"
                 LogBus.emit(if (mOk) "  ↩ $mMsg" else "  ⚠ $mMsg（下一轮按仍在野外处理）")

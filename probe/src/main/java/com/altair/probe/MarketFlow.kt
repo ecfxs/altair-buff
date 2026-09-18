@@ -81,9 +81,12 @@ object MarketFlow {
         get() = getStr("walkMode", "keyRepeat")
         set(v) = setStr("walkMode", v)
 
-    /** 方向键：19=上 20=下 21=左 22=右。出口在自由市场里通常朝一个固定方向。 */
+    /**
+     * 方向键：19=上 20=下 21=左 22=右。
+     * 默认**左**（21）—— 用户确认自由市场的出口在左侧（"走到左侧出口出"）。
+     */
     var walkKeyCode: Int
-        get() = getLong("walkKeyCode", 22L).toInt()
+        get() = getLong("walkKeyCode", 21L).toInt()
         set(v) = setLong("walkKeyCode", v.toLong())
 
     /** 连发次数（每次之间 [walkGapMs] 毫秒），总时长 ≈ 次数 × 间隔。 */
@@ -129,11 +132,19 @@ object MarketFlow {
     // ------------------------------------------------------------ 主流程
 
     /**
-     * 进自由市场并走到出口待命。返回 (是否成功, 说明)。
+     * 进自由市场 → 走到左侧出口 →（可选）出市场。返回 (是否成功, 说明)。
      *
+     * @param leaveAfter 到了出口之后按【方向键上】出市场。
+     *   · 悬浮窗「自由市场▶」按钮传 true —— 用户描述的完整组合键就是"进→走到左侧出口**出**"，
+     *     这样它也是一个能自检的闭环（跑完应回到野外）
+     *   · 引擎的回城模式传 false —— 进市场是为了**等待**，要停在出口待命，
+     *     等下一轮到点再出市场补 BUFF
      * @param log 逐步日志回调（悬浮窗与引擎都传 LogBus::emit）
      */
-    fun enterMarketAndWalkToExit(log: (String) -> Unit): Pair<Boolean, String> {
+    fun enterMarketAndWalkToExit(
+        log: (String) -> Unit,
+        leaveAfter: Boolean = false,
+    ): Pair<Boolean, String> {
         val c = ctx ?: return false to "未初始化"
         val picks = OverlayService.pickedPointsOf(c)
         if (picks.size <= IDX_MARKET) {
@@ -178,7 +189,16 @@ object MarketFlow {
 
         // ---- 5. 走到出口 ----
         val walked = walkToPortal(picks, log)
-        return walked
+        if (!walked.first || !leaveAfter) return walked
+
+        // ---- 6. 出市场（按方向键上）----
+        log("⑥ 到了出口，按【方向键上】出市场")
+        val (exited, exMsg) = exitMarket(log)
+        return if (exited) {
+            true to (walked.second + "；" + exMsg)
+        } else {
+            false to (walked.second + "；出市场失败：" + exMsg)
+        }
     }
 
     /**
@@ -208,6 +228,12 @@ object MarketFlow {
             log("⑤ 闭环走位：把血条对齐到出口 x=${"%.3f".format(target)}（容差 ${"%.3f".format(alignTolerance)}）")
             return walkAligned(target, log)
         }
+        // 未标定出口 x：按用户给的机制走 —— **出口在左侧**，一直往左走到底（贴到地图左边界）
+        // 就是出口。判定"到底"：连续 3 次血条 x 不再变小（贴边后角色动不了）。
+        if (walkMode != "tap") {
+            log("⑤ 出口未标定：按「出口在左侧」往左走到底（血条 x 不再变小即到达）")
+            return walkLeftUntilEdge(log)
+        }
         log("⑤ 出口 x 未标定（走到门口按一次「记出口」），退化为开环走位")
         if (walkMode == "tap") {
             if (picks.size <= IDX_PORTAL) {
@@ -227,6 +253,61 @@ object MarketFlow {
         }
         if (sent == 0) return false to "方向键一次都没发出去"
         return true to "已朝出口走 $sent 次（开环，未做视觉校准）"
+    }
+
+    /**
+     * 往左走到底 = 到达自由市场的左侧出口。
+     *
+     * 判定依据：贴到地图左边界后角色走不动，血条 x 不再变小。
+     * 连续 3 次没变小就认为到了 —— 比"走固定步数"可靠，因为云手机帧率与卡顿都会影响实际位移。
+     */
+    private fun walkLeftUntilEdge(log: (String) -> Unit): Pair<Boolean, String> {
+        var prev = Double.MAX_VALUE
+        var stalled = 0
+        var steps = 0
+        repeat(maxWalkSteps) {
+            steps++
+            val x = runCatching { ShellCore.probe.findHeadHpBarX() }.getOrNull()
+            if (x != null) {
+                if (x <= prev + 0.002) stalled++ else stalled = 0
+                prev = x
+                log("   第 $steps 步：血条 x=${"%.3f".format(x)}（连续未变小 $stalled/3）")
+                if (stalled >= 3) {
+                    return true to "已贴到左侧边界（血条 x=${"%.3f".format(x)}），应为出口"
+                }
+            }
+            runCatching { ShellCore.probe.sendKey(KEY_LEFT) }
+            sleep(walkGapMs)
+        }
+        return false to "往左走了 $steps 步仍未贴到边界（最后 x=${"%.3f".format(prev)}）"
+    }
+
+    /**
+     * 原地等待模式：放技能前**左右走动一下再回原位**（用户确认的循环）。
+     *
+     * 用血条 x 做闭环回到原点，而不是"左走 N 步再右走 N 步" ——
+     * 后者在卡顿时会越走越偏，几次循环就跑出原地了。
+     */
+    fun strollAndReturn(log: (String) -> Unit): Pair<Boolean, String> {
+        val origin = runCatching { ShellCore.probe.findHeadHpBarX() }.getOrNull()
+            ?: return false to "没识别到角色血条，跳过原地走动"
+        log("先往左走 3 步")
+        repeat(3) {
+            runCatching { ShellCore.probe.sendKey(KEY_LEFT) }
+            sleep(walkGapMs)
+        }
+        var i = 0
+        var x = origin
+        while (i < 12) {
+            x = runCatching { ShellCore.probe.findHeadHpBarX() }.getOrNull() ?: break
+            if (x >= origin - 0.01) break
+            runCatching { ShellCore.probe.sendKey(KEY_RIGHT) }
+            sleep(walkGapMs)
+            i++
+        }
+        val back = kotlin.math.abs(x - origin) <= 0.02
+        return true to ("原地走动完成：原点 x=${"%.3f".format(origin)}，回位 x=${"%.3f".format(x)}" +
+            if (back) "（已回原位）" else "（⚠ 未完全回位）")
     }
 
     /**

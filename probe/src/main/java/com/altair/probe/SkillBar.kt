@@ -55,13 +55,15 @@ object SkillBar {
     private const val MAX_SNAP = 0.5
 
     /**
-     * 菜单按钮候选坐标（标定产物里标着 `confidence: low`）。
+     * ⛔ 已作废的菜单候选坐标（**不要再用**）。
      *
-     * 备注原文：**"右上角圆形候选 pixelBox=[1219,28,38,38]，三张图位置一致但圆内纹理 std 高达 70~92，
-     * 不像平坦按钮。待人工确认"**。作为起始值填入，让「菜单」按钮可用、并能在 ROI 上核对；
-     * 若核对下来不在菜单键上，重新采点即可覆盖。
+     * 标定产物里的 `buttons.menu_open = [0.9672, 0.0653]`（右上角圆）经用户实机确认**是错的**：
+     * 真正的菜单键是**下方带 "MENU" 字样**的那个。
+     *
+     * 为什么直接删掉而不是"先填上凑合用"：**坐标错了会自动点到游戏里别的地方**
+     * （确认框、购买、传送……），后果不可控。宁可让按钮明确提示"没有坐标"。
+     * 正确做法是用悬浮窗的「校菜单」单点校准。
      */
-    val MENU_CANDIDATE = 0.9672f to 0.0653f
 
     /**
      * 保证已知的固定 UI 坐标都有值：技能 1-4 用实测值、菜单用候选值。
@@ -79,12 +81,10 @@ object SkillBar {
             val existing = pts.getOrNull(i)
             if (existing == null) { merged.add(DEFAULT[i]); changed = true } else merged.add(existing)
         }
-        // 槽位 4 = 菜单。以前这里空着 → 悬浮窗「菜单」按钮点了没反应
-        // （它只写日志，而悬浮面板早就不显示日志了，用户看到的就是"没反应"）。
-        val menu = pts.getOrNull(4)
-        if (menu == null) { merged.add(MENU_CANDIDATE); changed = true } else merged.add(menu)
-        // 槽位 5 起（自由市场 / 传送点）标定产物里只有占位值 [0.5,0.5]，没法用 —— 必须人工采点。
-        for (i in 5 until pts.size) merged.add(pts[i])
+        // 槽位 4 起（菜单 / 自由市场 / 传送点）标定产物里没有可用值
+        // （menu_free_market 是 [0.5,0.5] 占位、menu_open 经确认是错的），必须人工单点校准。
+        // 这里**不填任何猜测值**：坐标错了会自动点到游戏里别的地方。
+        for (i in 4 until pts.size) merged.add(pts[i])
         if (!changed) return false
         OverlayService.savePickedPointsOf(ctx, merged)
         // ★ 必须通知悬浮窗：它内存里的 lastPicks 是独立的副本，
