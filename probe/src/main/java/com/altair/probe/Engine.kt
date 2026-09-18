@@ -143,8 +143,13 @@ object Engine {
             return
         }
         val touch = inputMethod() == "touch"
+        if (touch) {
+            // 先用内置的实测技能坐标兜底：技能位是固定 UI，装好就已知，
+            // 不该因为"采集点被清空/采了一半"就拒绝启动。
+            SkillBar.ensureDefaults(context)
+        }
         if (touch && OverlayService.pickedPointsOf(context).size < 4) {
-            LogBus.emit("⛔ 无法启动：输入方式为触摸，但还没采集技能键坐标（需 4 个点）。")
+            LogBus.emit("⛔ 无法启动：输入方式为触摸，但技能键坐标不足 4 个（内置坐标也没能补上）。")
             state = State.ERROR; lastError = "触摸方式但缺技能键坐标"
             return
         }

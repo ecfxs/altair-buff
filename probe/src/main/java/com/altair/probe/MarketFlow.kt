@@ -88,8 +88,12 @@ object MarketFlow {
      * 保留 key 作为兜底（某些环境下触摸通道不可用）。
      */
     var walkMethod: String
-        get() = getStr("walkMethod", "joystick")
-        set(v) = setStr("walkMethod", v)
+        // ★ 键名带 V2，默认**方向键**：
+        //   · 用户实测方向键版本能走、摇杆版本不稳
+        //   · 旧键 walkMethod 里存着 0.24.6「走法」按钮写下的 "joystick"，
+        //     复用它会让旧值永远盖住新默认值（这个坑我踩过一次，换键名才算真改掉）
+        get() = getStr("walkMethodV2", "key")
+        set(v) = setStr("walkMethodV2", v)
 
     /**
      * 摇杆中心（归一化）。默认取左下角常见位置；
@@ -167,9 +171,14 @@ object MarketFlow {
         get() = getLong("strollJitterMs", 30L)
         set(v) = setLong("strollJitterMs", v)
 
-    /** 连发按键的间隔（毫秒）。越小越接近"按住"。 */
+    /**
+     * 连发按键的间隔（毫秒）。越小越接近"按住"。
+     * 100ms × 6 次 ≈ 600ms —— 注意每次 `input keyevent` 都是独立进程调用，
+     * 在慢的云手机上单次可能几百毫秒，所以"600ms"实际是**按到时间到为止**，
+     * 真实按了几次看日志（会打印"连发 N 次 / 实际 Xms"）。
+     */
     var strollPressGapMs: Long
-        get() = getLong("strollPressGapMs", 80L)
+        get() = getLong("strollPressGapMs", 100L)
         set(v) = setLong("strollPressGapMs", v)
 
     /**

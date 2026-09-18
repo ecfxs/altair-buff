@@ -154,7 +154,7 @@ class OverlayService : Service() {
 
     private lateinit var wm: WindowManager
     private var panel: View? = null
-    private var roiView: RoiView? = null
+    @Volatile private var roiView: RoiView? = null
     private var pickView: PickView? = null
     /** 单点校准的目标槽位；-1 = 整批采点模式，-2 = 摇杆中心（不属于采点列表）。 */
     private var slotPickTarget = -1
@@ -327,9 +327,14 @@ class OverlayService : Service() {
      */
     private fun syncRoiWithForeground(fg: String) {
         val shouldShow = roiEnabled && fg == targetPkg
-        val showing = roiView != null
-        if (shouldShow && !showing) addRoi()
-        else if (!shouldShow && showing) removeRoi()
+        if (shouldShow == (roiView != null)) return
+        // ★ 必须切到主线程再加/删覆盖层：addView 要求调用线程有 Looper，
+        //   而本函数是 refreshStatus() 的后台线程调过来的 ——
+        //   否则报 "Can't create handler inside thread ... Looper.prepare()"（实机日志里就是这个）
+        ui.post {
+            if (shouldShow && roiView == null) addRoi()
+            else if (!shouldShow && roiView != null) removeRoi()
+        }
     }
 
     /**
@@ -675,6 +680,11 @@ class OverlayService : Service() {
         if (pickView != null) { stopPick(); return }
         slotPickTarget = -1
         val v = PickView(this)
+        // ★ 带上已有点启动：采集是**接着采**，不是从头覆盖。
+        //   之前从空开始，采两下点「完成」就把已标定好的 4 个技能位冲掉了 ——
+        //   实机日志里就出现了"提示说下一个是菜单、采完只剩 2 个点、引擎报缺技能坐标"。
+        //   要从头重采，先点「清点」。
+        v.points.addAll(lastPicks)
         v.onPick = { idx, nx, ny ->
             LogBus.emit("采点 $idx: [%.4f, %.4f]".format(nx, ny))
         }
@@ -699,11 +709,11 @@ class OverlayService : Service() {
                 panel?.let { pnl -> panelParams?.let { pp -> runCatching { wm.addView(pnl, pp) } } }
                 val next = pickName(lastPicks.size)
                 LogBus.emit(
-                    "采点模式：已开启 —— 当前已有 ${lastPicks.size} 个点，" +
-                        "下一个是「$next」（顺序：技能1-4 → 菜单 → 自由市场 → 传送点）；" +
-                        "点完点画面下方的「完成采点」"
+                    "采点模式：已开启 —— 已有 ${lastPicks.size} 个点，接着采第 ${lastPicks.size + 1} 个「$next」" +
+                        "（顺序：技能1-4 → 菜单 → 自由市场 → 传送点）；" +
+                        "点完点画面下方的「完成采点」；要从头重采请先点「清点」"
                 )
-                flashStatus("采点：下一个是「$next」（已有 ${lastPicks.size} 个）")
+                flashStatus("采点：接着采「$next」（已有 ${lastPicks.size} 个）")
             }
             .onFailure { LogBus.emit("采点层添加失败: ${it.message}") }
     }
