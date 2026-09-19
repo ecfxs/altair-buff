@@ -425,6 +425,19 @@ class Management(private val ctx: Context, private val sh: RootShell) {
                 .edit().putBoolean("autoFreeMarket", on).apply()
             msgs += "回城模式（自动进自由市场）= ${if (on) "开" else "关"}"
         }
+        // 原地走动参数（群控台下发覆盖设备本地值；越界回落到默认）
+        if (o.has("strollHoldMs")) {
+            MarketFlow.strollHoldMs = o.optLong("strollHoldMs", 600L).coerceIn(100L, 10_000L)
+            msgs += "走动时长 = ${MarketFlow.strollHoldMs}ms"
+        }
+        if (o.has("strollJitterMs")) {
+            MarketFlow.strollJitterMs = o.optLong("strollJitterMs", 30L).coerceIn(0L, 1_000L)
+            msgs += "走动抖动 = ±${MarketFlow.strollJitterMs}ms"
+        }
+        if (o.has("strollPressGapMs")) {
+            MarketFlow.strollPressGapMs = o.optLong("strollPressGapMs", 100L).coerceIn(30L, 2_000L)
+            msgs += "连发间隔 = ${MarketFlow.strollPressGapMs}ms"
+        }
         o.optString("notes", "").takeIf { it.isNotBlank() }?.let { msgs += "notes: $it" }
         if (msgs.isEmpty()) msgs += "(配置里没有本版本认识的字段)"
         return msgs

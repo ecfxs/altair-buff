@@ -1209,6 +1209,12 @@ export interface components {
             notes?: string;
             /** @description 每轮补完 BUFF 后自动进自由市场等待并走到出口待命（回城模式） */
             autoFreeMarket?: boolean;
+            /** @description 原地走动每腿时长（毫秒），默认 600 */
+            strollHoldMs?: number;
+            /** @description 原地走动时长抖动 ±毫秒，默认 30 */
+            strollJitterMs?: number;
+            /** @description 原地走动连发按键间隔（毫秒），默认 100 */
+            strollPressGapMs?: number;
         };
         DeviceConfigEnvelope: components["schemas"]["DeviceConfig"] & {
             desired?: components["schemas"]["DesiredState"];

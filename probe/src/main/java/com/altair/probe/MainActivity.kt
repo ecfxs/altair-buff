@@ -55,6 +55,12 @@ class MainActivity : Activity() {
     private lateinit var urlField: EditText
     private lateinit var autoChk: CheckBox
     private lateinit var forceChk: CheckBox
+    private var versionTv: TextView? = null
+
+    private lateinit var strollHold: EditText
+    private lateinit var strollJitter: EditText
+    private lateinit var strollGap: EditText
+
     private lateinit var mgmtField: EditText
     private lateinit var mgmtToken: EditText
     private lateinit var mgmtChk: CheckBox
@@ -146,7 +152,7 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
         }
-        pages = listOf(buildRunPage(), buildSettingsPage(), buildLogPage())
+        pages = listOf(buildRunPage(), buildSettingsPage(), buildMgmtPage(), buildLogPage())
         pages.forEach { container.addView(it) }
         root.addView(container)
         setContentView(root)
@@ -158,14 +164,15 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.parseColor("#151A21"))
             setPadding(dp(6), dp(6), dp(6), dp(6))
         }
-        tabButtons = listOf("运行", "设置", "日志").mapIndexed { i, name ->
+        // 4 个分页：集控与更新单独一页（用户要求）
+        tabButtons = listOf("运行", "设置", "集控", "日志").mapIndexed { i, name ->
             TextView(this).apply {
                 text = name
                 gravity = Gravity.CENTER
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
                 setPadding(0, dp(9), 0, dp(9))
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                    .apply { marginEnd = if (i < 2) dp(6) else 0 }
+                    .apply { marginEnd = if (i < 3) dp(6) else 0 }
                 setOnClickListener { switchTab(i) }
             }
         }
@@ -181,7 +188,7 @@ class MainActivity : Activity() {
             b.setBackgroundColor(Color.parseColor(if (on) "#2563EB" else "#1B2028"))
             b.setTextColor(Color.parseColor(if (on) "#FFFFFF" else "#8FA3B8"))
         }
-        if (i == 2) logScroll.post { if (autoScroll) logScroll.fullScroll(View.FOCUS_DOWN) }
+        if (i == 3) logScroll.post { if (autoScroll) logScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
     // ============================================================ 运行页
@@ -268,7 +275,10 @@ class MainActivity : Activity() {
                 append("采集点   : ").append(pts.size).append(" 个")
                 if (pts.size >= 4) append("（技能键已就绪）")
             }
-            runOnUiThread { runStatus.text = txt }
+            runOnUiThread {
+                runStatus.text = txt
+                versionTv?.text = versionText()   // 目标游戏/集控开关可能变了
+            }
             }.onFailure {
                 LogBus.emit("刷新运行状态失败：${it.javaClass.simpleName}: ${it.message}")
             }
@@ -319,7 +329,7 @@ class MainActivity : Activity() {
             return
         }
         Engine.start(this)
-        switchTab(2)
+        switchTab(3)   // 日志页现在是第 4 个
         refreshRunStatus()
     }
 
@@ -426,6 +436,65 @@ class MainActivity : Activity() {
             "用当前前台标定" to { calibrateTarget() }
         ))
 
+        // ---------- 原地走动 ----------
+        // 用户要求：走动时长要能在**软件界面**里设置（群控台也能下发，下发会覆盖这里的值）
+        c.addView(section("原地走动（补 BUFF 前左右各走一次）"))
+        strollHold = EditText(this).apply {
+            hint = "每腿时长（毫秒），默认 600"
+            setText(MarketFlow.strollHoldMs.toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+            styleEdit()
+        }
+        c.addView(strollHold)
+        strollJitter = EditText(this).apply {
+            hint = "时长抖动 ±毫秒，默认 30"
+            setText(MarketFlow.strollJitterMs.toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+            styleEdit()
+        }
+        c.addView(strollJitter)
+        strollGap = EditText(this).apply {
+            hint = "连发按键间隔（毫秒），默认 100"
+            setText(MarketFlow.strollPressGapMs.toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+            styleEdit()
+        }
+        c.addView(strollGap)
+        c.addView(buttonRow("保存原地走动" to { saveStroll() }))
+        c.addView(note("走法跟随触发方式：触摸 → 左下角摇杆；键盘 → 方向键。" +
+            "群控台也能下发这三项，下发值会覆盖这里的本地设置。"))
+
+        return sv
+    }
+
+    // ============================================================ 集控与更新页
+
+    /**
+     * 集控与更新单独成页（用户要求）。
+     *
+     * 单独一页的理由：这两块都是"设备接进群控体系"的一次性配置，
+     * 和日常要看/要调的东西（运行状态、技能键、走动）混在一页里，翻找成本高。
+     * 页首固定显示**软件版本**，方便对版本号排查问题。
+     */
+    private fun buildMgmtPage(): View {
+        val sv = ScrollView(this)
+        val c = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+        }
+        sv.addView(c)
+
+        // ---------- 版本（用户要求：这一页要显示软件版本）----------
+        c.addView(card(
+            "软件版本",
+            TextView(this).apply {
+                versionTv = this
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(Color.parseColor("#C9D4E0"))
+                text = versionText()
+            }
+        ))
+
         // ---------- 集控 ----------
         c.addView(section("集控（多设备统一管理）"))
         mgmtField = EditText(this).apply {
@@ -486,6 +555,27 @@ class MainActivity : Activity() {
         c.addView(note("实测 GitHub 直连在国内经常不通，自更新会自动在 " +
             "gh-proxy → ghfast → GitHub → jsDelivr 之间切换。"))
         return sv
+    }
+
+    /** 版本信息文案（页首卡片 + 需要时刷新）。 */
+    private fun versionText(): String =
+        "阿尔泰挂机 v${updater.currentVersionName()}（versionCode ${updater.currentVersionCode()}）\n" +
+            "集控协议 v1 · 包名 $packageName\n" +
+            "目标游戏 ${OverlayService.targetPkgOf(this)} · " +
+            (if (mgmt.enabled) "集控已启用" else "集控未启用")
+
+    /** 保存原地走动参数。 */
+    private fun saveStroll() {
+        MarketFlow.strollHoldMs =
+            strollHold.text.toString().toLongOrNull()?.coerceIn(100L, 10_000L) ?: 600L
+        MarketFlow.strollJitterMs =
+            strollJitter.text.toString().toLongOrNull()?.coerceIn(0L, 1_000L) ?: 30L
+        MarketFlow.strollPressGapMs =
+            strollGap.text.toString().toLongOrNull()?.coerceIn(30L, 2_000L) ?: 100L
+        val msg = "原地走动已保存：每腿 ${MarketFlow.strollHoldMs}ms（±${MarketFlow.strollJitterMs}ms），" +
+            "连发间隔 ${MarketFlow.strollPressGapMs}ms"
+        log(msg)
+        toast(msg)
     }
 
     // ============================================================ 日志页
@@ -689,7 +779,7 @@ class MainActivity : Activity() {
                 }
                 OverlayService.start(this)
                 log("悬浮控制台已启动（面板只含 ROI 与技能键点击）。")
-                switchTab(2)
+                switchTab(3)   // 日志页现在是第 4 个
                 refreshRunStatus()
             }
         }.apply { isDaemon = true }.start()

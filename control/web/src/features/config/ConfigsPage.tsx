@@ -279,6 +279,62 @@ export function ConfigsPage() {
               }
             />
           </div>
+
+          {/* 原地走动：补 BUFF 前左右各走一次（设备界面也能改，这里下发会覆盖设备本地值） */}
+          <div className="mt-3 rounded-ctl border border-line bg-inset px-3 py-2">
+            <div className="mb-1 text-[12px] text-fg">原地走动（补 BUFF 前左右各走一次）</div>
+            <div className="flex flex-wrap items-center gap-3 text-[11.5px] text-muted">
+              <span className="inline-flex items-center gap-1.5">
+                每腿时长
+                <input
+                  type="number"
+                  min={100}
+                  max={10000}
+                  className="w-[74px] rounded-input border border-line-2 bg-inset px-[9px] py-1.5 text-xs text-input-fg outline-none focus:border-brand"
+                  value={form.strollHoldMs ?? 600}
+                  onChange={(e) => {
+                    setForm((f) => ({ ...f, strollHoldMs: Number.parseInt(e.target.value, 10) || 600 }));
+                    setDirty(true);
+                  }}
+                />
+                毫秒
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                抖动 ±
+                <input
+                  type="number"
+                  min={0}
+                  max={1000}
+                  className="w-[64px] rounded-input border border-line-2 bg-inset px-[9px] py-1.5 text-xs text-input-fg outline-none focus:border-brand"
+                  value={form.strollJitterMs ?? 30}
+                  onChange={(e) => {
+                    const v = Number.parseInt(e.target.value, 10);
+                    setForm((f) => ({ ...f, strollJitterMs: Number.isFinite(v) ? v : 30 }));
+                    setDirty(true);
+                  }}
+                />
+                毫秒
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                连发间隔
+                <input
+                  type="number"
+                  min={30}
+                  max={2000}
+                  className="w-[64px] rounded-input border border-line-2 bg-inset px-[9px] py-1.5 text-xs text-input-fg outline-none focus:border-brand"
+                  value={form.strollPressGapMs ?? 100}
+                  onChange={(e) => {
+                    setForm((f) => ({ ...f, strollPressGapMs: Number.parseInt(e.target.value, 10) || 100 }));
+                    setDirty(true);
+                  }}
+                />
+                毫秒
+              </span>
+              <span className="text-[10.5px] text-muted-2">
+                走法跟随触发方式：触摸→摇杆，键盘→方向键
+              </span>
+            </div>
+          </div>
         </div>
 
         <div className="col-span-full flex flex-wrap items-center gap-[9px]">

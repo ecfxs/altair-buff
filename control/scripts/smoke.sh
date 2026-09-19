@@ -135,13 +135,15 @@ echo "$R3" | grep -q '"running":false,"rev":2' && ok "设备下次上报即收�
 say "6) 配置下发与 revision 语义"
 C1="$(curl -sS -b "$JAR" -X PUT "$BASE/api/v1/panel/configs/default" \
   -H 'Content-Type: application/json' \
-  -d '{"targetPkg":"com.nexon.mod","pressMs":90,"inputMethod":"keyevent","skillPoints":[[0.74,0.56]],"buff":[{"idx":1,"enabled":true,"key":1,"durationSec":280},{"idx":2,"enabled":true,"key":2,"durationSec":480},{"idx":3,"enabled":false,"key":3,"durationSec":280}],"notes":"冒烟验收","autoFreeMarket":true}')"
+  -d '{"targetPkg":"com.nexon.mod","pressMs":90,"inputMethod":"keyevent","skillPoints":[[0.74,0.56]],"buff":[{"idx":1,"enabled":true,"key":1,"durationSec":280},{"idx":2,"enabled":true,"key":2,"durationSec":480},{"idx":3,"enabled":false,"key":3,"durationSec":280}],"notes":"冒烟验收","autoFreeMarket":true,"strollHoldMs":800,"strollJitterMs":45,"strollPressGapMs":120}')"
 REV="$(echo "$C1" | sed -n 's/.*"revision":"\(r[0-9]*\)".*/\1/p')"
 [[ -n "$REV" ]] && ok "服务端生成 revision=$REV" || bad "没有 generation revision: $C1"
 
 CFG="$(curl -sS -X GET "$BASE/api/v1/device/config?deviceId=manual01" -H "X-Altair-Token: $TOKEN")"
 echo "$CFG" | grep -q '"durationSec":480' && ok "设备拉到新配置（BUFF2 时长 480 秒）" || bad "设备配置不对: $CFG"
 echo "$CFG" | grep -q '"durationMin":8' && ok "同时下发 durationMin=8（兼容老读者）" || bad "缺 durationMin 兼容字段: $CFG"
+echo "$CFG" | grep -q '"strollHoldMs":800' && ok "走动时长随配置下发（800ms）" || bad "走动参数没下发: $CFG"
+echo "$CFG" | grep -q '"strollJitterMs":45' && ok "走动抖动随配置下发（45ms）" || bad "抖动参数没下发: $CFG"
 echo "$CFG" | grep -q '"autoFreeMarket":true' && ok "回城模式开关随配置下发到设备" || bad "设备没收到 autoFreeMarket: $CFG"
 echo "$CFG" | grep -q "$REV" && ok "设备侧 revision 与面板一致" || bad "revision 不一致"
 

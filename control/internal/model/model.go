@@ -74,14 +74,29 @@ type Config struct {
 	// AutoFreeMarket：每轮补完 BUFF 后自动回自由市场等待（并走到出口待命）。
 	// 设计依据见详细设计 6.7「回城模式」。默认关 —— 它涉及地图切换，风险比原地等待高。
 	AutoFreeMarket bool `json:"autoFreeMarket"`
+
+	// 原地走动参数（补 BUFF 前左右各走一次）。设备界面与群控台都能改，群控台下发覆盖设备本地值。
+	StrollHoldMs     int `json:"strollHoldMs"`     // 每腿持续时长（毫秒），默认 600
+	StrollJitterMs   int `json:"strollJitterMs"`   // 时长抖动 ±毫秒，默认 30
+	StrollPressGapMs int `json:"strollPressGapMs"` // 连发按键间隔（毫秒），默认 100
 }
+
+// 原地走动的默认值与取值范围（设备端 MarketFlow 用同一组默认值）。
+const (
+	DefaultStrollHoldMs     = 600
+	DefaultStrollJitterMs   = 30
+	DefaultStrollPressGapMs = 100
+)
 
 // DefaultConfig 与旧实现保持一致的初始值。
 func DefaultConfig() Config {
 	return Config{
-		TargetPkg:   "com.nexon.mod",
-		PressMs:     90,
-		SkillPoints: [][]float64{},
+		TargetPkg:        "com.nexon.mod",
+		PressMs:          90,
+		StrollHoldMs:     DefaultStrollHoldMs,
+		StrollJitterMs:   DefaultStrollJitterMs,
+		StrollPressGapMs: DefaultStrollPressGapMs,
+		SkillPoints:      [][]float64{},
 		InputMethod:    "keyevent",
 		AutoFreeMarket: false,
 		Buff: []Buff{

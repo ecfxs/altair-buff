@@ -563,6 +563,16 @@ func normalizeConfig(c model.Config) model.Config {
 	if c.InputMethod != "touch" {
 		c.InputMethod = "keyevent"
 	}
+	// 原地走动参数：越界/缺省都回落到默认值（设备端也做一次，双保险）
+	if c.StrollHoldMs < 100 || c.StrollHoldMs > 10000 {
+		c.StrollHoldMs = model.DefaultStrollHoldMs
+	}
+	if c.StrollJitterMs < 0 || c.StrollJitterMs > 1000 {
+		c.StrollJitterMs = model.DefaultStrollJitterMs
+	}
+	if c.StrollPressGapMs < 30 || c.StrollPressGapMs > 2000 {
+		c.StrollPressGapMs = model.DefaultStrollPressGapMs
+	}
 	if c.PressMs <= 0 || c.PressMs > 5000 {
 		c.PressMs = 90
 	}
