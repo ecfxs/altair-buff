@@ -141,6 +141,14 @@ class OverlayService : Service() {
     /** 正在标注的槽位（null = 没在标注）。 */
     private var pickSlot: String? = null
 
+    /**
+     * 连续标注的待标队列。
+     *
+     * 空 = 单点标注（标完一项就回面板）；非空 = 连续模式，标完一项自动弹出下一项的采点层。
+     * 用户点「连续标技能 1→4」时填 [Picks.SKILLS]，所以顺序天然就是 1→2→3→4。
+     */
+    private val pickQueue = ArrayDeque<String>()
+
     private var targetPkg: String = "com.nexon.mod"
     private var lastFg: String = "?"
 
@@ -559,33 +567,52 @@ class OverlayService : Service() {
         content.addView(headerRow(annoHeader, annoCount))
         content.addView(annoBody)
 
+        // ---- 标注按钮：一行 3 键的网格（紧凑）----
+        // 原来技能 4 个挤一行 + 跳跃轮盘各占整行 = 3 行高度，且 4 个按钮每个只有 ~45dp 宽。
+        // 改成一行 3 个、6 项排满 2 行：更省纵向空间，单个按钮也更宽好点。
         slotBtns.clear()
-        fun addSlotBtn(slot: String) {
-            val b = overlayBtn(("○ ") + Picks.label(slot), fill = Ui.BG, border = Ui.BORDER) {
-                startSlotPick(slot)
+        val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        Picks.ALL.chunked(3).forEach { rowSlots ->
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            rowSlots.forEach { slot ->
+                val b = overlayBtn(("○ ") + Picks.label(slot), fill = Ui.BG, border = Ui.BORDER,
+                    heightDp = 30, compact = true) { startSlotPick(slot) }
+                // ★ 长按 = 从这一颗起连续标注（技能3 → 3、4）
+                b.setOnLongClickListener {
+                    if (slot in Picks.SKILLS) {
+                        startSkillSequence(slot)
+                        true
+                    } else {
+                        LogBus.emit("连续标注只对「技能1..4」有效")
+                        false
+                    }
+                }
+                (b.layoutParams as LinearLayout.LayoutParams).apply {
+                    marginEnd = dp(2)
+                    bottomMargin = dp(2)
+                }
+                slotBtns[slot] = b
+                row.addView(b)
             }
-            slotBtns[slot] = b
-            annoBody.addView(b)
-        }
-        // 技能 1-4 排一行（面板窄，尽量省纵向空间）
-        val skillRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        Picks.SKILLS.forEach { s ->
-            val b = overlayBtn("○ " + Picks.label(s), fill = Ui.BG, border = Ui.BORDER, heightDp = 36) {
-                startSlotPick(s)
+            // 补齐空位，保证最后一行按钮宽度与上一行对齐
+            repeat(3 - rowSlots.size) {
+                row.addView(View(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, dp(30), 1f).apply { marginEnd = dp(2) }
+                })
             }
-            b.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9f)
-            (b.layoutParams as LinearLayout.LayoutParams).marginEnd = dp(3)
-            slotBtns[s] = b
-            skillRow.addView(b)
+            grid.addView(row)
         }
-        annoBody.addView(skillRow)
-        addSlotBtn(Picks.JUMP)
-        addSlotBtn(Picks.JOYSTICK)
+        annoBody.addView(grid)
+
+        // 「连续标技能」主入口：面板上直接可见，不用去摸长按
+        annoBody.addView(overlayBtn("▶ 连续标技能 1→4", fill = Ui.SURFACE_2, border = Ui.PRIMARY,
+            heightDp = 30, compact = true) { startSkillSequence(Picks.SKILL1) })
 
         cancelPickBtn = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             visibility = View.GONE
-            addView(overlayBtn("✕ 取消标注", fill = Ui.SURFACE_2, border = Ui.BORDER) { cancelSlotPick() })
+            addView(overlayBtn("✕ 取消标注", fill = Ui.SURFACE_2, border = Ui.BORDER,
+                heightDp = 30, compact = true) { cancelSlotPick() })
         }
         annoBody.addView(cancelPickBtn)
 
@@ -698,19 +725,26 @@ class OverlayService : Service() {
         label: String,
         fill: Int,
         border: Int = 0,
-        heightDp: Int = 32,
+        heightDp: Int = 28,
+        compact: Boolean = false,
         onClick: () -> Unit
     ): TextView = TextView(this).apply {
         text = label
         gravity = Gravity.CENTER
-        setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5f)
+        setTextSize(TypedValue.COMPLEX_UNIT_DIP, if (compact) 9f else 10f)
         setTextColor(Ui.TEXT)
+        setPadding(dp(2), 0, dp(2), 0)
         background = Ui.ripple(this@OverlayService, Ui.shape(
             this@OverlayService, fill, Ui.RADIUS_CTRL, border), Ui.RADIUS_CTRL)
         isClickable = true
-        layoutParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, dp(heightDp)
-        ).apply { bottomMargin = dp(4) }
+        if (compact) {
+            // 网格里由父容器赋权重平分宽度
+            layoutParams = LinearLayout.LayoutParams(0, dp(heightDp), 1f)
+        } else {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(heightDp)
+            ).apply { bottomMargin = dp(3) }
+        }
         setOnClickListener { onClick() }
     }
 
@@ -857,27 +891,54 @@ class OverlayService : Service() {
                 pickView = v
                 pickSlot = slot
 
-                // 采点层的提示条会盖住球，把球挪到不被"完成"按钮压住的地方没意义，
-                // 这里不动球 —— 采点期间用户看到的是游戏画面 + 十字准星。
-                val msg = "标注「${Picks.label(slot)}」：点画面上那个位置，再点下方「完成」"
+                // 连续模式下把进度说清楚，用户才知道还剩几项、点完会不会自动接上下一项
+                val msg = if (pickQueue.isNotEmpty()) {
+                    "连续标注 ${Picks.SKILLS.indexOf(slot) + 1}/${Picks.SKILLS.size}：" +
+                        "点画面上「${Picks.label(slot)}」的位置（点完自动接下一项）"
+                } else {
+                    "标注「${Picks.label(slot)}」：点画面上那个位置，再点下方「完成」"
+                }
                 LogBus.emit(msg)
             }
             .onFailure {
                 pickView = null
                 pickSlot = null
+                pickQueue.clear()
                 LogBus.emit("标注层添加失败：${it.message}")
                 ui.post { showPanel() }
             }
     }
 
-    /** 用户主动取消标注（面板上的按钮）。采到一半也能退。 */
+    /**
+     * 连续标注：从 [from] 开始，按 [Picks.SKILLS] 的顺序一路标下去（技能1→2→3→4）。
+     *
+     * 队列填好后立刻开始第一项；之后每标完一项，[finishSlotPick] 会自动弹下一项，
+     * 用户只要在游戏画面上连点四个技能图标就行，不用来回切面板。
+     *
+     * 为了省一次点击，「连续标技能」默认从技能1 开始；从技能3 起标就长按那颗按钮。
+     */
+    private fun startSkillSequence(from: String) {
+        val start = Picks.SKILLS.indexOf(from)
+        if (start < 0) return
+        pickQueue.clear()
+        Picks.SKILLS.drop(start).forEach { pickQueue.addLast(it) }
+        LogBus.emit("连续标注开始：${Picks.SKILLS.drop(start).joinToString(" → ") { Picks.label(it) }}")
+        startSlotPick(pickQueue.removeFirst())
+    }
+
+    /** 用户主动取消标注（面板上的按钮）。采到一半也能退，连续模式下会中止整个队列。 */
     private fun cancelSlotPick() {
         val v = pickView ?: return
         val slot = pickSlot          // 先取出来，下面会被清空
         runCatching { wm.removeView(v) }
         pickView = null
         pickSlot = null
-        LogBus.emit("已取消标注，「${slot?.let { Picks.label(it) } ?: "该项"}」未改动")
+        val wasSequence = pickQueue.isNotEmpty()
+        pickQueue.clear()
+        LogBus.emit(
+            "已取消标注，「${slot?.let { Picks.label(it) } ?: "该项"}」未改动" +
+                if (wasSequence) "；连续标注已中止" else ""
+        )
         flashStatus("已取消标注")
         showPanel()
     }
@@ -885,8 +946,13 @@ class OverlayService : Service() {
     /**
      * 结束标注的收尾（三条退出路径共用）。
      *
-     * 无论成功、没采到、还是用户取消，**都要回到展开面板** —— 用户下一步八成是标别的槽位，
-     * 回到球上他还得再点一次。
+     * ## 连续模式
+     * 队列里还有下一项 → **直接弹出下一项的采点层**，用户不用回面板。
+     * 这是"连续标 1/2/3/4"的实现：队列在 [startSkillSequence] 里填好，
+     * 每标完一项这里自动推进，直到队列空。
+     *
+     * ## 单点模式
+     * 队列为空 → 回到展开面板（用户下一步八成是标别的槽位，回球上还得再点一次）。
      */
     private fun finishSlotPick() {
         val v = pickView ?: return
@@ -899,17 +965,27 @@ class OverlayService : Service() {
         if (slot == null) {
             // 理论上不会走到这（标注一定会带槽位），兜底只记日志
             LogBus.emit("标注结束：没有目标槽位，已丢弃")
+            pickQueue.clear()
         } else if (p == null) {
-            LogBus.emit("⚠ 没采到点，「${Picks.label(slot)}」未改动")
+            // 没采到就直接中断连续模式 —— 否则会一路空弹下去，用户不知道发生了什么事
+            LogBus.emit("⚠ 没采到点，「${Picks.label(slot)}」未改动；连续标注已中止")
+            pickQueue.clear()
         } else {
             Picks.set(this, slot, p.first, p.second)
             LogBus.emit(String.format(
                 Locale.US, "✅ %s 已保存 = [%.4f, %.4f]",
                 Picks.label(slot), p.first, p.second
             ))
-            LogBus.emit("   全部标注：\n" + Picks.describe(this))
+            if (pickQueue.isEmpty()) LogBus.emit("   全部标注：\n" + Picks.describe(this))
         }
-        showPanel()      // 采完回到展开面板，方便连续标下一项
+
+        // 连续模式：还有下一项就接着标，不回面板
+        val next = pickQueue.removeFirstOrNull()
+        if (next != null) {
+            ui.post { startSlotPick(next) }
+            return
+        }
+        showPanel()      // 采完回到展开面板
     }
 
     // ------------------------------------------------------------ 标点回显

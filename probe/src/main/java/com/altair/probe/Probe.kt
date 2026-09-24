@@ -224,11 +224,30 @@ class Probe(
         val cy = (centerY * h).toInt().coerceIn(0, h - 1)
         val mx = (moveX * w).toInt().coerceIn(0, w - 1)
         val my = (moveY * h).toInt().coerceIn(0, h - 1)
-        val sec = "%.2f".format(holdMs / 1000.0)
-
         fun swipeCmd() = "input swipe $cx $cy $mx $my $holdMs"
-        fun meCmd() =
-            "input motionevent DOWN $cx $cy; input motionevent MOVE $mx $my; sleep $sec; input motionevent UP $mx $my"
+
+        // ★ 保持期间必须**持续补发 MOVE**，这是走位能不能动的关键。
+        //
+        //   游戏引擎在每次 MotionEvent 到来时才更新摇杆的方向与幅度。只发一次 MOVE 然后 sleep，
+        //   中间这段时间没有任何事件 —— 摇杆等于被"点"了一下就松开，角色几乎不动。
+        //   所以要保持，就必须把 MOVE 铺满整个 holdMs。
+        //
+        //   但每次 `input` 都要起一个 app_process（实测单条 ~30ms），帧数不能随便加：
+        //   2400ms 若按 12ms 一帧要 200 条，光进程开销就 6 秒，整段手势被撑到 8 秒以上。
+        //   这里取**有界**帧数，并把每次的 ~30ms 固有开销从 sleep 里扣掉，
+        //   使整段手势的墙钟时长仍然 ≈ holdMs（否则 1:2:1 的对称性会被开销撑坏）。
+        val perCallMs = 30L
+        val frames = (holdMs / 120L).coerceIn(2L, 20L).toInt()
+        val sleepMs = (holdMs - frames * perCallMs).coerceAtLeast(0L) / frames
+        fun meCmd(): String = buildString {
+            append("input motionevent DOWN $cx $cy; ")
+            append("input motionevent MOVE $mx $my; ")
+            if (sleepMs > 0) {
+                val s = "%.3f".format(sleepMs / 1000.0)
+                repeat(frames) { append("sleep $s; input motionevent MOVE $mx $my; ") }
+            }
+            append("input motionevent UP $mx $my")
+        }
 
         // 明确的 swipe 档位直接走兜底
         if (method == "swipe") {
@@ -236,11 +255,17 @@ class Probe(
             return "摇杆(swipe) ($cx,$cy)→($mx,$my) ${holdMs}ms  ${ms}ms ${err.take(40)}"
         }
 
-        val (ms, err) = sh.timedExec(meCmd(), (8000 + holdMs).toLong())
+        // 超时要把串行的 input 开销算进去，否则会被中途掐断
+        // （表现是"走到一半突然松手"，而且日志里看不出是超时）。
+        // 命令构成：DOWN + MOVE + (sleep + MOVE) × frames + UP
+        val inputCount = 2 + frames + 1
+        val meTimeout = 4000L + holdMs + inputCount * perCallMs
+        val (ms, err) = sh.timedExec(meCmd(), meTimeout)
         val failed = err.contains("not found", true) || err.contains("Unknown", true) ||
             err.contains("Error", true) || err.contains("inaccessible", true)
         if (!failed) {
-            return "摇杆(motionevent) ($cx,$cy)→($mx,$my) 保持 ${holdMs}ms  ${ms}ms ${err.take(40)}"
+            return "摇杆(motionevent) ($cx,$cy)→($mx,$my) 保持 ${holdMs}ms（${frames} 帧）" +
+                "  ${ms}ms ${err.take(40)}"
         }
         // 该机型的 input 没有 motionevent 子命令 → 退回 swipe
         val (ms2, err2) = sh.timedExec(swipeCmd(), (8000 + holdMs).toLong())
