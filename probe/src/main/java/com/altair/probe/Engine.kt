@@ -1,32 +1,32 @@
 package com.altair.probe
 
 import android.content.Context
-import org.json.JSONArray
-import org.json.JSONObject
+import java.util.Locale
 
 /**
  * 挂机引擎
  * ========
  *
- * 这是主功能本体：按配置的周期，定时给角色补 BUFF。
- *
- * ## 状态机
+ * 只做两件事，而且是**两套互相独立的计时器**（用户指定）：
  * ```
- *   IDLE ──start()──▶ WAITING ──到点──▶ CASTING ──成功──▶ WAITING（下一轮）
- *     ▲                  │                  │
- *     └────── stop() ────┴──── 失败重试后 ───┴──▶ ERROR（熔断，等人工）
+ *   ① 补 BUFF：4 个槽位各自计时，到点就点对应的技能图标
+ *              槽位周期 = 该槽填的时长 × 0.94（留 6% 余量吸收抖动与卡顿）
+ *   ② 原地走位：独立的间隔计时器（默认 15 分钟），到点走 1:2:1 三段 + 跳一下
  * ```
+ * 两者**启动时都立即执行一次**（用户要求）：点完启动马上能看到动作，
+ * 而不是干等 15 分钟看不出到底有没有生效。
  *
- * ## 两条安全约束
- * 1. **前台门禁**：只有目标游戏在前台才执行。否则跳过本轮并记日志 ——
- *    无人值守时最危险的失败就是"在错误的界面上乱点"。
- * 2. **失败熔断**：连续失败 N 次就停下来等人工，绝不死循环重试。
+ * ## 启动那一刻的执行顺序
+ * 两者同时到点，实际顺序是**先补 BUFF、再走位** —— 补 BUFF 是主功能，先把它做掉；
+ * 即使随后走位出问题，BUFF 也已经补上了。
  *
- * ## 输入方式可切换
- * 技能键到底走键盘还是触摸，实测一直没定论。所以做成配置项：
- *   keyevent —— `input keyevent 8/9/10/11`（需要游戏绑定数字键）
- *   touch    —— 在采集到的技能键坐标上 `input swipe`（需要先采点）
- * 引擎只调 `pressSkill(i)`，底下走哪条路由配置决定，换方式不用改引擎。
+ * ## 两条安全约束（沿用历史设计，都是踩过坑换来的）
+ * 1. **前台门禁**：只有目标游戏在前台才动手。无人值守时最危险的失败是"在错误的界面上乱点"。
+ * 2. **失败熔断**：同一个槽位连续失败 3 次就停下等人工，绝不死循环猛点。
+ *
+ * ## 输入通道
+ * 只剩触摸这一条。技能图标 / 跳跃 / 轮盘的坐标全部来自 [Picks]（用户手动标注）。
+ * 键盘通道（`input keyevent`）已随简化删除 —— 数字键在野外实测无响应，留着只是复杂度。
  */
 object Engine {
 
@@ -34,17 +34,34 @@ object Engine {
 
     @Volatile var state: State = State.IDLE
         private set
-    @Volatile var nextDueAt: Long = 0L
+
+    /** 下一个 BUFF 到点时刻（4 个槽位里最早的），供界面倒计时。 */
+    @Volatile var nextBuffDueAt: Long = 0L
         private set
-    @Volatile var lastCastAt: Long = 0L
+
+    /** 下一次原地走位到点时刻，供界面倒计时。 */
+    @Volatile var nextWalkDueAt: Long = 0L
         private set
-    @Volatile var cycleCount: Int = 0
+
+    /** 累计补 BUFF 次数（按槽位计，不是"轮"）。 */
+    @Volatile var buffCastCount: Int = 0
         private set
+
+    /** 累计走位次数。 */
+    @Volatile var walkCount: Int = 0
+        private set
+
+    /** 当前连续失败次数（取所有槽位的最大值）。 */
     @Volatile var failStreak: Int = 0
         private set
+
     @Volatile var lastError: String = ""
         private set
+
     @Volatile var lastResult: String = ""
+        private set
+
+    @Volatile var lastWalkResult: String = ""
         private set
 
     private var ctx: Context? = null
@@ -54,139 +71,138 @@ object Engine {
     /** 连续失败多少次就熔断。 */
     private const val FAIL_LIMIT = 3
 
-    /** BUFF 之间的间隔（毫秒）——排队释放，用户指定 1.5 秒。 */
+    /** BUFF 之间的排队间隔：槽位同时到点时，别一瞬间点完 4 个（用户指定 1.5 秒）。 */
     private const val BUFF_GAP_MS = 1500L
 
-    /** 原地走动是否每轮都做。默认 false：用户指定"启动时走一次，之后不必再走"。 */
-    private fun strollEveryRound(): Boolean =
-        buffPrefs()?.getBoolean("strollEveryRound", false) ?: false
+    /** 前台不是游戏时的重看间隔（不是错误，只是时机不对）。 */
+    private const val FORE_SKIP_RETRY_MS = 30_000L
 
-    /** 本次运行是否已经走过一次（首轮走动，后续轮次跳过）。 */
-    @Volatile private var strolledThisRun = false
+    /** 还没跑过任何动作时的短重试间隔（用户正在切回游戏）。 */
+    private const val FIRST_RETRY_MS = 5_000L
+
+    /** 走位失败后的重试间隔（不必等一整个 15 分钟）。 */
+    private const val WALK_RETRY_MS = 60_000L
+
+    /** 默认 BUFF 时长（秒）。 */
+    const val DEFAULT_DUR_SEC = 280
+
+    /** 每槽位下一次到点时刻（下标 = 槽位 0..3）。0 表示未排期。 */
+    private val dueAt = LongArray(Picks.SKILL_COUNT)
+
+    /** 每槽位连续失败次数。 */
+    private val failAt = IntArray(Picks.SKILL_COUNT)
+
+    private var walkDueAt = 0L
+
+    /** 全局静默截止时刻（前台门禁跳过时用）。 */
+    private var retryAt = 0L
 
     // ------------------------------------------------------------ 配置读取
 
     private fun buffPrefs(): android.content.SharedPreferences? =
         ctx?.getSharedPreferences("buff", Context.MODE_PRIVATE)
 
-    /** 默认 BUFF 时长（秒）。 */
-    const val DEFAULT_DUR_SEC = 280
-
-    data class BuffCfg(val idx: Int, val enabled: Boolean, val key: Int, val durSec: Int)
+    data class BuffSlot(val idx: Int, val enabled: Boolean, val durSec: Int)
 
     /**
-     * BUFF 配置。**时长单位是秒**（用户要求：设置界面从分钟改成秒，默认 280 秒）。
+     * BUFF 配置（4 个槽位）。
      *
-     * 键名用 `durSec$i` 而不是复用 `dur$i` —— 旧键存的是**分钟**，
+     * 时长单位是**秒**。键名用 `durSec$i` 而不是复用 `dur$i` —— 旧键存的是**分钟**，
      * 复用同一个键会把"5 分钟"读成"5 秒"（这种单位串台比报错更难查）。
      * 旧值做一次迁移：`dur$i`（分钟）× 60。
+     *
+     * 上下文没注入时返回空列表，**绝不抛异常** —— 界面启动时就要读它，
+     * 这里一崩就是整个 App 崩（后台线程里的未捕获异常会带走进程）。
      */
-    fun buffConfig(): List<BuffCfg> {
-        // 上下文没注入时返回空配置，**绝不抛异常** —— 界面启动时就要读它算周期，
-        // 这里一崩就是整个 App 崩（后台线程里的未捕获异常会带走进程）。
+    fun buffConfig(): List<BuffSlot> {
         val sp = buffPrefs() ?: return emptyList()
-        return (0 until 3).map { i ->
+        return (0 until Picks.SKILL_COUNT).map { i ->
             val sec = sp.getInt("durSec$i", -1).let { v ->
                 if (v > 0) v else sp.getInt("dur$i", 0).takeIf { it > 0 }?.times(60) ?: DEFAULT_DUR_SEC
             }
-            BuffCfg(
+            BuffSlot(
                 idx = i,
+                // 默认只勾第一个：避免装好后没配就一口气点 4 个技能
                 enabled = sp.getBoolean("enabled$i", i == 0),
-                key = sp.getInt("key$i", i),
-                durSec = sec
+                durSec = sec.coerceIn(10, 86_400)
             )
         }
     }
 
-    /** 回城模式：补完 BUFF 自动进自由市场等待（配置项 autoFreeMarket，默认关）。 */
-    private fun autoFreeMarket(): Boolean =
-        buffPrefs()?.getBoolean("autoFreeMarket", false) ?: false
-
-    /** 当前是否停在自由市场里。只在本进程内维护 —— 重启后按"未知"处理，下一轮会先尝试出市场。 */
-    @Volatile private var inMarket = false
-    /** "回城模式已暂停"只提示一次，别每轮刷屏。 */
-    @Volatile private var pausedMarketNotified = false
-
-    private fun inputMethod(): String =
-        ctx?.getSharedPreferences("overlay", Context.MODE_PRIVATE)
-            ?.getString("inputMethod", "keyevent") ?: "keyevent"
-
-    /** 循环周期 = 最短 BUFF 时长（秒）× 0.94（留 6% 余量吸收抖动与卡顿）。 */
-    fun cyclePeriodMs(): Long {
-        val sec = buffConfig().filter { it.enabled }.minOfOrNull { it.durSec } ?: 0
-        return if (sec <= 0) 0L else (sec * 1000L * 0.94).toLong()
-    }
+    /** 单个槽位的补 BUFF 周期：时长 × 0.94。 */
+    fun slotPeriodMs(durSec: Int): Long = (durSec * 1000L * 0.94).toLong()
 
     // ------------------------------------------------------------ 生命周期
 
     /**
      * 注入上下文。**界面 onCreate 时就要调**。
      *
-     * 为什么必须提前调用：引擎没启动时也有代码要读配置 —— 主界面刷新状态的「周期」那一行
-     * 会走 cyclePeriodMs → buffConfig。此前 ctx 只在 start() 里赋值，于是
-     * 「更新后第一次打开」必崩：`pm install -r` 会重启进程，此时 ctx 还是 null，
-     * 而后台线程里的 NPE 会直接带走整个 App —— 而且崩在「启动引擎」之前，
-     * 所以之后每次打开都一样，用户看到的就是「一打开就闪退」。
+     * 为什么必须提前调用：引擎没启动时也有代码要读配置（主界面刷新状态的那几行），
+     * 而 `pm install -r` 会重启进程、此时 ctx 还是 null —— 后台线程里的 NPE 会直接
+     * 带走整个 App，用户看到的就是「更新后一打开就闪退」。
      */
     fun init(context: Context) {
         ctx = context.applicationContext
-        MarketFlow.init(context)
+        WalkFlow.init(context)
     }
 
     fun start(context: Context) {
-        if (running) { LogBus.emit("引擎已在运行"); return }
+        if (running) {
+            LogBus.emit("引擎已在运行")
+            return
+        }
         init(context)
-        val period = cyclePeriodMs()
-        if (period <= 0) {
-            LogBus.emit("⛔ 无法启动：没有任何 BUFF 被启用，或时长未填。请到「设置」页配置。")
-            state = State.ERROR; lastError = "没有启用任何 BUFF"
+
+        val enabled = buffConfig().filter { it.enabled }
+        if (enabled.isEmpty()) {
+            state = State.ERROR
+            lastError = "没有启用任何 BUFF"
+            LogBus.emit("⛔ 无法启动：4 个 BUFF 槽位一个都没勾选。请到「设置」页勾选要补的技能。")
             return
         }
-        val touch = inputMethod() == "touch"
-        if (touch) {
-            // 先用内置的实测技能坐标兜底：技能位是固定 UI，装好就已知，
-            // 不该因为"采集点被清空/采了一半"就拒绝启动。
-            SkillBar.ensureDefaults(context)
-        }
-        if (touch && OverlayService.pickedPointsOf(context).size < 4) {
-            LogBus.emit("⛔ 无法启动：输入方式为触摸，但技能键坐标不足 4 个（内置坐标也没能补上）。")
-            state = State.ERROR; lastError = "触摸方式但缺技能键坐标"
+        if (!Picks.skillsReady(context)) {
+            val miss = Picks.missingSkills(context).joinToString("、")
+            state = State.ERROR
+            lastError = "技能图标没标注全（缺 $miss）"
+            LogBus.emit(
+                "⛔ 无法启动：技能图标还没标注全（缺 $miss）。\n" +
+                    "   请点「启动悬浮窗」→ 切到游戏 → 依次点「标技能1..4」并点画面上对应的技能图标。"
+            )
             return
         }
-        // 回城模式先守「采点齐不齐」：宁可启动时明确拒绝，
-        // 也不要每轮都在"进不去市场"里静默失败、还把日志刷满。
-        if (autoFreeMarket()) {
-            val picks = OverlayService.pickedPointsOf(context).size
-            val need = if (MarketFlow.walkMode == "tap") 7 else 6
-            if (picks < need) {
-                LogBus.emit(
-                    "⛔ 无法启动：开了回城模式，但采点不足（当前 $picks 个，需要 $need 个：" +
-                        "技能1-4 → 菜单 → 自由市场" + (if (need == 7) " → 传送点" else "") +
-                        "）。请到悬浮窗「★采点」依次补采。"
-                )
-                state = State.ERROR; lastError = "回城模式但采点不足（$picks/$need）"
-                return
-            }
-        }
+
         running = true
         failStreak = 0
-        strolledThisRun = false      // 新一次启动 → 首轮还要走一次
+        for (i in 0 until Picks.SKILL_COUNT) {
+            failAt[i] = 0
+            dueAt[i] = 0L
+        }
         lastError = ""
-        // 启动**立刻执行一次**（用户要求），不等第一个周期：
-        // 否则点完启动要干等 4.7 分钟才看到第一个动作，看不出到底有没有生效。
-        nextDueAt = System.currentTimeMillis()
+        lastResult = ""
+        retryAt = 0
+
+        // 启动立即执行一次：两点都设成"现在"
+        val now = System.currentTimeMillis()
+        for (s in enabled) dueAt[s.idx] = now
+        walkDueAt = now
+        nextBuffDueAt = now
+        nextWalkDueAt = now
         state = State.WAITING
-        LogBus.emit("▶ 引擎启动：周期 ${period / 60000.0} 分钟，输入方式=${inputMethod()}，" +
-            "启用 ${buffConfig().count { it.enabled }} 个 BUFF —— 立即执行第一轮")
+
+        LogBus.emit(
+            "▶ 引擎启动：补 BUFF ${enabled.size} 个（" +
+                enabled.joinToString("、") { "BUFF${it.idx + 1} 每 ${it.durSec} 秒" } +
+                "）；走位每 ${WalkFlow.intervalMin} 分钟一次 —— 两者都立即跑第一轮"
+        )
+        if (Picks.get(context, Picks.JUMP) == null) {
+            LogBus.emit("ℹ 「跳跃」还没标注：走位会走完三段，但**不跳**。要跳请在悬浮窗点「标跳跃」。")
+        }
+        if (!Picks.joystickAnnotated(context)) {
+            LogBus.emit("ℹ 「轮盘中心」还没标注：走位先用默认左下角位置。建议点悬浮窗「标轮盘」校准。")
+        }
+
         worker = Thread { loop() }.apply { isDaemon = true; name = "engine" }
         worker?.start()
-
-        // 技能位：只保证有实测坐标（启动时已内置），**不做自动位移**。
-        // 原因见 SkillBar 类注释：带内能稳定找到的相位是按钮"边缘"，应用了会把点推离中心。
-        // 需要校正时用悬浮窗「技能位」按钮 —— 它重置为实测值并报告观测偏移。
-        if (SkillBar.ensureDefaults(context)) {
-            LogBus.emit("技能位：已内置实测坐标（悬浮窗「技能位」可重置/查看）")
-        }
     }
 
     fun stop(reason: String = "手动停止") {
@@ -195,7 +211,8 @@ object Engine {
         worker?.interrupt()
         worker = null
         state = State.IDLE
-        nextDueAt = 0
+        nextBuffDueAt = 0
+        nextWalkDueAt = 0
         LogBus.emit("⏹ 引擎停止（$reason）")
     }
 
@@ -208,7 +225,29 @@ object Engine {
             try {
                 Thread.sleep(500)
                 if (!running) break
-                if (System.currentTimeMillis() >= nextDueAt) castRound()
+
+                val now = System.currentTimeMillis()
+                if (retryAt > 0 && now < retryAt) continue
+
+                val c = ctx ?: continue
+                val target = OverlayService.targetPkgOf(c)
+
+                // 门禁：只有目标游戏在前台才动手
+                val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
+                if (fg != target) {
+                    // 还没执行过任何动作时用短重试：用户多半是"在本页点了启动、正要切回游戏"，
+                    // 让切回去之后立刻就能跑，而不是干等半分钟。
+                    val wait = if (buffCastCount == 0 && walkCount == 0) FIRST_RETRY_MS else FORE_SKIP_RETRY_MS
+                    lastResult = "跳过：前台是「${fg.ifBlank { "未知" }}」，不是 $target"
+                    LogBus.emit("⏭ $lastResult（${wait / 1000} 秒后再看）")
+                    retryAt = now + wait
+                    state = State.WAITING
+                    continue
+                }
+                retryAt = 0
+
+                castDueBuffs(now)
+                walkIfDue(now)
             } catch (_: InterruptedException) {
                 break
             } catch (t: Throwable) {
@@ -219,167 +258,110 @@ object Engine {
         }
     }
 
-    private fun castRound() {
-        state = State.CASTING
-        val c = ctx ?: return
-        val target = OverlayService.targetPkgOf(c)
-
-        // 门禁：只有目标游戏在前台才动手
-        val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
-        if (fg != target) {
-            lastResult = "跳过：前台是「${fg.ifBlank { "未知" }}」，不是 $target"
-            LogBus.emit("⏭ $lastResult")
-            // 不累计失败 —— 这不是错误，只是时机不对；推迟 30 秒再看
-            nextDueAt = System.currentTimeMillis() + 30_000
-            state = State.WAITING
-            return
-        }
-
-        // 【暂时停用】回城模式（进出自由市场）。
-        // 用户要求：先只保留「技能位 + 角色血条」两项识别与「原地走动 + 补 BUFF」，
-        // 菜单/自由市场/传送门/过图那套识别**代码保留但不再启用**，后续再优化。
-        // 真要用时把下面这段的 false 改成 autoFreeMarket() 即可恢复。
-        if (false && autoFreeMarket() && inMarket) {
-            LogBus.emit("── 回城模式：先出自由市场 ──")
-            val (ok, msg) = MarketFlow.exitMarket { LogBus.emit("  $it") }
-            inMarket = false
-            if (!ok) {
-                failStreak++
-                lastResult = "出自由市场失败：$msg"
-                LogBus.emit("  ❌ $lastResult")
-                nextDueAt = System.currentTimeMillis() + 30_000L * failStreak
-                state = State.WAITING
-                return
-            }
-        }
-
-        // 补 BUFF 前：首轮做一次原地走动（标定当前位置 → 左右各一次）；
-        // 之后每轮**不再走动**（用户指定"不需要重新在原地走动"）。
-        // 想恢复成每轮都走，把 strollEveryRound 置 true 即可。
-        if (!strolledThisRun || strollEveryRound()) {
-            val (_, strollMsg) = MarketFlow.strollAndReturn { LogBus.emit("  $it") }
-            LogBus.emit("  $strollMsg")
-            strolledThisRun = true
-        } else {
-            LogBus.emit("  （跳过原地走动：本次运行已走过一次）")
-        }
-        if (autoFreeMarket() && !pausedMarketNotified) {
-            pausedMarketNotified = true
-            LogBus.emit("ℹ 回城模式（自动进自由市场）暂时停用：当前只做「原地走动 + 补 BUFF」，后续再启用")
-        }
-
-        val enabled = buffConfig().filter { it.enabled }
-        LogBus.emit("── 第 ${cycleCount + 1} 轮：开始补 ${enabled.size} 个 BUFF ──")
-        var ok = 0
-        for (b in enabled) {
-            val r = pressSkill(b.idx)
-            if (r.first) { ok++; LogBus.emit("  ✅ BUFF${b.idx + 1}（键 ${b.key + 1}）${r.second}") }
-            else LogBus.emit("  ❌ BUFF${b.idx + 1} 失败：${r.second}")
-            // BUFF 排队释放：技能之间固定 1.5 秒（用户指定）
-            try { Thread.sleep(BUFF_GAP_MS) } catch (_: InterruptedException) { break }
-        }
-
-        if (ok == enabled.size) {
-            failStreak = 0
-            cycleCount++
-            lastCastAt = System.currentTimeMillis()
-            lastResult = "完成：$ok/${enabled.size}"
-            val period = cyclePeriodMs()
-            nextDueAt = lastCastAt + period
-            state = State.WAITING
-            LogBus.emit("✅ 第 $cycleCount 轮完成，下次 ${period / 60000.0} 分钟后")
-
-            // 【暂时停用】补完就回自由市场等待（同上，代码保留不启用）
-            if (false && autoFreeMarket()) {
-                LogBus.emit("── 回城模式：进自由市场并走到出口 ──")
-                // 显式写 log = ：尾随 lambda 会绑到最后一个参数（leaveAfter），这里不能省
-                val (mOk, mMsg) = MarketFlow.enterMarketAndWalkToExit(
-                    log = { LogBus.emit("  $it") },
-                    leaveAfter = false,   // 回城模式停在出口待命，下一轮到点再出
-                )
-                inMarket = mOk
-                lastResult += if (mOk) "；已回自由市场" else "；回城失败"
-                LogBus.emit(if (mOk) "  ↩ $mMsg" else "  ⚠ $mMsg（下一轮按仍在野外处理）")
-            }
-        } else {
-            failStreak++
-            lastResult = "本轮 $ok/${enabled.size}"
-            if (failStreak >= FAIL_LIMIT) {
-                state = State.ERROR
-                lastError = "连续 $failStreak 轮失败，已熔断"
-                LogBus.emit("🛑 $lastError —— 停止等人工处理")
-                stop(lastError)
-                state = State.ERROR
-            } else {
-                // 退避重试：间隔指数增长，绝不死循环猛点
-                val backoff = 30_000L * failStreak
-                nextDueAt = System.currentTimeMillis() + backoff
-                state = State.WAITING
-                LogBus.emit("⚠ 本次未全部成功（$failStreak/$FAIL_LIMIT），${backoff / 1000} 秒后重试")
-            }
-        }
-    }
+    // ------------------------------------------------------------ 补 BUFF
 
     /**
-     * 按第 idx 个技能键（0 基）。
-     * 返回 (是否成功, 说明)。输入方式由配置决定。
+     * 把所有已到点的槽位补掉。
+     *
+     * 槽位**各自独立计时**：BUFF1 时长 280 秒、BUFF2 时长 600 秒时，两者互不干扰
+     * （这正是"各自独立时长"的意义 —— 统一按最短时长补，长 BUFF 会被过量重放）。
      */
-    private fun pressSkill(idx: Int): Pair<Boolean, String> {
-        val b = buffConfig().getOrNull(idx) ?: return false to "配置缺失"
-        val c = ctx ?: return false to "上下文未初始化"
-        return when (inputMethod()) {
-            "touch" -> {
-                val pts = OverlayService.pickedPointsOf(c)
-                val p = pts.getOrNull(idx) ?: return false to "没有第 ${idx + 1} 个采集点"
-                // ★ 必须和悬浮窗「按法」用同一套按压参数。
-                //   之前引擎固定用 tapNorm 默认档（90ms/swipe），而用户往往是靠切「按法」
-                //   才把点击调通的 —— 结果就是「面板点1 生效、引擎触摸点击无效」。
-                val op = c.getSharedPreferences("overlay", Context.MODE_PRIVATE)
-                val ms = op.getInt("pressMs", 90)
-                val method = op.getString("pressMethod", "swipe") ?: "swipe"
-                val r = ShellCore.probe.tapNorm(
-                    p.first.toDouble(), p.second.toDouble(), "技能${idx + 1}", ms, method
+    private fun castDueBuffs(now: Long) {
+        val c = ctx ?: return
+        val enabled = buffConfig().filter { it.enabled }
+        val due = enabled.filter { dueAt[it.idx] > 0 && dueAt[it.idx] <= now }
+        if (due.isEmpty()) return
+
+        state = State.CASTING
+        LogBus.emit("── 补 BUFF：${due.size} 个到点（${due.joinToString("、") { "BUFF${it.idx + 1}" }}）──")
+
+        for ((n, s) in due.withIndex()) {
+            if (!running) return
+            val r = Picks.tap(c, Picks.SKILLS[s.idx], "BUFF${s.idx + 1}")
+            val nowMs = System.currentTimeMillis()
+            if (r.first) {
+                failAt[s.idx] = 0
+                buffCastCount++
+                dueAt[s.idx] = nowMs + slotPeriodMs(s.durSec)
+                LogBus.emit(
+                    "  ✅ BUFF${s.idx + 1}（技能图标 ${s.idx + 1}）已点，" +
+                        "下次 ${"%.1f".format(Locale.US, slotPeriodMs(s.durSec) / 60_000.0)} 分钟后"
                 )
-                if (r.contains("点击")) true to "点击(%.4f, %.4f) $method/${ms}ms".format(p.first, p.second)
-                else false to r.take(80)
+            } else {
+                failAt[s.idx]++
+                failStreak = failAt.maxOrNull() ?: 0
+                val backoff = 30_000L * failAt[s.idx]
+                dueAt[s.idx] = nowMs + backoff
+                lastError = "BUFF${s.idx + 1} 点击失败：${r.second}"
+                LogBus.emit("  ❌ BUFF${s.idx + 1} 失败（第 ${failAt[s.idx]}/$FAIL_LIMIT 次）：${r.second}")
+                if (failAt[s.idx] >= FAIL_LIMIT) {
+                    lastError = "BUFF${s.idx + 1} 连续 $FAIL_LIMIT 次失败，已熔断"
+                    LogBus.emit("🛑 $lastError —— 停止等人工处理")
+                    stop(lastError)
+                    state = State.ERROR
+                    return
+                }
+                LogBus.emit("     ${backoff / 1000} 秒后单独重试该槽位")
             }
-            else -> {
-                val codes = intArrayOf(8, 9, 10, 11)          // KEYCODE_1..4
-                val code = codes.getOrElse(b.key) { 8 }
-                val r = ShellCore.probe.sendKey(code)
-                if (r.contains("已发送")) true to "按键 $code" else false to r.take(80)
+            // 排队释放：槽位之间固定 1.5 秒（最后一个不用等，别拖住后面的走位）
+            if (n < due.size - 1) {
+                try {
+                    Thread.sleep(BUFF_GAP_MS)
+                } catch (_: InterruptedException) {
+                    return
+                }
             }
         }
+
+        refreshNextBuffDue()
+        lastResult = "补 BUFF 完成（累计 $buffCastCount 次）"
+        if (state != State.ERROR) state = State.WAITING
     }
 
-    // ------------------------------------------------------------ 上报
+    /** 重算"下一个到点的 BUFF"，供界面倒计时。 */
+    private fun refreshNextBuffDue() {
+        val enabled = buffConfig().filter { it.enabled }
+        nextBuffDueAt = enabled.map { dueAt[it.idx] }.filter { it > 0 }.minOrNull() ?: 0L
+    }
 
-    /** 供集控上报的状态快照。 */
-    fun statusJson(): JSONObject {
-        val o = JSONObject()
-        o.put("state", state.name)
-        o.put("running", running)
-        o.put("cycleCount", cycleCount)
-        o.put("failStreak", failStreak)
-        o.put("lastError", lastError)
-        o.put("lastResult", lastResult)
-        o.put("inputMethod", if (ctx == null) "?" else inputMethod())
-        o.put("autoFreeMarket", autoFreeMarket())
-        o.put("inMarket", inMarket)
-        o.put("cyclePeriodMs", cyclePeriodMs())
-        if (nextDueAt > 0) o.put("nextDueAt", nextDueAt)
-        if (lastCastAt > 0) o.put("lastCastAt", lastCastAt)
-        val arr = JSONArray()
-        buffConfig().forEach { b ->
-            arr.put(JSONObject().apply {
-                put("idx", b.idx + 1)
-                put("enabled", b.enabled)
-                put("key", b.key + 1)
-                put("durationSec", b.durSec)
-                put("durationMin", b.durSec / 60)   // 兼容老面板/老契约
-            })
+    // ------------------------------------------------------------ 原地走位
+
+    private fun walkIfDue(now: Long) {
+        if (walkDueAt <= 0 || walkDueAt > now) return
+        state = State.CASTING
+        LogBus.emit("── 原地走位（第 ${walkCount + 1} 次）──")
+        val (ok, msg) = WalkFlow.strollAndJump { LogBus.emit(it) }
+        walkCount++
+        lastWalkResult = msg
+        val nowMs = System.currentTimeMillis()
+        walkDueAt = nowMs + if (ok) WalkFlow.intervalMs else WALK_RETRY_MS
+        nextWalkDueAt = walkDueAt
+        if (ok) {
+            LogBus.emit("  ✅ $msg")
+            LogBus.emit("     下次走位：${WalkFlow.intervalMin} 分钟后")
+        } else {
+            LogBus.emit("  ⚠ $msg（${WALK_RETRY_MS / 1000} 秒后重试，不等一整个间隔）")
         }
-        o.put("buffs", arr)
-        return o
+        if (state != State.ERROR) state = State.WAITING
+    }
+
+    // ------------------------------------------------------------ 展示辅助
+
+    /** 倒计时文案，供主界面与悬浮窗共用。 */
+    fun countdown(at: Long): String {
+        if (!running || at <= 0) return "—"
+        val left = at - System.currentTimeMillis()
+        if (left <= 0) return "即将执行"
+        val sec = left / 1000
+        return if (sec < 60) "${sec} 秒后" else "%d分%02d秒后".format(sec / 60, sec % 60)
+    }
+
+    /** 状态中文名。 */
+    fun stateText(): String = when (state) {
+        State.IDLE -> "空闲（未启动）"
+        State.WAITING -> "运行中 · 等待到点"
+        State.CASTING -> "正在执行动作…"
+        State.PAUSED -> "已暂停"
+        State.ERROR -> "出错已熔断（需人工）"
     }
 }

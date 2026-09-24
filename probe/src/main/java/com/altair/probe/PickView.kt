@@ -10,22 +10,22 @@ import android.view.MotionEvent
 import android.view.View
 
 /**
- * 坐标采集层
+ * 坐标标注层
  * ==========
  *
  * ## 为什么需要它
- * 键盘通道一旦走不通，就只能改用触摸点击，而触摸必须知道**准确的按钮坐标**。
- * 从截图推算坐标既慢又不准（技能键是半透明圆角，自动检测效果很差）。
+ * 触摸点击必须知道**准确的按钮坐标**。从截图推算坐标既慢又不准（技能键是半透明圆角，
+ * 自动检测效果很差），而自动识别一旦偏了就会点到游戏里别的地方。最准的办法极其简单：
+ * **让用户直接在游戏画面上点一下**。
  *
- * 最准的办法极其简单：**让用户直接在游戏画面上点一下**。
- * 这一层就是干这个的 —— 它是全屏透明、可触摸的覆盖层：
+ * 这一层就是干这个的 —— 全屏透明、可触摸：
  *   - 用户看到的是游戏画面（底下透出来）
  *   - 点一下，就记录下那个位置的归一化坐标，并画一个带编号的标记
- *   - 游戏收不到这次点击（正好，采点时不该产生副作用）
+ *   - 游戏收不到这次点击（正好，标注时不该产生副作用）
  *
- * 采完点后，这些坐标可以直接用于「点1/点2/点3/点4」按钮做触摸测试。
+ * 一次只标**一个**槽位（技能1..4 / 跳跃 / 轮盘），采到就由 [OverlayService] 存进 [Picks]。
  */
-class PickView(ctx: Context) : View(ctx) {
+class PickView(ctx: Context, private val hint: String = "") : View(ctx) {
 
     /** 已采集的归一化坐标 (x, y)，取值 0~1。 */
     val points = mutableListOf<Pair<Float, Float>>()
@@ -161,7 +161,22 @@ class PickView(ctx: Context) : View(ctx) {
             canvas.drawText(n, cx + r + 22f - (if (n.length > 1) 16f else 9f), cy - r - 11f, text)
         }
 
+        drawHint(canvas, w)
         drawFinishButton(canvas, w, h)
+    }
+
+    /** 顶部提示条：明确告诉用户"现在标的是哪一项"，避免标错槽位。 */
+    private fun drawHint(canvas: Canvas, w: Float) {
+        if (hint.isBlank()) return
+        val tw = text.measureText(hint)
+        val boxW = tw + 40f
+        val left = (w - boxW) / 2f
+        finishBg.color = Color.parseColor("#E6000000")
+        canvas.drawRoundRect(
+            android.graphics.RectF(left, 24f, left + boxW, 24f + 62f), 16f, 16f, finishBg
+        )
+        text.color = Color.WHITE
+        canvas.drawText(hint, left + 20f, 24f + 44f, text)
     }
 
     private fun drawFinishButton(canvas: Canvas, w: Float, h: Float) {
@@ -175,7 +190,7 @@ class PickView(ctx: Context) : View(ctx) {
         finishBg.color = if (finishPressed) Color.parseColor("#E63B82F6") else Color.parseColor("#E62563EB")
         canvas.drawRoundRect(finishRect, 22f, 22f, finishBg)
         canvas.drawRoundRect(finishRect, 22f, 22f, finishEdge)
-        val label = if (points.isEmpty()) "完成采点（还没采）" else "完成采点（已采 ${points.size} 个）"
+        val label = if (points.isEmpty()) "完成标注（还没点）" else "完成标注（已点 ${points.size} 个）"
         val cy = finishRect.centerY() - (finishText.descent() + finishText.ascent()) / 2f
         canvas.drawText(label, finishRect.centerX(), cy, finishText)
     }

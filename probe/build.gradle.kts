@@ -13,8 +13,8 @@ android {
         // 设计文档 2.5 节：取 30 以同时兼容 Android 13 与 11，
         // 并规避 POST_NOTIFICATIONS / SCHEDULE_EXACT_ALARM 两代权限收紧。
         targetSdk = 30
-        versionCode = 38
-        versionName = "0.24.14"
+        versionCode = 39
+        versionName = "0.25.0"
     }
 
     // 显式指定工作区内的 keystore。

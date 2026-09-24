@@ -18,29 +18,27 @@ import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.Spinner
-import android.widget.ArrayAdapter
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
 
 /**
- * 主界面 —— 正式版三页签结构
- * ==========================
+ * 主界面 —— 四页签
+ * ================
  *
- *   运行  |  设置  |  日志
+ *   运行  |  设置  |  更新  |  日志
  *
- * 设计取舍：
- *  · 悬浮窗只留「ROI + 采点 + 技能键点击」这类**挂在游戏上天天要点的**；
- *    截图、诊断、键扫描、复制日志这些排查用的一次性工具都收进日志页。
- *  · 日志独立一页并且**自动滚到最新**（用户手动往上翻时暂停自动滚动，
- *    否则正读着就被拽走）。
+ * 设计取舍（都是"简化"这条线上的决定）：
+ *  · **坐标一律在悬浮窗里标**：只有把点打在**真实的游戏画面**上才准，所以本页只做查看/清空，
+ *    不放标注入口 —— 放了反而会有人在没有游戏画面的地方点，标出无意义的坐标。
+ *  · **没有输入方式二选一**：只剩触摸通道（键盘通道实测数字键无响应，已整体删除）。
+ *  · **没有集控页**：多设备群控已下线，更新独立成页并固定显示版本号，方便对版本排查问题。
+ *  · 日志独立一页并**自动滚到最新**（用户手动往上翻时暂停自动滚动，否则正读着就被拽走）。
  */
 class MainActivity : Activity() {
 
     private val probe get() = ShellCore.probe
     private val updater get() = ShellCore.updater
-    private val mgmt by lazy { Management(this, ShellCore.root) }
 
     // ---- 页签 ----
     private lateinit var tabButtons: List<TextView>
@@ -52,34 +50,32 @@ class MainActivity : Activity() {
     private lateinit var runLog: TextView
 
     // ---- 设置页 ----
+    private lateinit var targetField: EditText
+    private lateinit var legEdit: EditText
+    private lateinit var intervalEdit: EditText
+    private lateinit var pushEdit: EditText
+    private lateinit var jumpEdit: EditText
+
+    /** BUFF 4 个槽位：(勾选框, 时长秒输入框)。槽位下标 = 技能图标序号。 */
+    private val buffRows = mutableListOf<Pair<CheckBox, EditText>>()
+
+    // ---- 更新页 ----
     private lateinit var urlField: EditText
     private lateinit var autoChk: CheckBox
     private lateinit var forceChk: CheckBox
     private var versionTv: TextView? = null
 
-    private lateinit var strollHold: EditText
-    private lateinit var strollJitter: EditText
-    private lateinit var strollGap: EditText
-
-    private lateinit var mgmtField: EditText
-    private lateinit var mgmtToken: EditText
-    private lateinit var mgmtChk: CheckBox
-    private lateinit var targetField: EditText
-    private val buffRows = mutableListOf<Triple<CheckBox, Spinner, EditText>>()
-
     // ---- 全局操作状态条 ----
     private lateinit var busyStrip: TextView
     private val ticker = android.os.Handler(android.os.Looper.getMainLooper())
+    private var lastRunRefresh = 0L
     private val tick = object : Runnable {
         override fun run() {
             val l = Busy.current
-            busyStrip.text = if (l == null) "就绪" else "⏳ $l   ${"%.1f".format(Busy.elapsedMs() / 1000.0)}s"
-            busyStrip.setBackgroundColor(
-                Color.parseColor(if (l == null) "#12331F" else "#33301A")
-            )
-            busyStrip.setTextColor(
-                Color.parseColor(if (l == null) "#7FD18B" else "#FFD479")
-            )
+            busyStrip.text =
+                if (l == null) "就绪" else "⏳ $l   ${"%.1f".format(Busy.elapsedMs() / 1000.0)}s"
+            busyStrip.setBackgroundColor(Color.parseColor(if (l == null) "#12331F" else "#33301A"))
+            busyStrip.setTextColor(Color.parseColor(if (l == null) "#7FD18B" else "#FFD479"))
             // 引擎在跑时，让运行页的倒计时也实时走
             if (tab == 0 && Engine.isRunning && System.currentTimeMillis() - lastRunRefresh > 900) {
                 lastRunRefresh = System.currentTimeMillis()
@@ -88,14 +84,12 @@ class MainActivity : Activity() {
             ticker.postDelayed(this, 250)
         }
     }
-    private var lastRunRefresh = 0L
 
     // ---- 日志页 ----
     private lateinit var logScroll: ScrollView
     private lateinit var logBody: LinearLayout
     private var autoScroll = true
     private val logBuffer = StringBuilder()
-    private var lastReport: String? = null
 
     private val logListener: (String) -> Unit = { line -> runOnUiThread { renderLog(line) } }
 
@@ -104,28 +98,29 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ShellCore.init(this)
-        Engine.init(this)   // ★ 必须早于任何读引擎配置的代码（否则「更新后一打开就闪退」）
+        // ★ 必须早于任何读引擎配置的代码（否则「更新后一打开就闪退」）
+        Engine.init(this)
+        WalkFlow.init(this)
         buildUi()
         LogBus.add(logListener)
-        // 技能 1-4 的坐标是固定 UI，用实机采点实测值内置好，不再要求手动采点
-        if (SkillBar.ensureDefaults(this)) {
-            log("已内置技能 1-4 的实测坐标：" + SkillBar.describe(this))
-            log("（悬浮窗「技能位」可按 74px 周期在技能带内自动吸附校正）")
-        }
         // 把之前累积的日志倒进来
         LogBus.dump().lines().forEach { if (it.isNotEmpty()) renderLog(it) }
-        log("阿尔泰挂机 v" + updater.currentVersionName())
-        log("包名 ${packageName} · 目标游戏 ${OverlayService.targetPkgOf(this)}")
+        log("阿尔泰挂机 v" + updater.currentVersionName() + "（简化版：手动标注 + 定时补 BUFF + 定时走位）")
+        log("包名 $packageName · 目标游戏 ${OverlayService.targetPkgOf(this)}")
+        val miss = Picks.missing(this)
+        if (miss.isEmpty()) {
+            log("坐标标注：已齐全（技能1-4 / 跳跃 / 轮盘）")
+        } else {
+            log("坐标标注：还缺 ${miss.joinToString("、")} —— 点「启动悬浮窗」后切到游戏逐项标注")
+        }
         switchTab(0)
         startupUpdateCheck()
-        maybeStartMgmt()
         refreshRunStatus()
     }
 
     override fun onDestroy() {
         super.onDestroy()
         runCatching { LogBus.remove(logListener) }
-        runCatching { mgmt.stop() }
     }
 
     // ============================================================ 界面骨架
@@ -152,7 +147,7 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
         }
-        pages = listOf(buildRunPage(), buildSettingsPage(), buildMgmtPage(), buildLogPage())
+        pages = listOf(buildRunPage(), buildSettingsPage(), buildUpdatePage(), buildLogPage())
         pages.forEach { container.addView(it) }
         root.addView(container)
         setContentView(root)
@@ -164,8 +159,7 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.parseColor("#151A21"))
             setPadding(dp(6), dp(6), dp(6), dp(6))
         }
-        // 4 个分页：集控与更新单独一页（用户要求）
-        tabButtons = listOf("运行", "设置", "集控", "日志").mapIndexed { i, name ->
+        tabButtons = listOf("运行", "设置", "更新", "日志").mapIndexed { i, name ->
             TextView(this).apply {
                 text = name
                 gravity = Gravity.CENTER
@@ -214,8 +208,8 @@ class MainActivity : Activity() {
         ))
 
         c.addView(row(
-            "▶ 启动挂机" to { startEngine() },
-            "⏹ 停止挂机" to { stopEngine() }
+            "▶ 启动任务" to { startEngine() },
+            "⏹ 停止任务" to { stopEngine() }
         ))
         c.addView(row(
             "启动悬浮窗" to { startOverlay() },
@@ -236,11 +230,17 @@ class MainActivity : Activity() {
 
         c.addView(note(
             "使用顺序\n" +
-            "1. 点「启动悬浮窗」，切到游戏\n" +
-            "2. 悬浮窗上点「ROI显示」核对识别框\n" +
-            "3. 点「★采点」依次点：技能1-4 → 菜单按钮 → 自由市场按钮\n" +
-            "4. 点「完成采点」后，用「点1..4」验证技能是否响应\n" +
-            "5. 采到的坐标会自动保存，也可在「设置」页查看"
+                "1. 点「启动悬浮窗」，切到游戏\n" +
+                "2. 悬浮窗上点「标技能1」，再点画面上技能1的图标；技能2/3/4 同理\n" +
+                "3. 点「标跳跃」点游戏里的跳跃键；点「标轮盘」点左下角摇杆正中心\n" +
+                "4. 回本页点「▶ 启动任务」（标完会自动保存，下次开软件直接沿用）\n" +
+                "5. 启动后：立刻补一次 BUFF + 走一次位；之后 BUFF 按各自时长补，" +
+                "走位每 15 分钟一次\n\n" +
+                "⚠ 引擎有前台门禁：只有目标游戏在前台才动手。所以在**本页**点「启动任务」后，" +
+                "动作要等你切回游戏才开始（最多等 5 秒）。想立刻开跑，" +
+                "就在游戏里用悬浮窗的「▶ 启动」。\n\n" +
+                "想确认点标得准不准：悬浮窗上按「回显:关」变成「回显:开」，" +
+                "画面上就会画出所有标注点。"
         ))
         return sv
     }
@@ -248,88 +248,72 @@ class MainActivity : Activity() {
     private fun refreshRunStatus() {
         Thread {
             // ★ 整体兜一层：后台线程里的未捕获异常会直接杀掉 App。
-            //   历史上正是这里的 NPE 造成「更新后一打开就闪退」——即使以后再出别的意外，
-            //   也只应写一条日志，而不是让整个 App 消失。
+            //   历史上正是这里的 NPE 造成「更新后一打开就闪退」。
             runCatching {
-            val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
-            val target = OverlayService.targetPkgOf(this)
-            val armed = fg == target
-            val pts = OverlayService.pickedPointsOf(this)
-            val txt = buildString {
-                append(if (armed) "🟢 游戏中 · 动作已启用" else "🔴 非游戏 · 动作已禁用").append('\n')
-                append("── 挂机引擎 ──").append('\n')
-                append("状态     : ").append(engineStateText()).append('\n')
-                append("下次补BUFF: ").append(countdownText()).append('\n')
-                append("已完成   : ").append(Engine.cycleCount).append(" 轮")
-                if (Engine.failStreak > 0) append("（连续失败 ${Engine.failStreak}）")
-                append('\n')
-                if (Engine.lastResult.isNotBlank()) append("上次结果 : ").append(Engine.lastResult).append('\n')
-                if (Engine.lastError.isNotBlank()) append("最近错误 : ").append(Engine.lastError).append('\n')
-                append("输入方式 : ").append(inputMethodLabel()).append('\n')
-                append("周期     : ").append(periodText()).append('\n')
-                append("── 环境 ──").append('\n')
-                append("前台应用 : ").append(if (fg.isBlank()) "未知" else fg).append('\n')
-                append("目标游戏 : ").append(target).append('\n')
-                append("悬浮窗   : ").append(if (OverlayService.running) "运行中" else "未启动").append('\n')
-                append("当前操作 : ").append(Busy.current ?: "空闲").append('\n')
-                append("采集点   : ").append(pts.size).append(" 个")
-                if (pts.size >= 4) append("（技能键已就绪）")
-            }
-            runOnUiThread {
-                runStatus.text = txt
-                versionTv?.text = versionText()   // 目标游戏/集控开关可能变了
-            }
+                val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
+                val target = OverlayService.targetPkgOf(this)
+                val armed = fg == target
+                val missing = Picks.missing(this)
+                val txt = buildString {
+                    append(if (armed) "🟢 游戏中 · 动作已启用" else "🔴 非游戏 · 动作已禁用").append('\n')
+                    append("── 挂机任务 ──").append('\n')
+                    append("状态      : ").append(Engine.stateText()).append('\n')
+                    append("下次补BUFF: ").append(Engine.countdown(Engine.nextBuffDueAt)).append('\n')
+                    append("下次走位  : ").append(Engine.countdown(Engine.nextWalkDueAt)).append('\n')
+                    append("累计      : 补 ").append(Engine.buffCastCount)
+                        .append(" 次 / 走 ").append(Engine.walkCount).append(" 次")
+                    if (Engine.failStreak > 0) append("（连续失败 ${Engine.failStreak}）")
+                    append('\n')
+                    if (Engine.lastResult.isNotBlank()) append("上次结果  : ").append(Engine.lastResult).append('\n')
+                    if (Engine.lastWalkResult.isNotBlank()) append("上次走位  : ").append(Engine.lastWalkResult).append('\n')
+                    if (Engine.lastError.isNotBlank()) append("最近错误  : ").append(Engine.lastError).append('\n')
+                    append("── 标注 ──").append('\n')
+                    append("技能图标  : ").append(
+                        if (Picks.skillsReady(this@MainActivity)) "✅ 技能1-4 已标注"
+                        else "❌ 缺 " + Picks.missingSkills(this@MainActivity).joinToString("、")
+                    ).append('\n')
+                    append("跳跃      : ").append(
+                        if (Picks.get(this@MainActivity, Picks.JUMP) != null) "✅ 已标注"
+                        else "❌ 未标注（走位不会跳）"
+                    ).append('\n')
+                    append("轮盘中心  : ").append(
+                        if (Picks.joystickAnnotated(this@MainActivity)) "✅ 已标注"
+                        else "⚠ 未标注（用默认左下角）"
+                    ).append('\n')
+                    if (missing.isNotEmpty()) append("还缺      : ").append(missing.joinToString("、")).append('\n')
+                    append("── 环境 ──").append('\n')
+                    append("前台应用  : ").append(if (fg.isBlank()) "未知" else fg).append('\n')
+                    append("目标游戏  : ").append(target).append('\n')
+                    append("悬浮窗    : ").append(if (OverlayService.running) "运行中" else "未启动").append('\n')
+                    append("当前操作  : ").append(Busy.current ?: "空闲")
+                }
+                runOnUiThread {
+                    runStatus.text = txt
+                    versionTv?.text = versionText()
+                }
             }.onFailure {
                 LogBus.emit("刷新运行状态失败：${it.javaClass.simpleName}: ${it.message}")
             }
         }.apply { isDaemon = true }.start()
     }
 
-    private fun engineStateText(): String = when (Engine.state) {
-        Engine.State.IDLE -> "空闲（未启动）"
-        Engine.State.WAITING -> "运行中 · 等待下一次"
-        Engine.State.CASTING -> "正在补 BUFF…"
-        Engine.State.PAUSED -> "已暂停"
-        Engine.State.ERROR -> "出错已熔断（需人工）"
-    }
-
-    private fun countdownText(): String {
-        if (!Engine.isRunning || Engine.nextDueAt <= 0) return "—"
-        val left = Engine.nextDueAt - System.currentTimeMillis()
-        if (left <= 0) return "即将执行"
-        val sec = left / 1000
-        return "%d分%02d秒后".format(sec / 60, sec % 60)
-    }
-
-    private fun periodText(): String {
-        val p = Engine.cyclePeriodMs()
-        if (p <= 0) return "未配置（设置页填 BUFF 时长后自动算）"
-        val sec = p / 1000
-        return if (sec < 60) "${sec} 秒" else "%d 分 %02d 秒".format(sec / 60, sec % 60)
-    }
-
-    private fun inputMethodLabel(): String =
-        if (inputMethodPref() == "touch") "触摸点击（用采集的坐标）" else "键盘按键（数字键 1-4）"
-
-    private fun inputMethodPref(): String =
-        getSharedPreferences("overlay", Context.MODE_PRIVATE).getString("inputMethod", "keyevent") ?: "keyevent"
-
     private fun startEngine() {
-        Engine.buffConfig()   // 确保上下文已初始化
-        val period = Engine.cyclePeriodMs()
-        if (period <= 0) {
-            log("⛔ 启动失败：没有任何 BUFF 被启用，或时长未填。请到「设置」页配置 BUFF。")
-            toast("请先在设置页配置 BUFF")
+        // 先把已有标注读出来，失败原因能说得具体一点
+        val miss = Picks.missingSkills(this)
+        if (miss.isNotEmpty()) {
+            log("⛔ 启动失败：技能图标还没标注全（缺 ${miss.joinToString("、")}）。")
+            toast("请先在悬浮窗标注技能图标")
             switchTab(1)
             return
         }
-        if (inputMethodPref() == "touch" && OverlayService.pickedPointsOf(this).size < 4) {
-            log("⛔ 启动失败：输入方式是触摸，但还没采集技能键坐标（需 4 个点）。")
-            toast("请先在悬浮窗采点")
+        if (Engine.buffConfig().none { it.enabled }) {
+            log("⛔ 启动失败：4 个 BUFF 槽位一个都没勾选。请到「设置」页勾选。")
+            toast("请先在设置页勾选 BUFF")
+            switchTab(1)
             return
         }
         Engine.start(this)
-        switchTab(3)   // 日志页现在是第 4 个
+        if (Engine.isRunning) switchTab(3)   // 启动成功就跳到日志页，能直接看到动作
         refreshRunStatus()
     }
 
@@ -348,9 +332,9 @@ class MainActivity : Activity() {
         }
         sv.addView(c)
 
-        // ---------- BUFF ----------
+        // ---------- BUFF 4 个槽位 ----------
         val buffBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        for (i in 0 until 3) {
+        for (i in 0 until Picks.SKILL_COUNT) {
             val r = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -360,15 +344,10 @@ class MainActivity : Activity() {
                 text = "BUFF ${i + 1}"
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 setTextColor(Color.parseColor("#C9D4E0"))
-            }
-            val key = Spinner(this).apply {
-                adapter = ArrayAdapter(this@MainActivity,
-                    android.R.layout.simple_spinner_dropdown_item,
-                    listOf("数字键1", "数字键2", "数字键3", "数字键4"))
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
             val dur = EditText(this).apply {
-                setText("${Engine.DEFAULT_DUR_SEC}")   // 默认 280 秒
+                setText("${Engine.DEFAULT_DUR_SEC}")
                 inputType = InputType.TYPE_CLASS_NUMBER
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 setTextColor(Color.parseColor("#C9D4E0"))
@@ -381,43 +360,68 @@ class MainActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 setTextColor(Color.parseColor("#8FA3B8"))
             }
-            r.addView(en); r.addView(key); r.addView(dur); r.addView(unit)
+            r.addView(en); r.addView(dur); r.addView(unit)
             buffBox.addView(r)
-            buffRows.add(Triple(en, key, dur))
+            buffRows.add(en to dur)
         }
         loadBuffConfig()
-        c.addView(card("BUFF 技能（按职业设 1~3 个，持续时间决定补的间隔）", buffBox))
+        c.addView(card("BUFF 技能（勾选要补的，时长决定多久补一次）", buffBox))
         c.addView(row("保存 BUFF 配置" to { saveBuffConfig() }))
-
-        // 输入方式：实测键盘与触摸哪个可用一直没定论，所以做成可切换
-        c.addView(section("技能键输入方式"))
-        val imRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val imSp = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                listOf("键盘按键 input keyevent 1-4", "触摸点击 input swipe 采集坐标"))
-            setSelection(if (inputMethodPref() == "touch") 1 else 0)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        imRow.addView(imSp)
-        c.addView(imRow)
-        c.addView(row("保存输入方式" to {
-            val m = if (imSp.selectedItemPosition == 1) "touch" else "keyevent"
-            getSharedPreferences("overlay", Context.MODE_PRIVATE)
-                .edit().putString("inputMethod", m).apply()
-            log("技能键输入方式已设为：" + if (m == "touch") "触摸点击" else "键盘按键")
-            refreshRunStatus()
-        }))
-        c.addView(note("说明：方向键已实测可用，说明键盘通道是通的；但数字键 1-4 在野外实测无响应。" +
-            "若「键扫描」找到能触发技能的键，用键盘；否则改用触摸（需先在悬浮窗采点）。"))
-
-        // ---------- 坐标 ----------
-        c.addView(buttonRow(
-            "查看采集点" to { showPickedPoints() },
-            "清空采集点" to { clearPickedPoints() }
+        c.addView(note(
+            "4 个槽位对应标注的「技能1..4」：勾上 BUFF2 就会去点技能2的图标。\n" +
+                "每个槽位**各自独立计时**（填 280 秒就大约每 263 秒补一次，留了 6% 余量），" +
+                "所以不同技能时长不一样也没关系。没勾的槽位不点。"
         ))
 
-        // ---------- 目标游戏 ----------
+        // ---------- 原地走位 ----------
+        c.addView(section("原地走位（左 D → 右 2D → 左 D → 跳一下）"))
+        legEdit = EditText(this).apply {
+            hint = "单程时长 D（毫秒），默认 600"
+            setText(WalkFlow.legMs.toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+            styleEdit()
+        }
+        c.addView(legEdit)
+        intervalEdit = EditText(this).apply {
+            hint = "走位间隔（分钟），默认 15"
+            setText(WalkFlow.intervalMin.toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+            styleEdit()
+        }
+        c.addView(intervalEdit)
+        pushEdit = EditText(this).apply {
+            hint = "推杆幅度（屏幕宽度百分比），默认 6"
+            setText(WalkFlow.pushPct.toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+            styleEdit()
+        }
+        c.addView(pushEdit)
+        jumpEdit = EditText(this).apply {
+            hint = "跳跃按压时长（毫秒），默认 90"
+            setText(WalkFlow.jumpPressMs.toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+            styleEdit()
+        }
+        c.addView(jumpEdit)
+        c.addView(buttonRow("保存走位参数" to { saveWalk() }))
+        c.addView(note(
+            "三段都从标注的「轮盘中心」推杆，1:2:1 的配比保证走完回到起点附近。\n" +
+                "走得太少 → 调大单程时长或推杆幅度；走过头 → 调小。改完可在悬浮窗点「试走位一次」验证。"
+        ))
+
+        // ---------- 坐标标注 ----------
+        c.addView(section("坐标标注"))
+        c.addView(buttonRow(
+            "查看标注" to { showPicks() },
+            "清空标注" to { clearPicks() }
+        ))
+        c.addView(note(
+            "标注必须在**游戏画面**上做（只有那样点出来的坐标才是准的），" +
+                "所以入口在悬浮窗上：「标技能1..4」「标跳跃」「标轮盘」。\n" +
+                "每一项独立保存，改一个不会动到其它项；下次开软件自动沿用上一次的标注。"
+        ))
+
+        // ---------- 目标游戏门禁 ----------
         targetField = EditText(this).apply {
             hint = "目标游戏包名"
             setText(OverlayService.targetPkgOf(this@MainActivity))
@@ -435,48 +439,91 @@ class MainActivity : Activity() {
             "保存" to { saveTarget() },
             "用当前前台标定" to { calibrateTarget() }
         ))
-
-        // ---------- 原地走动 ----------
-        // 用户要求：走动时长要能在**软件界面**里设置（群控台也能下发，下发会覆盖这里的值）
-        c.addView(section("原地走动（补 BUFF 前左右各走一次）"))
-        strollHold = EditText(this).apply {
-            hint = "每腿时长（毫秒），默认 600"
-            setText(MarketFlow.strollHoldMs.toString())
-            inputType = InputType.TYPE_CLASS_NUMBER
-            styleEdit()
-        }
-        c.addView(strollHold)
-        strollJitter = EditText(this).apply {
-            hint = "时长抖动 ±毫秒，默认 30"
-            setText(MarketFlow.strollJitterMs.toString())
-            inputType = InputType.TYPE_CLASS_NUMBER
-            styleEdit()
-        }
-        c.addView(strollJitter)
-        strollGap = EditText(this).apply {
-            hint = "连发按键间隔（毫秒），默认 100"
-            setText(MarketFlow.strollPressGapMs.toString())
-            inputType = InputType.TYPE_CLASS_NUMBER
-            styleEdit()
-        }
-        c.addView(strollGap)
-        c.addView(buttonRow("保存原地走动" to { saveStroll() }))
-        c.addView(note("走法跟随触发方式：触摸 → 左下角摇杆；键盘 → 方向键。" +
-            "群控台也能下发这三项，下发值会覆盖这里的本地设置。"))
+        c.addView(note("只有这个包名在前台时才执行动作。包名不对就不会有任何点击 —— 这是防" +
+            "「在错误界面上乱点」的安全闸，换游戏时记得重新标定。"))
 
         return sv
     }
 
-    // ============================================================ 集控与更新页
+    // ---- BUFF 配置 ----
 
-    /**
-     * 集控与更新单独成页（用户要求）。
-     *
-     * 单独一页的理由：这两块都是"设备接进群控体系"的一次性配置，
-     * 和日常要看/要调的东西（运行状态、技能键、走动）混在一页里，翻找成本高。
-     * 页首固定显示**软件版本**，方便对版本号排查问题。
-     */
-    private fun buildMgmtPage(): View {
+    private fun buffPrefs() = getSharedPreferences("buff", Context.MODE_PRIVATE)
+
+    private fun loadBuffConfig() {
+        val sp = buffPrefs()
+        buffRows.forEachIndexed { i, (en, dur) ->
+            en.isChecked = sp.getBoolean("enabled$i", i == 0)
+            // 新键是秒；旧键 dur$i 存的是分钟 → ×60 迁移（复用同键会把 5 分钟读成 5 秒）
+            val sec = sp.getInt("durSec$i", -1).let { v ->
+                if (v > 0) v else sp.getInt("dur$i", 0).takeIf { it > 0 }?.times(60) ?: Engine.DEFAULT_DUR_SEC
+            }
+            dur.setText(sec.toString())
+        }
+    }
+
+    private fun saveBuffConfig() {
+        val sp = buffPrefs().edit()
+        buffRows.forEachIndexed { i, (en, dur) ->
+            sp.putBoolean("enabled$i", en.isChecked)
+            sp.putInt(
+                "durSec$i",
+                dur.text.toString().toIntOrNull()?.coerceIn(10, 86_400) ?: Engine.DEFAULT_DUR_SEC
+            )
+        }
+        sp.apply()
+        val enabled = buffRows.filter { it.first.isChecked }
+        val detail = if (enabled.isEmpty()) {
+            "⚠ 一个都没勾选，任务无法启动"
+        } else {
+            enabled.joinToString("、") { (en, dur) ->
+                val i = buffRows.indexOfFirst { it === en }
+                val sec = dur.text.toString().toIntOrNull() ?: Engine.DEFAULT_DUR_SEC
+                "BUFF${i + 1} 每 ${"%.1f".format(Engine.slotPeriodMs(sec) / 60_000.0)} 分钟"
+            }
+        }
+        log("BUFF 配置已保存：启用 ${enabled.size} 个 —— $detail")
+        toast("已保存")
+    }
+
+    // ---- 走位参数 ----
+
+    private fun saveWalk() {
+        WalkFlow.legMs = legEdit.text.toString().toLongOrNull() ?: 600L
+        WalkFlow.intervalMin = intervalEdit.text.toString().toLongOrNull() ?: 15L
+        WalkFlow.pushPct = pushEdit.text.toString().toIntOrNull() ?: 6
+        WalkFlow.jumpPressMs = jumpEdit.text.toString().toIntOrNull() ?: Picks.TAP_PRESS_MS
+        // 回填被 coerce 过的值，让界面显示的就是真正生效的值
+        legEdit.setText(WalkFlow.legMs.toString())
+        intervalEdit.setText(WalkFlow.intervalMin.toString())
+        pushEdit.setText(WalkFlow.pushPct.toString())
+        jumpEdit.setText(WalkFlow.jumpPressMs.toString())
+        val msg = "走位参数已保存：单程 ${WalkFlow.legMs}ms → 右 ${WalkFlow.legMs * 2}ms → 左 " +
+            "${WalkFlow.legMs}ms → 跳；每 ${WalkFlow.intervalMin} 分钟一次，推杆 ${WalkFlow.pushPct}%"
+        log(msg)
+        toast("已保存")
+    }
+
+    // ---- 标注查看 / 清空 ----
+
+    private fun showPicks() {
+        val missing = Picks.missing(this)
+        log("--- 已保存的标注（${Picks.ALL.size - missing.size}/${Picks.ALL.size} 项）---")
+        Picks.describe(this).lines().forEach { log(it) }
+        if (missing.isNotEmpty()) {
+            log("  还缺：${missing.joinToString("、")} —— 在悬浮窗上逐项标注")
+        }
+    }
+
+    private fun clearPicks() {
+        Picks.clearAll(this)
+        log("标注已清空（技能1-4 / 跳跃 / 轮盘）。任务下次启动前需要重新标注。")
+        toast("已清空标注")
+        refreshRunStatus()
+    }
+
+    // ============================================================ 更新页
+
+    private fun buildUpdatePage(): View {
         val sv = ScrollView(this)
         val c = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -495,36 +542,6 @@ class MainActivity : Activity() {
             }
         ))
 
-        // ---------- 集控 ----------
-        c.addView(section("集控（多设备统一管理）"))
-        mgmtField = EditText(this).apply {
-            hint = "服务器地址，如 https://control.example.com"
-            setText(mgmt.server)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            styleEdit()
-        }
-        c.addView(mgmtField)
-        mgmtToken = EditText(this).apply {
-            hint = "设备 Token（集控面板页面上可复制）"
-            setText(mgmt.token)
-            styleEdit()
-        }
-        c.addView(mgmtToken)
-        mgmtChk = CheckBox(this).apply {
-            text = "启用集控定期上报（协议 v1：一次上报即收启停指令，周期由服务端下发）"
-            isChecked = mgmt.enabled
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setTextColor(Color.parseColor("#8FA3B8"))
-        }
-        c.addView(mgmtChk)
-        c.addView(buttonRow(
-            "上报一次" to { runMgmtReport() },
-            "拉取配置" to { runMgmtPull() },
-            "截图上传" to { runMgmtScreenshot() },
-            "设备ID" to { showDeviceId() }
-        ))
-
-        // ---------- 更新 ----------
         c.addView(section("更新"))
         urlField = EditText(this).apply {
             hint = "自定义更新源 URL（留空用默认多源）"
@@ -552,31 +569,20 @@ class MainActivity : Activity() {
             "按URL更新" to { runUpdateByUrl() },
             "安装本地APK" to { runLocalInstall() }
         ))
-        c.addView(note("实测 GitHub 直连在国内经常不通，自更新会自动在 " +
-            "gh-proxy → ghfast → GitHub → jsDelivr 之间切换。"))
+        c.addView(note(
+            "实测 GitHub 直连在国内经常不通，自更新会自动在 " +
+                "gh-proxy → ghfast → GitHub → jsDelivr 之间切换。\n" +
+                "「按URL更新」和「安装本地APK」共用上面那个输入框：前者填 URL，后者填本地 APK 路径。"
+        ))
         return sv
     }
 
     /** 版本信息文案（页首卡片 + 需要时刷新）。 */
     private fun versionText(): String =
         "阿尔泰挂机 v${updater.currentVersionName()}（versionCode ${updater.currentVersionCode()}）\n" +
-            "集控协议 v1 · 包名 $packageName\n" +
+            "简化版 · 包名 $packageName\n" +
             "目标游戏 ${OverlayService.targetPkgOf(this)} · " +
-            (if (mgmt.enabled) "集控已启用" else "集控未启用")
-
-    /** 保存原地走动参数。 */
-    private fun saveStroll() {
-        MarketFlow.strollHoldMs =
-            strollHold.text.toString().toLongOrNull()?.coerceIn(100L, 10_000L) ?: 600L
-        MarketFlow.strollJitterMs =
-            strollJitter.text.toString().toLongOrNull()?.coerceIn(0L, 1_000L) ?: 30L
-        MarketFlow.strollPressGapMs =
-            strollGap.text.toString().toLongOrNull()?.coerceIn(30L, 2_000L) ?: 100L
-        val msg = "原地走动已保存：每腿 ${MarketFlow.strollHoldMs}ms（±${MarketFlow.strollJitterMs}ms），" +
-            "连发间隔 ${MarketFlow.strollPressGapMs}ms"
-        log(msg)
-        toast(msg)
-    }
+            "标注 ${Picks.ALL.size - Picks.missing(this).size}/${Picks.ALL.size} 项"
 
     // ============================================================ 日志页
 
@@ -591,13 +597,7 @@ class MainActivity : Activity() {
             }
         ))
         wrap.addView(buttonRow(
-            "截图" to { act("截图") { probe.quickCapture() } },
-            "按键诊断" to { act("按键诊断") { probe.keyDiagnostics(3) } },
-            "键扫描" to { act("键扫描") { probe.keyScan(3) } },
-            "申请Root" to { act("申请Root") { probe.requestRoot() } }
-        ))
-        wrap.addView(buttonRow(
-            "采集压测" to { act("采集压测") { probe.benchCapture() } },
+            "申请Root" to { act("申请Root") { probe.requestRoot() } },
             "自动滚动开关" to {
                 autoScroll = !autoScroll
                 log("日志自动滚动: " + if (autoScroll) "开" else "关（可自由上翻）")
@@ -636,7 +636,7 @@ class MainActivity : Activity() {
                 s.contains("★") || s.contains("⚠") ||
                     s.contains("!!") || s.contains("⛔") -> Color.parseColor("#FFB454")
                 s.contains("✅") || s.contains("🟢") -> Color.parseColor("#7FD18B")
-                s.contains("🔴") -> Color.parseColor("#FF6B6B")
+                s.contains("🔴") || s.contains("❌") -> Color.parseColor("#FF6B6B")
                 else -> Color.parseColor("#C9D4E0")
             })
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
@@ -647,7 +647,7 @@ class MainActivity : Activity() {
         // 只保留最近 800 行，避免长时间运行后 View 数量爆炸
         while (logBody.childCount > 800) logBody.removeViewAt(0)
         if (autoScroll) logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
-        runLog?.text = logBuffer.toString().trimEnd().lines().takeLast(6).joinToString("\n")
+        runLog.text = logBuffer.toString().trimEnd().lines().takeLast(6).joinToString("\n")
     }
 
     private fun log(s: String) = LogBus.emit(s)
@@ -765,7 +765,7 @@ class MainActivity : Activity() {
         }.apply { isDaemon = true }.start()
     }
 
-    // ============================================================ 各功能
+    // ============================================================ 悬浮窗 / 门禁
 
     private fun startOverlay() {
         ShellCore.init(this)
@@ -778,8 +778,7 @@ class MainActivity : Activity() {
                     return@runOnUiThread
                 }
                 OverlayService.start(this)
-                log("悬浮控制台已启动（面板只含 ROI 与技能键点击）。")
-                switchTab(3)   // 日志页现在是第 4 个
+                log("悬浮控制台已启动。切到游戏后即可逐项标注坐标。")
                 refreshRunStatus()
             }
         }.apply { isDaemon = true }.start()
@@ -831,95 +830,7 @@ class MainActivity : Activity() {
         }.apply { isDaemon = true }.start()
     }
 
-    private fun showPickedPoints() {
-        val pts = OverlayService.pickedPointsOf(this)
-        log("--- 已保存的采集点（${pts.size} 个）---")
-        if (pts.isEmpty()) log("（空，请到悬浮窗点「★采点」）")
-        val names = arrayOf("技能1", "技能2", "技能3", "技能4", "菜单", "自由市场", "传送点", "备用")
-        pts.forEachIndexed { i, (x, y) ->
-            log("  %-6s = [%.4f, %.4f]".format(names.getOrElse(i) { "点${i + 1}" }, x, y))
-        }
-    }
-
-    private fun clearPickedPoints() {
-        OverlayService.savePickedPointsOf(this, emptyList())
-        log("采集点已清空。")
-        refreshRunStatus()
-    }
-
-    // ---- BUFF 配置（存 SharedPreferences，供后续 P1 引擎读取）----
-
-    private fun buffPrefs() = getSharedPreferences("buff", Context.MODE_PRIVATE)
-
-    private fun loadBuffConfig() {
-        val sp = buffPrefs()
-        buffRows.forEachIndexed { i, (en, key, dur) ->
-            en.isChecked = sp.getBoolean("enabled$i", i == 0)
-            key.setSelection(sp.getInt("key$i", i).coerceIn(0, 3))
-            // 新键是秒；旧键 dur$i 存的是分钟 → ×60 迁移（复用同键会把 5 分钟读成 5 秒）
-            val sec = sp.getInt("durSec$i", -1).let { v ->
-                if (v > 0) v else sp.getInt("dur$i", 0).takeIf { it > 0 }?.times(60) ?: Engine.DEFAULT_DUR_SEC
-            }
-            dur.setText(sec.toString())
-        }
-    }
-
-    private fun saveBuffConfig() {
-        val sp = buffPrefs().edit()
-        buffRows.forEachIndexed { i, (en, key, dur) ->
-            sp.putBoolean("enabled$i", en.isChecked)
-            sp.putInt("key$i", key.selectedItemPosition)
-            sp.putInt("durSec$i", dur.text.toString().toIntOrNull()?.coerceIn(10, 86400) ?: Engine.DEFAULT_DUR_SEC)
-        }
-        sp.apply()
-        val enabled = buffRows.count { it.first.isChecked }
-        val durs = buffRows.filter { it.first.isChecked }
-            .map { it.third.text.toString().toIntOrNull() ?: 5 }
-        val cycleSec = durs.minOrNull() ?: 0
-        log("BUFF 配置已保存：启用 $enabled 个" +
-            (if (cycleSec > 0) "，最短时长 ${cycleSec} 秒 → 循环周期 ${(cycleSec * 0.94).toInt()} 秒" else ""))
-    }
-
-    // ---- 集控 ----
-
-    private fun saveMgmtFields() {
-        mgmt.server = mgmtField.text.toString()
-        mgmt.token = mgmtToken.text.toString()
-        mgmt.enabled = mgmtChk.isChecked
-    }
-
-    private fun runMgmtReport() {
-        saveMgmtFields()
-        act("集控上报") { mgmt.reportOnce() }
-    }
-
-    private fun runMgmtPull() {
-        saveMgmtFields()
-        act("集控拉配置") { mgmt.pullConfigOnce() }
-    }
-
-    /** 手动截图并上传（服务端也能点播，走同一段代码）。 */
-    private fun runMgmtScreenshot() {
-        saveMgmtFields()
-        act("集控截图上传") { mgmt.uploadScreenshot(label = "手动") }
-    }
-
-    private fun showDeviceId() {
-        log("设备ID: ${mgmt.deviceId}")
-        log("Token : ${mgmt.token.ifBlank { "(未填)" }}")
-    }
-
-    private fun maybeStartMgmt() {
-        saveMgmtFields()
-        if (mgmt.enabled) {
-            if (mgmt.token.isBlank()) {
-                log("⚠ 集控已启用但 Token 为空，服务器会返回 401。请从集控面板复制 Token 填入。")
-            }
-            mgmt.start()
-        } else mgmt.stop()
-    }
-
-    // ---- 更新 ----
+    // ============================================================ 更新
 
     private fun runSelfUpdate() {
         updater.setAutoCheck(autoChk.isChecked)
@@ -962,7 +873,7 @@ class MainActivity : Activity() {
         }.apply { isDaemon = true }.start()
     }
 
-    // ---- 日志导出 ----
+    // ============================================================ 日志导出
 
     private fun copyLog() {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager

@@ -50,41 +50,9 @@ else
 fi
 
 # ---------------------------------------------------------------- 1.5) 静态检查
-# 先跑静态检查再构建：网页面板的 JS 语法错 Python 检查发现不了，
-# 只有把 JS 抠出来真跑一遍才知道（曾因此导致面板永远停在「加载中」）。
+# 集控（Go 服务端 + React 面板 + 旧 Python 面板）已在 v0.25 随简化整体下线，
+# 相应的 tools/check-assets.sh 与 control/ 验收一节一并删除。
 echo
-echo "==== 静态检查（旧 Python 面板）===="
-if ! bash tools/check-assets.sh; then
-  echo "!! 静态检查未通过，已中止发布"
-  exit 1
-fi
-
-# ---------------------------------------------------------------- 1.6) 集控侧验收
-# APK 从 0.24 起用集控协议 v1（合并往返/心跳/截图/服务端下发周期），
-# 旧 Python 服务端不认识 —— 所以发 APK 之前必须确认新的 altaird 是好的。
-# 这段在切换完成后可以删掉 1.5 那一节（旧面板届时已删除）。
-echo
-echo "==== 集控侧验收（control/）===="
-if [ -d "$ROOT/control" ]; then
-  if [ -f "$ROOT/.toolchain/env.sh" ]; then
-    # shellcheck disable=SC1091
-    source "$ROOT/.toolchain/env.sh"
-  fi
-  if ! command -v go >/dev/null; then
-    echo "!! 找不到 go，无法验证集控侧；请先 bash tools/setup-toolchain.sh" >&2
-    exit 1
-  fi
-  ( cd "$ROOT/control" && go build ./... && go vet ./... ) || { echo "!! 集控侧编译失败"; exit 1; }
-  ( cd "$ROOT/control" && go test ./... -count=1 ) || { echo "!! 集控侧单测失败"; exit 1; }
-  bash "$ROOT/control/scripts/smoke.sh" || { echo "!! 集控端到端验收失败"; exit 1; }
-  echo "  ✅ 集控侧验收通过"
-  echo
-  echo "  ⚠ 注意：本次发布的 APK 使用集控协议 v1，**必须配合 altaird 服务端**。"
-  echo "     若线上还在跑旧的 tools/control-server.py，升级 APK 会让设备静默失联。"
-  echo "     上线步骤见 control/deploy/RUNBOOK.md。"
-else
-  echo "  （没有 control/ 目录，跳过）"
-fi
 
 # ---------------------------------------------------------------- 2) 构建
 echo
@@ -104,7 +72,7 @@ if [ -x "$AAPT" ]; then
     if echo "$MT" | grep -q "$1"; then echo "  ✅ $2"; else echo "  ❌ $2 缺失"; MFBAD=1; fi
   }
   echo "  ---- 成品 APK manifest 校验 ----"
-  chk_attr "usesCleartextTraffic.*=true" "允许明文 HTTP（集控服务器是 http://）"
+  chk_attr "usesCleartextTraffic.*=true" "允许明文 HTTP（本地/代理更新源可能用 http://）"
   chk_attr "networkSecurityConfig"       "网络安全配置已引用"
   chk_attr "SYSTEM_ALERT_WINDOW"         "悬浮窗权限已声明"
   [ "${MFBAD:-0}" = "1" ] && { echo "!! manifest 校验未通过，已中止发布"; exit 1; }
