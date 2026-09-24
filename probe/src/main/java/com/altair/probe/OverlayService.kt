@@ -362,14 +362,33 @@ class OverlayService : Service() {
         p.y = p.y.coerceIn(0, (sh - h).coerceAtLeast(0))
     }
 
-    /** 挂上拖动监听：整条 view 可拖，位置落盘，重开软件还在原处。 */
-    private fun attachDrag(v: View, p: WindowManager.LayoutParams, keyX: String, keyY: String) {
+    /**
+     * 挂上"拖动 + 点击"监听：整条 view 可拖，位置落盘；没拖动就是点击，调 [onTap]。
+     *
+     * ## 为什么点击必须在这里自己处理，而不是用 `setOnClickListener`
+     * `setOnTouchListener` 只在 `View.onTouchEvent()` **之前**被调用，而 `performClick()`
+     * 是在 `onTouchEvent` 的 ACTION_UP 分支里触发的。
+     *
+     * 这里 `ACTION_DOWN` 必须返回 `true`（不然后续事件收不到），可一旦返回 true，
+     * 事件就被标记为已消费，`View.onTouchEvent()` 从此不再被调用 ——
+     * 挂在同一个 View 上的 `setOnClickListener` **永远不会触发**。
+     * 改造后第一次实测就是这个现象：拖得动，但点不开。
+     *
+     * 所以点击由这里显式调用 [View.performClick] 来触发（它同时也照顾了无障碍事件）。
+     */
+    private fun attachDrag(
+        v: View,
+        p: WindowManager.LayoutParams,
+        keyX: String,
+        keyY: String,
+        onTap: () -> Unit
+    ) {
         var downX = 0f
         var downY = 0f
         var startX = 0
         var startY = 0
         var moved = false
-        v.setOnTouchListener { _, e ->
+        v.setOnTouchListener { view, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = e.rawX; downY = e.rawY
@@ -385,16 +404,26 @@ class OverlayService : Service() {
                     if (moved) {
                         p.x = startX + dx.toInt()
                         p.y = startY + dy.toInt()
-                        clampPos(p, v.width, v.height)
-                        runCatching { wm.updateViewLayout(v, p) }
+                        clampPos(p, view.width, view.height)
+                        runCatching { wm.updateViewLayout(view, p) }
                     }
                     true
                 }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                MotionEvent.ACTION_UP -> {
                     if (moved) {
+                        // 拖动结束：落盘位置，不触发点击
                         prefs().edit().putInt(keyX, p.x).putInt(keyY, p.y).apply()
+                    } else {
+                        // 没移动 = 点击。直接用 onTap 而不是 view.performClick()：
+                        // 这里已经是"消费事件"的分支，performClick 的返回值不重要，
+                        // 而 onTap 少一层间接、意图更直白。
+                        onTap()
                     }
-                    moved
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    if (moved) prefs().edit().putInt(keyX, p.x).putInt(keyY, p.y).apply()
+                    true
                 }
                 else -> false
             }
@@ -429,9 +458,8 @@ class OverlayService : Service() {
         }
         if (p.x < 0) p.x = (screenSize().first - dp(BALL_D) - dp(12)).coerceAtLeast(0)
 
-        attachDrag(v, p, KEY_BALL_X, KEY_BALL_Y)
         // 拖动之外的抬手 = 点击 → 展开面板
-        v.setOnClickListener { showPanel() }
+        attachDrag(v, p, KEY_BALL_X, KEY_BALL_Y) { showPanel() }
 
         v.running = Engine.isRunning
         v.error = Engine.state == Engine.State.ERROR
@@ -598,9 +626,8 @@ class OverlayService : Service() {
             y = prefs().getInt(KEY_PANEL_Y, dp(10))
         }
 
-        attachDrag(titleBar, p, KEY_PANEL_X, KEY_PANEL_Y)
-        // 标题条上除了拖动，抬手还要收起面板（拖动时不触发 —— 见 attachDrag 的 moved 返回值）
-        titleBar.setOnClickListener { showBall() }
+        // 标题条上除了拖动，抬手还要收起面板（拖动时不触发 —— 见 attachDrag）
+        attachDrag(titleBar, p, KEY_PANEL_X, KEY_PANEL_Y) { showBall() }
 
         panel = root
         panelParams = p
