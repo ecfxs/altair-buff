@@ -185,7 +185,8 @@ class Probe(
             "tap" -> "input tap $px $py"
             else -> "input swipe $px $py $px $py $pressMs"
         }
-        val (ms, err) = sh.timedExec(cmd, 8000)
+        // ★ 注入期间让悬浮窗让路：否则这一下会打在我们自己的面板上（见 [InjectShield]）
+        val (ms, err) = InjectShield.withPassThrough { sh.timedExec(cmd, 8000) }
         val tag = if (label.isBlank()) "" else "[$label] "
         val nx4 = "%.4f".format(nx)
         val ny4 = "%.4f".format(ny)
@@ -251,7 +252,9 @@ class Probe(
 
         // 明确的 swipe 档位直接走兜底
         if (method == "swipe") {
-            val (ms, err) = sh.timedExec(swipeCmd(), (8000 + holdMs).toLong())
+            val (ms, err) = InjectShield.withPassThrough {
+                sh.timedExec(swipeCmd(), (8000 + holdMs).toLong())
+            }
             return "摇杆(swipe) ($cx,$cy)→($mx,$my) ${holdMs}ms  ${ms}ms ${err.take(40)}"
         }
 
@@ -260,7 +263,9 @@ class Probe(
         // 命令构成：DOWN + MOVE + (sleep + MOVE) × frames + UP
         val inputCount = 2 + frames + 1
         val meTimeout = 4000L + holdMs + inputCount * perCallMs
-        val (ms, err) = sh.timedExec(meCmd(), meTimeout)
+        // ★ 整段手势（含保持期间的 MOVE）都在"悬浮窗不吃触摸"的窗口里跑 ——
+        //   否则第一个 DOWN 就会被面板吃掉，角色一步都不会动（见 [InjectShield]）
+        val (ms, err) = InjectShield.withPassThrough { sh.timedExec(meCmd(), meTimeout) }
         val failed = err.contains("not found", true) || err.contains("Unknown", true) ||
             err.contains("Error", true) || err.contains("inaccessible", true)
         if (!failed) {
@@ -268,7 +273,9 @@ class Probe(
                 "  ${ms}ms ${err.take(40)}"
         }
         // 该机型的 input 没有 motionevent 子命令 → 退回 swipe
-        val (ms2, err2) = sh.timedExec(swipeCmd(), (8000 + holdMs).toLong())
+        val (ms2, err2) = InjectShield.withPassThrough {
+            sh.timedExec(swipeCmd(), (8000 + holdMs).toLong())
+        }
         return "摇杆(swipe兜底，motionevent 不可用) ($cx,$cy)→($mx,$my) ${holdMs}ms  ${ms2}ms ${err2.take(40)}"
     }
 

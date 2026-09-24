@@ -25,6 +25,8 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * 悬浮控制台
@@ -124,6 +126,7 @@ class OverlayService : Service() {
 
     private var panelParams: WindowManager.LayoutParams? = null
     private var ballParams: WindowManager.LayoutParams? = null
+    private var pickParams: WindowManager.LayoutParams? = null
 
     private var panelScroll: ScrollView? = null
 
@@ -170,6 +173,9 @@ class OverlayService : Service() {
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         startForeground(NOTIF_ID, buildNotification())
         LogBus.add(logListener)
+        // 注入输入时把覆盖层切成"不吃触摸"，否则注入会打在自己面板上（见 [InjectShield]）。
+        // 传进来的是"是否正在注入"，所以触摸开关要取反。
+        InjectShield.bind { injecting -> setOverlayTouchable(touchable = !injecting) }
         showBall()
         running = true
         LogBus.emit("悬浮控制台已启动。点悬浮球展开控制台 → 标注坐标 → 启动任务。")
@@ -184,6 +190,7 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         running = false
+        InjectShield.bind(null)
         ui.removeCallbacks(tickLoop)
         ui.removeCallbacks(pollLoop)
         LogBus.remove(logListener)
@@ -195,6 +202,7 @@ class OverlayService : Service() {
         ball = null
         marksView = null
         pickView = null
+        pickParams = null
         super.onDestroy()
     }
 
@@ -368,6 +376,56 @@ class OverlayService : Service() {
         val (sw, sh) = screenSize()
         p.x = p.x.coerceIn(0, (sw - w).coerceAtLeast(0))
         p.y = p.y.coerceIn(0, (sh - h).coerceAtLeast(0))
+    }
+
+    /**
+     * 覆盖层的「触摸穿透」开关 —— 由 [InjectShield] 在注入输入前后调用。
+     *
+     * ## 为什么必须有它
+     * `input` 注入的触摸由系统按 **z 序**交给最上面那个可触摸窗口，而悬浮面板就浮在游戏之上。
+     * 只要面板盖住了轮盘中心 / 技能键的位置，注入的 DOWN/MOVE/UP 就全打在**面板自己的按钮**上：
+     * 展开「工具」会让面板变高、正好盖住左下角轮盘，此时点「试走位一次」，
+     * 注入的第一个 DOWN 落在面板下部的「复位窗口位置」上 —— 用户看到的就是
+     * 「一点试走位，悬浮窗自己消失了」，而游戏里角色一步都没动。
+     *
+     * 注入期间挂上 [WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE]，事件就落回游戏；
+     * 注入结束立刻摘掉。采点层也要一起切：任务运行中用户正在标注时，引擎的注入点击
+     * 会被全屏的采点层吃掉，**静默存下一个错误坐标** —— 这是本项目最忌讳的失败模式。
+     * 回显层 [MarksView] 本来就是 NOT_TOUCHABLE，不用管。
+     *
+     * ## 为什么从注入线程同步等待
+     * 改窗口参数只能在 UI 线程做（`updateViewLayout` 最终会走 ViewRootImpl 的遍历调度），
+     * 但闸门必须**在注入命令发出之前**落地 —— 所以 post 过去之后用闩等它做完。
+     * 正常情况下这是毫秒级；超时只是兜底，免得远程 UI 线程卡住时把注入线程一起拖住。
+     */
+    private fun setOverlayTouchable(touchable: Boolean) {
+        val wins = listOfNotNull(
+            panel?.let { v -> panelParams?.let { v to it } },
+            ball?.let { v -> ballParams?.let { v to it } },
+            pickView?.let { v -> pickParams?.let { v to it } }
+        )
+        if (wins.isEmpty()) return
+        val apply = Runnable {
+            wins.forEach { (v, p) ->
+                p.flags = if (touchable) {
+                    p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                } else {
+                    p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                }
+                runCatching { wm.updateViewLayout(v, p) }
+            }
+        }
+        // 已经在 UI 线程就直接改 —— post + 等闩会变成"自己等自己"，白等满 1 秒超时
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            apply.run()
+            return
+        }
+        val done = CountDownLatch(1)
+        ui.post {
+            apply.run()
+            done.countDown()
+        }
+        runCatching { done.await(1000, TimeUnit.MILLISECONDS) }
     }
 
     /**
@@ -571,12 +629,9 @@ class OverlayService : Service() {
         // 原来技能 4 个挤一行 + 跳跃轮盘各占整行 = 3 行高度，且 4 个按钮每个只有 ~45dp 宽。
         // 改成一行 3 个、6 项排满 2 行：更省纵向空间，单个按钮也更宽好点。
         slotBtns.clear()
-        val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        Picks.ALL.chunked(3).forEach { rowSlots ->
-            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            rowSlots.forEach { slot ->
-                val b = overlayBtn(("○ ") + Picks.label(slot), fill = Ui.BG, border = Ui.BORDER,
-                    heightDp = 30, compact = true) { startSlotPick(slot) }
+        val slotCells = Picks.ALL.map { slot ->
+            overlayBtn(("○ ") + Picks.label(slot), fill = Ui.BG, border = Ui.BORDER,
+                heightDp = 30, compact = true) { startSlotPick(slot) }.also { b ->
                 // ★ 长按 = 从这一颗起连续标注（技能3 → 3、4）
                 b.setOnLongClickListener {
                     if (slot in Picks.SKILLS) {
@@ -587,22 +642,10 @@ class OverlayService : Service() {
                         false
                     }
                 }
-                (b.layoutParams as LinearLayout.LayoutParams).apply {
-                    marginEnd = dp(2)
-                    bottomMargin = dp(2)
-                }
                 slotBtns[slot] = b
-                row.addView(b)
             }
-            // 补齐空位，保证最后一行按钮宽度与上一行对齐
-            repeat(3 - rowSlots.size) {
-                row.addView(View(this).apply {
-                    layoutParams = LinearLayout.LayoutParams(0, dp(30), 1f).apply { marginEnd = dp(2) }
-                })
-            }
-            grid.addView(row)
         }
-        annoBody.addView(grid)
+        annoBody.addView(compactGrid(slotCells))
 
         // 「连续标技能」主入口：面板上直接可见，不用去摸长按
         annoBody.addView(overlayBtn("▶ 连续标技能 1→4", fill = Ui.SURFACE_2, border = Ui.PRIMARY,
@@ -621,11 +664,21 @@ class OverlayService : Service() {
         content.addView(toolHeader)
         content.addView(toolBody)
 
-        marksBtn = overlayBtn(marksLabel(), fill = Ui.SURFACE_2, border = Ui.BORDER) { toggleMarks() }
-        toolBody.addView(marksBtn)
-        toolBody.addView(overlayBtn("试走位一次", fill = Ui.SURFACE_2, border = Ui.BORDER) { testStroll() })
-        toolBody.addView(overlayBtn("复位窗口位置", fill = Ui.SURFACE_2, border = Ui.BORDER) { resetPositions() })
-        toolBody.addView(overlayBtn("清空标注", fill = Ui.SURFACE_2, border = Ui.DANGER) { clearAllPicks() })
+        // 工具区也排成一行 3 键的网格，和上面的标注区一致。
+        // 4 颗整行按钮原来要占 4 行 —— 展开「工具」时面板高得离谱，也正是「点试走位、
+        // 面板盖住轮盘、注入打在自己身上」那类事故的温床（见 [InjectShield]）。
+        val marks = overlayBtn(marksLabel(), fill = Ui.SURFACE_2, border = Ui.BORDER,
+            heightDp = 30, compact = true) { toggleMarks() }
+        marksBtn = marks
+        toolBody.addView(compactGrid(listOf(
+            marks,
+            overlayBtn("试走位一次", fill = Ui.SURFACE_2, border = Ui.BORDER,
+                heightDp = 30, compact = true) { testStroll() },
+            overlayBtn("复位窗口", fill = Ui.SURFACE_2, border = Ui.BORDER,
+                heightDp = 30, compact = true) { resetPositions() },
+            overlayBtn("清空标注", fill = Ui.SURFACE_2, border = Ui.DANGER,
+                heightDp = 30, compact = true) { clearAllPicks() }
+        )))
 
         val scroll = ScrollView(this).apply {
             addView(content)
@@ -756,6 +809,39 @@ class OverlayService : Service() {
             addView(head, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             if (right != null) addView(right)
         }
+
+    /**
+     * 一行 [cols] 列（默认 3）的紧凑网格。
+     *
+     * 面板宽度只有 [PANEL_W_FULL] dp，竖着堆整行按钮的话，展开「工具」后面板会一路长到
+     * 屏幕 88% 的高度（标注 + 工具共 10 颗）。网格化之后这两组各占 2 行，面板高度减半。
+     *
+     * 每格用 [overlayBtn] 的 `compact = true`：它已经带好 `width=0 + weight=1`，
+     * 由本方法负责按行切分与间距。
+     *
+     * 最后一行不足 [cols] 个时补透明占位 —— 否则最后一行那颗按钮会**独占整行宽度**，
+     * 和上面几行对不齐（看起来像漏了一格）。
+     */
+    private fun compactGrid(cells: List<View>, cols: Int = 3): LinearLayout {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        cells.chunked(cols).forEach { rowCells ->
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            rowCells.forEach { v ->
+                (v.layoutParams as? LinearLayout.LayoutParams)?.apply {
+                    marginEnd = dp(2)
+                    bottomMargin = dp(2)
+                }
+                row.addView(v)
+            }
+            repeat(cols - rowCells.size) {
+                row.addView(View(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, dp(1), 1f).apply { marginEnd = dp(2) }
+                })
+            }
+            box.addView(row)
+        }
+        return box
+    }
 
     /**
      * 可折叠小节的标题条。返回标题（点击切换）+ 内容容器。
@@ -889,6 +975,7 @@ class OverlayService : Service() {
         runCatching { wm.addView(v, p) }
             .onSuccess {
                 pickView = v
+                pickParams = p
                 pickSlot = slot
 
                 // 连续模式下把进度说清楚，用户才知道还剩几项、点完会不会自动接上下一项
@@ -932,6 +1019,7 @@ class OverlayService : Service() {
         val slot = pickSlot          // 先取出来，下面会被清空
         runCatching { wm.removeView(v) }
         pickView = null
+        pickParams = null
         pickSlot = null
         val wasSequence = pickQueue.isNotEmpty()
         pickQueue.clear()
@@ -959,6 +1047,7 @@ class OverlayService : Service() {
         val slot = pickSlot
         runCatching { wm.removeView(v) }
         pickView = null
+        pickParams = null
         pickSlot = null
 
         val p = v.points.lastOrNull()
