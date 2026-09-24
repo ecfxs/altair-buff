@@ -96,6 +96,33 @@ if ! gh repo view "$REPO" >/dev/null 2>&1; then
 fi
 echo "仓库: https://github.com/$REPO"
 
+# ---------------------------------------------------------------- 3.5) 先推 HEAD
+#
+# 教训：v0.24.13 / v0.24.14 的 tag 指的是**上一个**版本的提交 —— 建 release 时
+# 本地新提交还没推上去，GitHub 只能拿远端 main 当时的位置打 tag。源码提交必须先
+# 到远端，tag 才会落在本次发版的那个提交上（v0.26.0 也踩过一次，事后手动修的）。
+if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 \
+   && git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+  BRANCH="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
+  HEAD_SHA="$(git -C "$ROOT" rev-parse HEAD)"
+  echo
+  # 注意：本机 bash 3.2 + UTF-8 下，`$BRANCH（` 这种「变量名紧贴全角字符」会把
+  # 全角字符的首字节吞进变量名，set -u 直接报 unbound 并中止发版。变量名一律
+  # 用 ${} 包住（`${BRANCH}（`）才安全。
+  echo "==== 推送 ${BRANCH}（$(git -C "$ROOT" rev-parse --short HEAD)）===="
+  HEAD_PUSHED=0
+  for i in $(seq 1 12); do
+    if git -C "$ROOT" push origin "$BRANCH" 2>&1 | tail -2; then HEAD_PUSHED=1; break; fi
+    echo "  推送重试 $i / 12 ..."
+    sleep 15
+  done
+  [ "$HEAD_PUSHED" = "1" ] \
+    || echo "  ⚠ $BRANCH 推送失败：tag 可能仍指向远端旧提交（发布照常继续，APK 资产不受影响）"
+else
+  echo "  ⚠ 无 git 仓库或无 origin 远端：跳过预推送，tag 落点不做校验"
+  HEAD_SHA=""
+fi
+
 # ---------------------------------------------------------------- 4) 发布
 TAG="v$VER"
 echo
@@ -108,9 +135,30 @@ NOTES="版本 $VER
 "
 if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
   echo "tag $TAG 已存在，改为上传/覆盖资产"
+  # 重跑发版脚本时**不动 tag**：它应该保持指向首次发版的那个源码提交，
+  # 而此刻 HEAD 往往已经是后面的「dist: 同步到 …」提交了。
   gh release upload "$TAG" "$APK#probe-release.apk" -R "$REPO" --clobber
 else
   gh release create "$TAG" "$APK#probe-release.apk" -R "$REPO" -t "$TAG" -n "$NOTES"
+
+  # 核对 tag 落点：期望是刚推上去的源码提交。不一致（推送失败 / GitHub 仍看到旧
+  # main）就修正 —— tag 指错的话，将来按 tag 回滚会取到别的版本的代码。
+  if [ -n "${HEAD_SHA:-}" ]; then
+    TAG_SHA="$(gh api "repos/$REPO/git/ref/tags/$TAG" -q '.object.sha' 2>/dev/null)"
+    if [ "$TAG_SHA" = "$HEAD_SHA" ]; then
+      echo "  ✅ tag $TAG -> $(git -C "$ROOT" rev-parse --short HEAD)（与本次源码一致）"
+    else
+      TAG_SHA_SHORT="${TAG_SHA:0:7}"
+      [ -n "$TAG_SHA_SHORT" ] || TAG_SHA_SHORT="(读不到)"
+      echo "  ⚠ tag ${TAG} 指向 ${TAG_SHA_SHORT}，应为 ${HEAD_SHA:0:7}，修正中..."
+      if gh api --method PATCH "repos/$REPO/git/refs/tags/$TAG" \
+           -f sha="$HEAD_SHA" -F force=true >/dev/null 2>&1; then
+        echo "  ✅ tag 已修正 -> $(git -C "$ROOT" rev-parse --short HEAD)"
+      else
+        echo "  ⚠ tag 修正失败，手动执行: git push --force origin $HEAD_SHA:refs/tags/$TAG"
+      fi
+    fi
+  fi
 fi
 
 # ---------------------------------------------------------------- 5) 同步 dist（jsDelivr 源）
