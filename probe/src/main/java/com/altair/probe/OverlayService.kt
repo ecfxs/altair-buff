@@ -68,11 +68,11 @@ import java.util.concurrent.TimeUnit
 class OverlayService : Service() {
 
     companion object {
-        private const val CH_ID = "altair_overlay"
+        private const val CH_ID = "altair_controls"
         private const val NOTIF_ID = 1001
 
         /** 展开态面板宽度（dp）。标注按钮要放得下 2 列。 */
-        private const val PANEL_W_FULL = 200
+        private const val PANEL_W_FULL = 248
 
         /** 悬浮球直径（dp）。48 是 Android 的最小触摸目标，再加一圈色环的视觉余量。 */
         private const val BALL_D = 56
@@ -83,26 +83,30 @@ class OverlayService : Service() {
         /** 标点回显开关的持久化键（放 overlay prefs，和门禁目标同一份）。 */
         private const val KEY_MARKS = "marksOn"
 
-        /**
-         * 走位让路方式的持久化键。
-         *
-         * `move`（默认）= 把与注入区重叠的窗口临时挪走 + 置灰；`flag` = 只置灰。
-         * 留这个开关的理由：挪窗口是**几何事实**，任何 ROM 都拦不住，所以默认它；
-         * 但挪走会让面板在走位那几秒里看不见 —— 如果这台机器的 ROM 老实实现了
-         * `FLAG_NOT_TOUCHABLE`（置灰就够），用户切到 `flag` 就能保住"面板一直看得见"。
-         */
-        private const val KEY_GATE = "gateMode"
-        private const val GATE_MOVE = "move"
-        private const val GATE_FLAG = "flag"
-
         /** 面板与球的落点记忆 —— 省得每次启动都重新摆一次。 */
         private const val KEY_PANEL_X = "panelX"
         private const val KEY_PANEL_Y = "panelY"
         private const val KEY_BALL_X = "ballX"
         private const val KEY_BALL_Y = "ballY"
 
+        @Volatile var picking = false
+            private set
+
         @Volatile var running = false
             private set
+
+        /**
+         * 最近一次查到的前台包名（由 [pollLoop] 每 2 秒更新一次）。
+         *
+         * 主界面读这个值判断"游戏是否在前台"，**绝不能**在 UI 线程现查 ——
+         * 一次查询要起一个 `dumpsys window` 进程，按界面 500ms 的刷新节奏会把
+         * 常驻 root 通道占满（历史上正是这样把按键堵成 6 秒一次的）。
+         */
+        @Volatile private var foregroundPkg: String = ""
+
+        /** 目标游戏此刻是否在前台。覆盖层没在运行时一律 false。 */
+        fun isTargetForeground(ctx: Context): Boolean =
+            foregroundPkg.isNotEmpty() && foregroundPkg == targetPkgOf(ctx)
 
         fun start(ctx: Context) {
             val i = Intent(ctx, OverlayService::class.java)
@@ -153,7 +157,6 @@ class OverlayService : Service() {
     private var annoCount: TextView? = null
     private var cancelPickBtn: LinearLayout? = null
     private var marksBtn: TextView? = null
-    private var gateBtn: TextView? = null
 
     /** 标注按钮：槽位 → 按钮。用来刷新"已标/未标"的状态前缀。 */
     private val slotBtns = LinkedHashMap<String, TextView>()
@@ -170,7 +173,12 @@ class OverlayService : Service() {
     private val pickQueue = ArrayDeque<String>()
 
     private var targetPkg: String = "com.nexon.mod"
-    private var lastFg: String = "?"
+    /** 主按钮当前画的是哪一档配色（null = 还没画过）。用来避免 250ms 一次的无谓重绘。 */
+    private var mainBtnRunning: Boolean? = null
+    private var polling = false
+    private var injecting = false
+    private var emergency: View? = null
+    private var pickGeneration = 0
 
     private val ui = Handler(Looper.getMainLooper())
 
@@ -180,6 +188,11 @@ class OverlayService : Service() {
     private fun prefs() = getSharedPreferences("overlay", MODE_PRIVATE)
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == "STOP") Engine.stop("通知栏停止")
+        return START_NOT_STICKY
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -191,7 +204,8 @@ class OverlayService : Service() {
         startForeground(NOTIF_ID, buildNotification())
         LogBus.add(logListener)
         // 注入输入时让覆盖层让路，否则注入会打在自己面板上（见 [InjectShield]）
-        InjectShield.bind { mode, on, l, t, r, b -> onInjectGate(mode, on, l, t, r, b) }
+        // ★ mode 必须透传：INJECT 只置灰（几十毫秒，用户看不见），WALK 才动几何位置。
+        InjectShield.bind { mode, on, l, t, r, b -> injectGate(mode, on, l, t, r, b) }
         showBall()
         running = true
         LogBus.emit(
@@ -199,7 +213,7 @@ class OverlayService : Service() {
                 "点悬浮球展开控制台 → 标注坐标 → 启动任务。"
         )
         Thread {
-            ShellCore.ensureRoot()
+            runCatching { ShellCore.ensureRoot() }.onFailure { LogBus.emit("Root 检查失败：${it.message}") }
             ui.post { refreshStatus(true) }
         }.apply { isDaemon = true }.start()
         // 两条循环错开起跑：500ms 后开始跳秒（纯本地计算），1.2s 后开始查前台（要起 shell）
@@ -208,7 +222,13 @@ class OverlayService : Service() {
     }
 
     override fun onDestroy() {
+        Engine.stop("悬浮窗已关闭")
+        pickGeneration++
+        picking = false
+        emergency?.let { runCatching { wm.removeView(it) } }
+        emergency = null
         running = false
+        foregroundPkg = ""
         InjectShield.bind(null)
         ui.removeCallbacks(tickLoop)
         ui.removeCallbacks(pollLoop)
@@ -227,14 +247,11 @@ class OverlayService : Service() {
 
     // ------------------------------------------------------------ 状态轮询
 
-    /** 上一次跑"重查询"（前台包名）的时间。 */
-    private var lastHeavyRefresh = 0L
-
     /** 快速定时：只更新会随时间变化的倒计时。250ms 让秒数跳得干脆。 */
     private val tickLoop = object : Runnable {
         override fun run() {
             if (!running) return
-            runCatching { tickCountdowns() }
+            runCatching { tickCountdowns(); refreshStatus(true) }
             ui.postDelayed(this, 250)
         }
     }
@@ -244,20 +261,34 @@ class OverlayService : Service() {
      *
      * 前台包名查询要**跨 root shell 起一次进程**（几毫秒到几十毫秒），绝不能按 250ms 跑 ——
      * 那会把常驻 shell 占满，和按键注入抢通道（历史上正是这么把按键堵成 6 秒一次的）。
-     * 2 秒一次足够：门禁只需要在动作发生的那一刻准确，而那一刻 [act] 会自己再查一次。
+     * 空闲时每 2 秒查询一次；执行动作时由 Probe 独立检查。
      */
     private val pollLoop = object : Runnable {
         override fun run() {
             if (!running) return
-            runCatching { refreshHeavy() }
-            runCatching { syncMarks() }
+            if (!polling && !Actions.busy) {
+                polling = true
+                Thread {
+                    val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
+                    ui.post {
+                        polling = false
+                        if (running) {
+                            foregroundPkg = fg
+                            targetPkg = targetPkgOf(this@OverlayService)
+                            refreshStatus(true)
+                            syncMarks()
+                            healTouchability()
+                        }
+                    }
+                }.apply { isDaemon = true; start() }
+            }
             ui.postDelayed(this, 2000)
         }
     }
 
     /** 只重画倒计时，不碰任何会阻塞的东西。 */
     private fun tickCountdowns() {
-        val now = System.currentTimeMillis()
+        val now = android.os.SystemClock.elapsedRealtime()
         ball?.let { b ->
             b.remainMs = Engine.nextBuffDueAt - now
             if (b.visibility == View.VISIBLE) b.invalidate()
@@ -267,13 +298,6 @@ class OverlayService : Service() {
             val s = buildStatus()
             if (statusSummary?.text != s) statusSummary?.text = s
         }
-    }
-
-    /** 重查询：前台包名 + 引擎状态 + 标注徽章。 */
-    private fun refreshHeavy() {
-        val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
-        lastFg = fg
-        refreshStatus(true)
     }
 
     /**
@@ -293,16 +317,28 @@ class OverlayService : Service() {
         }
 
         // 主按钮跟着引擎状态换文案：跑着的时候必须一眼看出"再点就是停"。
+        // 只在状态真的翻转时才重绘背景 —— 这段是 250ms 一次的，每次都建两个 Drawable
+        // 会让悬浮窗一直在做无谓的分配。
         mainBtn?.let { b ->
             val label = if (Engine.isRunning) "⏹  停止任务" else "▶  启动任务"
             if (b.text != label) b.text = label
+            if (mainBtnRunning != Engine.isRunning) {
+                mainBtnRunning = Engine.isRunning
+                // 带水波纹重绘 —— 直接赋 shape() 会把按压反馈换掉
+                b.background = Ui.ripple(
+                    this,
+                    Ui.shape(this, if (Engine.isRunning) Ui.DANGER else Ui.PRIMARY, Ui.RADIUS_CTRL),
+                    Ui.RADIUS_CTRL
+                )
+            }
+            b.isEnabled = !Engine.isStopping
         }
 
         ball?.let { b ->
             b.running = Engine.isRunning
             b.error = Engine.state == Engine.State.ERROR
-            b.armed = lastFg == targetPkg
-            b.remainMs = Engine.nextBuffDueAt - System.currentTimeMillis()
+            b.armed = foregroundPkg == targetPkg
+            b.remainMs = Engine.nextBuffDueAt - android.os.SystemClock.elapsedRealtime()
             if (b.visibility == View.VISIBLE) b.invalidate()
         }
 
@@ -311,10 +347,10 @@ class OverlayService : Service() {
 
     /** 面板摘要：一行，替代改造前的 3 行 statusTv。 */
     private fun buildStatus(): String {
-        val armed = lastFg == targetPkg
+        val armed = foregroundPkg == targetPkg
         return if (Engine.isRunning) {
-            "补 " + Ui.mmss(Engine.nextBuffDueAt - System.currentTimeMillis(), true) +
-                " · 走 " + Ui.mmss(Engine.nextWalkDueAt - System.currentTimeMillis(), true) +
+            "补 " + Ui.mmss(Engine.nextBuffDueAt - android.os.SystemClock.elapsedRealtime(), true) +
+                " · 走 " + Ui.mmss(Engine.nextWalkDueAt - android.os.SystemClock.elapsedRealtime(), true) +
                 " · 补${Engine.buffCastCount}/走${Engine.walkCount}" +
                 if (Engine.failStreak > 0) " · 连败${Engine.failStreak}" else ""
         } else {
@@ -327,45 +363,56 @@ class OverlayService : Service() {
         !Engine.isRunning -> "已停止"
         Engine.state == Engine.State.ERROR -> "⛔ 熔断"
         Engine.state == Engine.State.CASTING -> "▶ 执行中"
-        lastFg == targetPkg -> "▶ 运行中"
+        foregroundPkg == targetPkg -> "▶ 运行中"
         else -> "⏸ 游戏不在前台"
     }
 
     private fun pillColor(): Int = Ui.statusColor(
         running = Engine.isRunning,
         error = Engine.state == Engine.State.ERROR,
-        armed = lastFg == targetPkg
+        armed = foregroundPkg == targetPkg
     )
 
-    private fun annotationProgress(): String =
-        "${Picks.ALL.size - Picks.missing(this).size}/${Picks.ALL.size} 项"
+    /** "已标 / 全部"的进度。必需项与可选项都在里面，缺哪一项由每颗按钮自己标。 */
+    private fun annotationProgress(): String {
+        val list = Picks.checklist(this)
+        return "${list.count { Picks.get(this, it.first) != null }}/${list.size} 项"
+    }
 
-    /** 刷新每颗标注按钮的"已标/未标"前缀。这是改造后新增的：按钮自己带状态。 */
+    /** 必需项是否都标齐了 —— 决定启动按钮是否可用。 */
+    private fun annotationReady(): Boolean = Picks.required(this).all { Picks.get(this, it) != null }
+
+    /** 刷新每颗标注按钮的"已标/未标"前缀。按钮自己带状态，缺哪一项一眼可见。 */
     private fun refreshAnnoBadges() {
         if (slotBtns.isEmpty()) return
         slotBtns.forEach { (slot, btn) ->
             val on = Picks.get(this, slot) != null
-            val want = (if (on) "✓ " else "○ ") + Picks.label(slot)
+            val need = slot in Picks.required(this)
+            // 可选项（跳跃）未标时用「◌ 」而不是「○ 」，避免用户以为少标了就启动不了
+            val mark = if (on) "✓ " else if (need) "○ " else "◌ "
+            val want = mark + Picks.label(slot)
             if (btn.text != want) btn.text = want
             btn.setTextColor(if (on) Ui.TEXT else Ui.TEXT_FAINT)
             btn.background = Ui.ripple(
                 this,
-                Ui.shape(this, if (on) Ui.SURFACE_2 else Ui.BG, Ui.RADIUS_CTRL, if (on) Ui.PRIMARY else Ui.BORDER),
+                Ui.shape(
+                    this,
+                    if (on) Ui.SURFACE_2 else Ui.BG,
+                    Ui.RADIUS_CTRL,
+                    if (on) Ui.PRIMARY else Ui.BORDER
+                ),
                 Ui.RADIUS_CTRL
             )
         }
         annoCount?.let { tv ->
-            val done = Picks.ALL.size - Picks.missing(this).size
-            val want = "$done/${Picks.ALL.size} 已标"
+            val list = Picks.checklist(this)
+            val done = list.count { Picks.get(this, it.first) != null }
+            val want = "$done/${list.size} 已标"
             if (tv.text != want) tv.text = want
-            tv.setTextColor(if (done == Picks.ALL.size) Ui.OK else Ui.TEXT_FAINT)
+            tv.setTextColor(if (annotationReady()) Ui.OK else Ui.TEXT_FAINT)
         }
         marksBtn?.let { b ->
             val want = marksLabel()
-            if (b.text != want) b.text = want
-        }
-        gateBtn?.let { b ->
-            val want = gateLabel()
             if (b.text != want) b.text = want
         }
         // 只在采点进行中才显示「取消标注」—— 平时它只会误导。
@@ -374,6 +421,7 @@ class OverlayService : Service() {
 
     /** 短暂提示：把状态条临时替换成一条消息，2.5 秒后回到正常状态。 */
     private fun flashStatus(msg: String) {
+        if (Looper.myLooper() != Looper.getMainLooper()) { ui.post { flashStatus(msg) }; return }
         statusSummary?.text = msg.take(48)
         ui.postDelayed({ if (running) refreshStatus(true) }, 2500)
     }
@@ -418,63 +466,65 @@ class OverlayService : Service() {
      * 落地，所以 post 过去之后用闩等回来。正常情况下是毫秒级；超时只是兜底。
      */
     private fun onUiSync(block: () -> Unit) {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            block()
-            return
-        }
+        if (Looper.myLooper() == Looper.getMainLooper()) { block(); return }
         val done = CountDownLatch(1)
-        ui.post {
-            runCatching { block() }
-            done.countDown()
+        val error = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+        val job = Runnable {
+            try { block() } catch (t: Throwable) { error.set(t) } finally { done.countDown() }
         }
-        runCatching { done.await(1500, TimeUnit.MILLISECONDS) }
-    }
-
-    /** [InjectShield] 的入口：按让路方式分派。 */
-    private fun onInjectGate(mode: InjectShield.Mode, on: Boolean, l: Int, t: Int, r: Int, b: Int) {
-        when (mode) {
-            InjectShield.Mode.INJECT -> setOverlayTouchable(touchable = !on)
-            InjectShield.Mode.WALK -> walkGate(on, l, t, r, b)
-        }
-    }
-
-    /**
-     * 单次注入的让路：把覆盖层临时置灰（`FLAG_NOT_TOUCHABLE`）。
-     *
-     * 覆盖我们**所有**注入路径（点技能、走位的每一段、跳跃），代价最小。
-     * 采点层也要一起切：任务运行中用户正在标注时，引擎的注入点击会被全屏的采点层吃掉，
-     * **静默存下一个错误坐标** —— 这是本项目最忌讳的失败模式。
-     */
-    private fun setOverlayTouchable(touchable: Boolean) {
-        val wins = overlayWindows()
-        if (wins.isEmpty()) return
-        onUiSync {
-            wins.forEach { (v, p) ->
-                p.flags = if (touchable) {
-                    p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                } else {
-                    p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                }
-                runCatching { wm.updateViewLayout(v, p) }
+        ui.post(job)
+        // 清理阶段也必须等待 UI 恢复，不因 worker 中断留下不可触摸的窗口。
+        val interrupted = Thread.interrupted()
+        try {
+            if (!done.await(2000, TimeUnit.MILLISECONDS)) {
+                ui.removeCallbacks(job)
+                throw IllegalStateException("悬浮窗响应超时，未发送触摸")
             }
+            error.get()?.let { throw IllegalStateException("悬浮窗操作失败", it) }
+        } finally { if (interrupted) Thread.currentThread().interrupt() }
+    }
+
+    private fun showEmergency(l: Int, t: Int, r: Int, b: Int) {
+        if (emergency != null) return
+        val screen = ScreenGeometry.read(this)
+        val w = dp(72); val h = dp(48); val margin = dp(8)
+        val candidates = listOf(margin to margin, screen.width - w - margin to margin,
+            margin to screen.height - h - margin, screen.width - w - margin to screen.height - h - margin)
+        val position = candidates.firstOrNull { (x, y) ->
+            x >= 0 && y >= 0 && !Rect.intersects(Rect(x, y, x + w, y + h), Rect(l, t, r, b))
+        } ?: error("没有可放置停止按钮的区域，请调整标记位置")
+        val v = Ui.btn(this, "停止", Ui.Kind.DANGER) { Engine.stop("快捷停止") }
+        val p = WindowManager.LayoutParams(w, h, overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = position.first; y = position.second
         }
+        wm.addView(v, p)
+        emergency = v
     }
 
     /**
-     * 整段走位的让路：把**与注入区域重叠**的窗口直接挪出画面。
+     * 注入期间让路。按 [InjectShield.Mode] 分两档 —— 见 [InjectShield] 的类注释。
      *
-     * ## 为什么不只靠置灰
-     * 轮盘在左下角，而展开后的面板最高能到屏幕 88% —— 面板与摇杆区重叠是**常态**，
+     * ## INJECT（单次点击，例如补技能）
+     * 只把自有窗口切到 `FLAG_NOT_TOUCHABLE`，**不动几何位置**。窗口不跳、日志不刷。
+     * 曾经这里对两档都执行 WALK 的做法，导致每补一个技能面板就被挪走再放回一次。
+     *
+     * ## WALK（整段走位）
+     * 额外把**与注入区重叠**的窗口缩成 1×1 挪到 (0,0)，并挂一颗快捷停止按钮。
+     * 为什么不只靠置灰：轮盘在左下角，而展开后的面板最高能到屏幕 88% —— 重叠是常态，
      * 这是用户实际踩到的场景（点「试走位」→ 面板吃掉注入 → 面板自己收起成球、角色不动）。
-     * 置灰依赖 ROM 正确实现 `FLAG_NOT_TOUCHABLE`；挪窗口是几何事实，不依赖任何 flag 语义，
-     * 所以走位这条路上两者都上：重叠的挪走，其余置灰。
+     * 置灰依赖 ROM 正确实现那个 flag；挪窗口是几何事实，不依赖任何 flag 语义。
      *
-     * ## 挪去哪
-     * 缩成 1×1 并移到屏幕左上角。**不**用"移到屏幕外"：位置是否被 WindowManager 夹回
-     * 显示区取决于 ROM，1×1 在 (0,0) 则不可能压到左下角摇杆/右下角跳跃键。
+     * 挪去哪：缩成 1×1 并移到屏幕左上角。**不**用"移到屏幕外"：位置是否被 WindowManager
+     * 夹回显示区取决于 ROM，1×1 在 (0,0) 则不可能压到左下角摇杆 / 右下角跳跃键。
      * 走完按原 x/y/w/h 放回去。
      */
-    private fun walkGate(on: Boolean, l: Int, t: Int, r: Int, b: Int) {
+    private fun injectGate(mode: InjectShield.Mode, on: Boolean, l: Int, t: Int, r: Int, b: Int) {
+        val walk = mode == InjectShield.Mode.WALK
+
         // ---- 收尾：全部恢复 ----
         if (!on) {
             val back = synchronized(vacated) {
@@ -483,6 +533,9 @@ class OverlayService : Service() {
                 copy
             }
             onUiSync {
+                injecting = false
+                emergency?.let { runCatching { wm.removeView(it) } }
+                emergency = null
                 overlayWindows().forEach { (v, p) ->
                     p.flags = p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
                     runCatching { wm.updateViewLayout(v, p) }
@@ -493,37 +546,60 @@ class OverlayService : Service() {
                     runCatching { wm.updateViewLayout(v, p) }
                 }
             }
-            if (back.isNotEmpty()) LogBus.emit("🛡 走位让路结束：${back.size} 个窗口已放回原位")
+            if (back.isNotEmpty()) LogBus.emit("🛡 让路结束：${back.size} 个窗口已放回原位")
             return
         }
 
-        // ---- 开始：与注入区重叠的挪走，其余置灰 ----
-        // 置灰档只切 flag（面板保持可见）；挪开档才动几何位置。
-        val move = gateMoves()
+        // ---- 开始 ----
         val inject = Rect(l, t, r, b)
         var moved = 0
         onUiSync {
+            injecting = true
+            removeMarks()
+            if (walk) showEmergency(l, t, r, b)
             overlayWindows().forEach { (v, p) ->
-                val overlaps = move && v.width > 0 && v.height > 0 &&
-                    Rect.intersects(Rect(p.x, p.y, p.x + v.width, p.y + v.height), inject)
-                if (overlaps) {
-                    synchronized(vacated) {
-                        vacated.add(v to intArrayOf(p.x, p.y, p.width, p.height))
+                if (walk) {
+                    val location = IntArray(2)
+                    v.getLocationOnScreen(location)
+                    val overlaps = v.width > 0 && v.height > 0 &&
+                        Rect.intersects(
+                            Rect(location[0], location[1], location[0] + v.width, location[1] + v.height),
+                            inject
+                        )
+                    if (overlaps) {
+                        synchronized(vacated) {
+                            vacated.add(v to intArrayOf(p.x, p.y, p.width, p.height))
+                        }
+                        p.x = 0; p.y = 0; p.width = 1; p.height = 1
+                        moved++
                     }
-                    p.x = 0; p.y = 0; p.width = 1; p.height = 1
-                    moved++
                 }
                 p.flags = p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 runCatching { wm.updateViewLayout(v, p) }
             }
         }
-        LogBus.emit(
-            when {
-                moved > 0 -> "🛡 走位让路：$moved 个窗口与注入区重叠，已临时收起（走完放回）"
-                !move -> "🛡 走位让路：置灰档（只切 FLAG_NOT_TOUCHABLE，面板保持可见）"
-                else -> "🛡 走位让路：没有窗口与注入区重叠（仅置灰）"
+        // INJECT 是每次点击都走的路径，不写日志 —— 否则日志会被"让路"刷屏，淹掉真正的结果。
+        if (walk) {
+            LogBus.emit(
+                if (moved > 0) "🛡 走位让路：$moved 个窗口与注入区重叠，已临时收起（走完放回）"
+                else "🛡 走位让路：没有窗口与注入区重叠（仅置灰）"
+            )
+        }
+    }
+
+    /**
+     * 自愈：万一某次恢复没跑到（超时/异常），自有窗口会一直带着 `FLAG_NOT_TOUCHABLE` ——
+     * 表现为"面板看得见但点不动"。每 2 秒的轮询顺手检查一次，空闲时无条件清掉。
+     */
+    private fun healTouchability() {
+        if (injecting || Actions.busy) return
+        overlayWindows().forEach { (v, p) ->
+            if (p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE != 0) {
+                p.flags = p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                runCatching { wm.updateViewLayout(v, p) }
+                LogBus.emit("🛡 检测到窗口仍处于不可触摸状态，已自动恢复")
             }
-        )
+        }
     }
 
     /** 版本号，写进启动日志 —— 远程排查时第一眼要看的就是"跑的是哪一版"。 */
@@ -641,8 +717,8 @@ class OverlayService : Service() {
 
         v.running = Engine.isRunning
         v.error = Engine.state == Engine.State.ERROR
-        v.armed = lastFg == targetPkg
-        v.remainMs = Engine.nextBuffDueAt - System.currentTimeMillis()
+        v.armed = foregroundPkg == targetPkg
+        v.remainMs = Engine.nextBuffDueAt - android.os.SystemClock.elapsedRealtime()
 
         runCatching { wm.addView(v, p) }
             .onSuccess {
@@ -728,7 +804,7 @@ class OverlayService : Service() {
         content.addView(Ui.divider(this))
 
         // ③ 标注区（可折叠，默认展开）—— 每颗按钮自带"已标/未标"状态
-        val (annoHeader, annoBody) = collapsibleHeader("标注", open = true)
+        val (annoHeader, annoBody) = collapsibleHeader("标记位置", open = !Engine.isRunning)
         annoHead = annoHeader
         annoCount = TextView(this).apply {
             text = "0/6 已标"
@@ -744,7 +820,7 @@ class OverlayService : Service() {
         slotBtns.clear()
         val slotCells = Picks.ALL.map { slot ->
             overlayBtn(("○ ") + Picks.label(slot), fill = Ui.BG, border = Ui.BORDER,
-                heightDp = 30, compact = true) { startSlotPick(slot) }.also { b ->
+                heightDp = 44, compact = true) { startSlotPick(slot) }.also { b ->
                 // ★ 长按 = 从这一颗起连续标注（技能3 → 3、4）
                 b.setOnLongClickListener {
                     if (slot in Picks.SKILLS) {
@@ -758,17 +834,17 @@ class OverlayService : Service() {
                 slotBtns[slot] = b
             }
         }
-        annoBody.addView(compactGrid(slotCells))
+        annoBody.addView(compactGrid(slotCells, cols = 3))
 
-        // 「连续标技能」主入口：面板上直接可见，不用去摸长按
-        annoBody.addView(overlayBtn("▶ 连续标技能 1→4", fill = Ui.SURFACE_2, border = Ui.PRIMARY,
-            heightDp = 30, compact = true) { startSkillSequence(Picks.SKILL1) })
+        // 「按顺序标记」主入口：面板上直接可见，不用去摸长按
+        annoBody.addView(overlayBtn("按顺序标记所需位置", fill = Ui.SURFACE_2, border = Ui.PRIMARY,
+            heightDp = 44, compact = false) { startSkillSequence(Picks.SKILL1) })
 
         cancelPickBtn = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             visibility = View.GONE
             addView(overlayBtn("✕ 取消标注", fill = Ui.SURFACE_2, border = Ui.BORDER,
-                heightDp = 30, compact = true) { cancelSlotPick() })
+                heightDp = 44, compact = true) { cancelSlotPick() })
         }
         annoBody.addView(cancelPickBtn)
 
@@ -777,25 +853,30 @@ class OverlayService : Service() {
         content.addView(toolHeader)
         content.addView(toolBody)
 
-        // 工具区也排成一行 3 键的网格，和上面的标注区一致。
+        // 工具区排成一行 2 键的网格（标签比标注区更长，2 列才放得下）。
         // 4 颗整行按钮原来要占 4 行 —— 展开「工具」时面板高得离谱，也正是「点试走位、
         // 面板盖住轮盘、注入打在自己身上」那类事故的温床（见 [InjectShield]）。
         val marks = overlayBtn(marksLabel(), fill = Ui.SURFACE_2, border = Ui.BORDER,
-            heightDp = 30, compact = true) { toggleMarks() }
+            heightDp = 44, compact = true) { toggleMarks() }
         marksBtn = marks
         toolBody.addView(compactGrid(listOf(
             marks,
             overlayBtn("试走位一次", fill = Ui.SURFACE_2, border = Ui.BORDER,
-                heightDp = 30, compact = true) { testStroll() },
-            overlayBtn("走位自检", fill = Ui.SURFACE_2, border = Ui.BORDER,
-                heightDp = 30, compact = true) { selfTestWalk() },
-            overlayBtn(gateLabel(), fill = Ui.SURFACE_2, border = Ui.BORDER,
-                heightDp = 30, compact = true) { toggleGate() }.also { gateBtn = it },
+                heightDp = 44, compact = true) { testStroll() },
             overlayBtn("复位窗口", fill = Ui.SURFACE_2, border = Ui.BORDER,
-                heightDp = 30, compact = true) { resetPositions() },
-            overlayBtn("清空标注", fill = Ui.SURFACE_2, border = Ui.DANGER,
-                heightDp = 30, compact = true) { clearAllPicks() }
-        )))
+                heightDp = 44, compact = true) { resetPositions() },
+            overlayBtn("选择当前游戏", fill = Ui.SURFACE_2, border = Ui.BORDER,
+                heightDp = 44, compact = true) {
+                Engine.stop("重新选择游戏")
+                Thread {
+                    val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
+                    ui.post {
+                        if (fg.isBlank() || fg == packageName) flashStatus("请先切到游戏")
+                        else { setTargetPkgOf(this, fg); targetPkg = fg; flashStatus("已选择当前游戏") }
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+        ), cols = 2))
 
         val scroll = ScrollView(this).apply {
             addView(content)
@@ -845,37 +926,43 @@ class OverlayService : Service() {
         statusPill = null
         statusSummary = null
         mainBtn = null
+        mainBtnRunning = null      // 按钮跟着面板一起没了，下次重建必须强制重绘一次
         annoHead = null
         annoCount = null
         marksBtn = null
-        gateBtn = null
         cancelPickBtn = null
         slotBtns.clear()
     }
 
     private fun marksLabel() = if (marksOnOf(this)) "回显:开" else "回显:关"
 
-    /** 走位让路是否要"挪窗口"（默认要；置灰档位见 [KEY_GATE]）。 */
-    private fun gateMoves() = prefs().getString(KEY_GATE, GATE_MOVE) != GATE_FLAG
-
-    private fun gateLabel() = if (gateMoves()) "让路:挪开" else "让路:置灰"
-
     /**
      * 高度兜底：横屏可用高度只有 720px，展开后的面板很容易顶出屏幕。
      * 把总高限制在屏幕 88% 以内，超出部分交给 ScrollView 内部滚动。
      */
+    /**
+     * 高度兜底：横屏可用高度只有 720px，展开后的面板很容易顶出屏幕。
+     * 把总高限制在屏幕 88% 以内，超出部分交给 ScrollView 内部滚动。
+     *
+     * ## 为什么要能"缩回去"
+     * 曾经这里只在超高时设一个**固定**高度，内容变矮之后从不恢复 —— 于是展开过一次「工具」，
+     * 之后再收起，面板会永远停在 88% 高度，下半截是空的。现在每次都按内容高度重新决定：
+     * 内容装得下就回到 `WRAP_CONTENT`，装不下才钉住上限。
+     */
     private fun capPanelHeight() {
-        val root = panel ?: return
+        if (panel == null) return
         val scroll = panelScroll ?: return
-        val maxTotal = (resources.displayMetrics.heightPixels * 0.88f).toInt()
-        if (root.height > maxTotal) {
-            val titleH = (statusPill?.height ?: dp(20))
-            val limit = (maxTotal - titleH - dp(12)).coerceAtLeast(dp(60))
-            scroll.layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, limit
-            )
-            scroll.requestLayout()
-        }
+        val exact = resources.displayMetrics.heightPixels * 0.88f
+        val titleH = (statusPill?.height ?: dp(20))
+        val limit = (exact.toInt() - titleH - dp(12)).coerceAtLeast(dp(60))
+        // 内容实际需要多高：ScrollView 里那个子 View 的测量高度。
+        val content = (scroll.getChildAt(0) as? View)?.measuredHeight ?: return
+        val want = if (content > limit) limit else LinearLayout.LayoutParams.WRAP_CONTENT
+        val lp = scroll.layoutParams as? LinearLayout.LayoutParams ?: return
+        if (lp.height == want) return
+        lp.height = want
+        scroll.layoutParams = lp
+        scroll.requestLayout()
     }
 
     /** 把所有窗口位置重置回默认（右上角球 / 左上角面板）。 */
@@ -906,14 +993,17 @@ class OverlayService : Service() {
         label: String,
         fill: Int,
         border: Int = 0,
-        heightDp: Int = 28,
+        heightDp: Int = 44,
         compact: Boolean = false,
         onClick: () -> Unit
     ): TextView = TextView(this).apply {
         text = label
         gravity = Gravity.CENTER
-        setTextSize(TypedValue.COMPLEX_UNIT_DIP, if (compact) 9f else 10f)
+        // 12dp：3 列网格里最长的标签是「○ 轮盘中心」，用 dp 而不是 sp 才不会随系统字号撑破框。
+        setTextSize(TypedValue.COMPLEX_UNIT_DIP, if (compact) 11.5f else 13f)
         setTextColor(Ui.TEXT)
+        maxLines = 1
+        ellipsize = TextUtils.TruncateAt.END
         setPadding(dp(2), 0, dp(2), 0)
         background = Ui.ripple(this@OverlayService, Ui.shape(
             this@OverlayService, fill, Ui.RADIUS_CTRL, border), Ui.RADIUS_CTRL)
@@ -939,10 +1029,13 @@ class OverlayService : Service() {
         }
 
     /**
-     * 一行 [cols] 列（默认 3）的紧凑网格。
+     * 一行 [cols] 列的紧凑网格。
      *
      * 面板宽度只有 [PANEL_W_FULL] dp，竖着堆整行按钮的话，展开「工具」后面板会一路长到
-     * 屏幕 88% 的高度（标注 + 工具共 10 颗）。网格化之后这两组各占 2 行，面板高度减半。
+     * 屏幕 88% 的高度（标注 + 工具共 10 颗）。网格化之后整个面板只要 4~5 行按钮。
+     *
+     * 列数按标签长度选：标注槽位是「○ 技能1」这种短标签 → **3 列**；
+     * 工具区是「选择当前游戏」这种长标签 → **2 列**（3 列会被省略号截断）。
      *
      * 每格用 [overlayBtn] 的 `compact = true`：它已经带好 `width=0 + weight=1`，
      * 由本方法负责按行切分与间距。
@@ -950,7 +1043,7 @@ class OverlayService : Service() {
      * 最后一行不足 [cols] 个时补透明占位 —— 否则最后一行那颗按钮会**独占整行宽度**，
      * 和上面几行对不齐（看起来像漏了一格）。
      */
-    private fun compactGrid(cells: List<View>, cols: Int = 3): LinearLayout {
+    private fun compactGrid(cells: List<View>, cols: Int): LinearLayout {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         cells.chunked(cols).forEach { rowCells ->
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -1000,33 +1093,6 @@ class OverlayService : Service() {
 
     // ------------------------------------------------------------ 动作
 
-    /**
-     * 执行一个动作。
-     *
-     * [guard] 为 true 时先做**前台门禁**：只有目标游戏在前台才执行。
-     * 这是防止「在错误界面上乱点」的关键。
-     */
-    private fun act(label: String, guard: Boolean = true, block: () -> String) {
-        LogBus.emit("▸ $label")
-        Thread {
-            if (guard) {
-                val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
-                if (fg != targetPkg) {
-                    LogBus.emit(
-                        "   ⛔ 已跳过：当前前台是「${fg.ifBlank { "未知" }}」，" +
-                            "不是目标游戏「$targetPkg」（用「用当前前台标定」可改目标）"
-                    )
-                    flashStatus("⛔ 游戏不在前台")
-                    return@Thread
-                }
-            }
-            val r = runCatching { block() }
-                .getOrElse { "出错: ${it.javaClass.simpleName}: ${it.message}" }
-            LogBus.emit(r.trimEnd())
-            ui.post { refreshStatus(true) }
-        }.apply { isDaemon = true }.start()
-    }
-
     /** 启动挂机引擎（等于主界面的启动，省得来回切 App）。 */
     private fun startEngine() {
         runCatching { Engine.start(this) }
@@ -1051,39 +1117,15 @@ class OverlayService : Service() {
 
     /** 手动试一次走位（不补 BUFF，纯验证走位闭环）。 */
     private fun testStroll() {
+        if (Engine.isRunning || Engine.isStopping || Busy.isBusy || Actions.busy || pickView != null) {
+            flashStatus("请先停止任务并完成标记")
+            return
+        }
         Thread {
-            LogBus.emit("▸ 试走位一次")
-            LogBus.emit("   " + WalkFlow.describe(this).replace("\n", "；"))
-            val r = runCatching { WalkFlow.strollAndJump { LogBus.emit(it) } }
-                .getOrElse { false to "走位异常：${it.javaClass.simpleName}: ${it.message}" }
-            LogBus.emit(if (r.first) "   ✅ ${r.second}" else "   ⚠ ${r.second}")
-            flashStatus(if (r.first) "✅ 走位完成" else "⚠ 走位有问题")
-            ui.post { refreshStatus(true) }
-        }.apply { isDaemon = true }.start()
-    }
-
-    /**
-     * 走位手势自检：4 种推杆发法各跑一遍，用户看角色哪一种动了。
-     *
-     * 走位不动到底是"注入被面板吃掉"还是"手势本身这台机器不认"，只有实机能区分；
-     * 这个按钮把前者排除掉（自检也走 [InjectShield] 让路），剩下的答案就落在手势上。
-     */
-    private fun selfTestWalk() {
-        Thread {
-            runCatching { WalkFlow.selfTest { LogBus.emit(it) } }
-                .onFailure { LogBus.emit("   自检异常：${it.javaClass.simpleName}: ${it.message}") }
-            flashStatus("走位自检完成")
-            ui.post { refreshStatus(true) }
-        }.apply { isDaemon = true }.start()
-    }
-
-    private fun clearAllPicks() {
-        Picks.clearAll(this)
-        LogBus.emit("已清空全部标注（技能1-4 / 跳跃 / 轮盘）。")
-        flashStatus("已清空标注")
-        marksView?.let { runCatching { wm.removeView(it) } }
-        marksView = null
-        ui.post { refreshStatus(true) }
+            val result = WalkFlow.strollAndJump { LogBus.emit(it) }
+            LogBus.emit(result.second)
+            flashStatus(result.second)
+        }.apply { isDaemon = true; start() }
     }
 
     // ------------------------------------------------------------ 单点标注
@@ -1102,7 +1144,20 @@ class OverlayService : Service() {
      * ★ 必须先摘下面板再加采点层，否则采点层盖住面板，用户便无法点「取消标注」。
      */
     private fun startSlotPick(slot: String) {
-        if (pickView != null) finishSlotPick()
+        Engine.stop("标记位置，完成后请重新启动")
+        picking = true
+        val generation = ++pickGeneration
+        fun begin() {
+            if (!running || generation != pickGeneration) return
+            if (Actions.busy || Engine.isStopping) { ui.postDelayed({ begin() }, 100); return }
+            openSlotPick(slot)
+        }
+        begin()
+    }
+
+    private fun openSlotPick(slot: String) {
+        if (pickView != null) cancelSlotPick()
+        val markedScreen = ScreenGeometry.read(this)
         val v = PickView(this, "点一下「${Picks.label(slot)}」在画面上的位置")
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -1113,7 +1168,15 @@ class OverlayService : Service() {
                 or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         )
-        v.onFinish = { ui.post { finishSlotPick() } }
+        v.onFinish = { ui.post { cancelSlotPick() } }
+        v.onPick = { _, _, _ -> ui.post {
+            if (pickView === v) {
+                if (ScreenGeometry.read(this) != markedScreen) {
+                    cancelSlotPick()
+                    flashStatus("屏幕已变化，请重新标记")
+                } else finishSlotPick()
+            }
+        } }
 
         removePanel()                       // ★ 顺序见上
         runCatching { wm.addView(v, p) }
@@ -1124,16 +1187,17 @@ class OverlayService : Service() {
 
                 // 连续模式下把进度说清楚，用户才知道还剩几项、点完会不会自动接上下一项
                 val msg = if (pickQueue.isNotEmpty()) {
-                    "连续标注 ${Picks.SKILLS.indexOf(slot) + 1}/${Picks.SKILLS.size}：" +
+                    "依次标记：" +
                         "点画面上「${Picks.label(slot)}」的位置（点完自动接下一项）"
                 } else {
-                    "标注「${Picks.label(slot)}」：点画面上那个位置，再点下方「完成」"
+                    "标记「${Picks.label(slot)}」：点一下自动保存"
                 }
                 LogBus.emit(msg)
             }
             .onFailure {
                 pickView = null
                 pickSlot = null
+                picking = false
                 pickQueue.clear()
                 LogBus.emit("标注层添加失败：${it.message}")
                 ui.post { showPanel("采点层添加失败，退回面板") }
@@ -1152,13 +1216,16 @@ class OverlayService : Service() {
         val start = Picks.SKILLS.indexOf(from)
         if (start < 0) return
         pickQueue.clear()
-        Picks.SKILLS.drop(start).forEach { pickQueue.addLast(it) }
+        Picks.required(this).filter { it !in Picks.SKILLS || Picks.SKILLS.indexOf(it) >= start }
+            .forEach { pickQueue.addLast(it) }
         LogBus.emit("连续标注开始：${Picks.SKILLS.drop(start).joinToString(" → ") { Picks.label(it) }}")
         startSlotPick(pickQueue.removeFirst())
     }
 
     /** 用户主动取消标注（面板上的按钮）。采到一半也能退，连续模式下会中止整个队列。 */
     private fun cancelSlotPick() {
+        pickGeneration++
+        picking = false
         val v = pickView ?: return
         val slot = pickSlot          // 先取出来，下面会被清空
         runCatching { wm.removeView(v) }
@@ -1218,32 +1285,11 @@ class OverlayService : Service() {
             ui.post { startSlotPick(next) }
             return
         }
+        picking = false
         showPanel("标注完成")      // 采完回到展开面板
     }
 
     // ------------------------------------------------------------ 标点回显
-
-    /**
-     * 切换走位让路方式：挪开 ↔ 仅置灰。
-     *
-     * 两种都保证"注入不落到自己面板上"，区别只在**能不能依赖 ROM 正确实现
-     * FLAG_NOT_TOUCHABLE**：挪开是几何事实（一定生效，但走位那几秒面板看不见），
-     * 置灰只改 flag（面板一直看得见，但依赖 ROM）。默认挪开 —— 先保证能走。
-     */
-    private fun toggleGate() {
-        val next = if (gateMoves()) GATE_FLAG else GATE_MOVE
-        prefs().edit().putString(KEY_GATE, next).apply()
-        gateBtn?.text = gateLabel()
-        LogBus.emit(
-            if (next == GATE_MOVE) {
-                "走位让路＝挪开：与摇杆区重叠的窗口会在走位期间临时收起（走完放回）"
-            } else {
-                "走位让路＝仅置灰：只切 FLAG_NOT_TOUCHABLE，面板保持可见；" +
-                    "若走位时面板还会自己动，说明这台机器没按标准处理该 flag，改回「挪开」"
-            }
-        )
-        flashStatus(gateLabel())
-    }
 
     private fun toggleMarks() {
         val on = !marksOnOf(this)
@@ -1256,7 +1302,8 @@ class OverlayService : Service() {
 
     /** 回显只在「开关打开 + 目标游戏在前台」时显示 —— 免得在桌面上也糊一层。 */
     private fun syncMarks() {
-        val shouldShow = marksOnOf(this) && lastFg == targetPkg
+        if (injecting) { removeMarks(); return }
+        val shouldShow = marksOnOf(this) && foregroundPkg == targetPkg
         if (shouldShow && marksView == null) addMarks()
         else if (!shouldShow && marksView != null) removeMarks()
         if (marksView != null) refreshMarks()
@@ -1269,9 +1316,15 @@ class OverlayService : Service() {
         v.invalidate()
     }
 
+    /**
+     * 回显层要画的东西：**槽位键** + 归一化坐标。
+     *
+     * 传槽位键而不是中文标签：标签只是显示文案，改一次文案就断一批字符串比较。
+     * 颜色与文案都由 [MarksView] 从键派生。
+     */
     private fun marksData(): List<Triple<String, Float, Float>> =
         Picks.ALL.mapNotNull { slot ->
-            Picks.get(this, slot)?.let { Triple(Picks.label(slot), it.first, it.second) }
+            Picks.get(this, slot)?.let { Triple(slot, it.first, it.second) }
         }
 
     private fun removeMarks() {
@@ -1306,7 +1359,7 @@ class OverlayService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             if (nm.getNotificationChannel(CH_ID) == null) {
                 nm.createNotificationChannel(
-                    NotificationChannel(CH_ID, "悬浮控制台", NotificationManager.IMPORTANCE_MIN).apply {
+                    NotificationChannel(CH_ID, "悬浮控制台", NotificationManager.IMPORTANCE_LOW).apply {
                         setShowBadge(false)
                     }
                 )
@@ -1317,6 +1370,10 @@ class OverlayService : Service() {
         return b.setContentTitle("阿尔泰挂机 · 悬浮控制台运行中")
             .setContentText("点悬浮球展开控制台")
             .setSmallIcon(android.R.drawable.ic_menu_edit)
+            .addAction(android.R.drawable.ic_media_pause, "停止任务",
+                android.app.PendingIntent.getService(this, 1,
+                    Intent(this, OverlayService::class.java).setAction("STOP"),
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE))
             .setOngoing(true)
             .build()
     }
@@ -1446,11 +1503,14 @@ class MarksView(ctx: Context) : View(ctx) {
             canvas.drawLine(0f, h * i / 10f, w, h * i / 10f, guide)
         }
 
+        val screen = ScreenGeometry.read(context)
+        val origin = IntArray(2)
+        getLocationOnScreen(origin)
         // ---- 轮盘中心 + 左右推杆落点 ----
         joystick?.let { (nx, ny) ->
-            val cx = nx * w
-            val cy = ny * h
-            val off = pushPct / 100f * w
+            val cx = nx * screen.width - origin[0]
+            val cy = ny * screen.height - origin[1]
+            val off = pushPct / 100f * screen.width
             stroke.color = Color.parseColor("#FF3BD16F")
             stroke.strokeWidth = 4f
             canvas.drawCircle(cx, cy, 30f, stroke)
@@ -1470,10 +1530,11 @@ class MarksView(ctx: Context) : View(ctx) {
         }
 
         // ---- 标注点 ----
-        items.forEach { (label, nx, ny) ->
-            val cx = nx * w
-            val cy = ny * h
-            val c = colorOf(label)
+        items.forEach { (slot, nx, ny) ->
+            val cx = nx * screen.width - origin[0]
+            val cy = ny * screen.height - origin[1]
+            val label = Picks.label(slot)
+            val c = colorOf(slot)
             stroke.color = c
             stroke.strokeWidth = 4f
             canvas.drawCircle(cx, cy, 26f, stroke)
@@ -1488,18 +1549,24 @@ class MarksView(ctx: Context) : View(ctx) {
 
         // ---- 尺寸与"还缺什么" ----
         text.color = Color.parseColor("#FF3BC9D1")
-        val missing = Picks.ALL.filter { slot -> items.none { it.first == Picks.label(slot) } }
+        val marked = items.map { it.first }.toSet()
+        val missing = Picks.required(context).filter { it !in marked }
+        val jumpMissing = !Picks.jumpReady(context)
         canvas.drawText(
             "${width}x${height} ${if (width > height) "横屏" else "竖屏"}  已标注 ${items.size}/${Picks.ALL.size}" +
-                if (missing.isEmpty()) "（齐了）"
-                else "（缺：${missing.joinToString("/") { Picks.label(it) }}）",
+                when {
+                    missing.isNotEmpty() -> "（缺：${missing.joinToString("/") { Picks.label(it) }}）"
+                    jumpMissing -> "（必需项齐了；跳跃未标，走位不跳）"
+                    else -> "（齐了）"
+                },
             12f, h - 14f, text
         )
     }
 
-    private fun colorOf(label: String): Int = when (label) {
-        "技能1", "技能2", "技能3", "技能4" -> Color.parseColor("#FFFFC53D")
-        "跳跃" -> Color.parseColor("#FFFF7A3D")
+    /** 颜色按**槽位**而不是显示文案决定 —— 改文案不该影响配色。 */
+    private fun colorOf(slot: String): Int = when (slot) {
+        in Picks.SKILLS -> Color.parseColor("#FFFFC53D")
+        Picks.JUMP -> Color.parseColor("#FFFF7A3D")
         else -> Color.parseColor("#FF3BC9D1")
     }
 }

@@ -35,7 +35,7 @@ object LogBus {
         }
     }
 
-    /** 追加一行并自动补时间戳（用于异常等需要定位时刻的场景）。 */
+    /** 追加一行并自动补时间戳。长耗时操作（更新/检查）的**结果**用它，便于在日志里定位时刻。 */
     fun emitStamped(s: String) {
         emit("[${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())}] $s")
     }

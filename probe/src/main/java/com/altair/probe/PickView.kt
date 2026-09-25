@@ -20,10 +20,12 @@ import android.view.View
  *
  * 这一层就是干这个的 —— 全屏透明、可触摸：
  *   - 用户看到的是游戏画面（底下透出来）
- *   - 点一下，就记录下那个位置的归一化坐标，并画一个带编号的标记
+ *   - 点一下，就记录下那个位置的归一化坐标，画一个十字标记，然后由 [OverlayService] 落盘
  *   - 游戏收不到这次点击（正好，标注时不该产生副作用）
  *
- * 一次只标**一个**槽位（技能1..4 / 跳跃 / 轮盘），采到就由 [OverlayService] 存进 [Picks]。
+ * ## 为什么自带一个「取消」按钮
+ * 采点层是全屏可触摸的，会盖住悬浮面板，用户没法回去点面板上的按钮退出。
+ * 所以退出路径必须长在这一层上。
  */
 class PickView(ctx: Context, private val hint: String = "") : View(ctx) {
 
@@ -33,9 +35,10 @@ class PickView(ctx: Context, private val hint: String = "") : View(ctx) {
     /** 每采到一个点回调：(序号从1开始, nx, ny)。 */
     var onPick: ((Int, Float, Float) -> Unit)? = null
 
-    /** 点「完成采点」时的回调 —— 用于退出采集模式。 */
+    /** 点「取消」时的回调 —— 用于退出采集模式。 */
     var onFinish: (() -> Unit)? = null
 
+    // ---- 画点用的笔 ----
     private val cross = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 4f
@@ -62,56 +65,73 @@ class PickView(ctx: Context, private val hint: String = "") : View(ctx) {
         color = Color.parseColor("#33FFFFFF")
     }
 
-    // ---- 内置「完成采点」按钮 ----
-    // 为什么必须在采集层里自带一个退出按钮：采集层是全屏可触摸的，
-    // 会盖住悬浮面板，用户就没法回去点面板上的「★采点」来关闭了。
-    private val finishRect = RectF()
-    private var finishPressed = false
-    private val finishBg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    // ---- 顶部提示条 / 底部取消按钮（各用各的笔，避免配色互相污染）----
+    private val hintBg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.parseColor("#E62563EB")
+        color = Color.parseColor("#E6000000")
     }
-    private val finishEdge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 4f
-        color = Color.WHITE
-    }
-    private val finishText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        textSize = 40f
+    private val hintText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = 32f
         typeface = Typeface.DEFAULT_BOLD
         color = Color.WHITE
         textAlign = Paint.Align.CENTER
     }
+    private val cancelBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val cancelEdge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.parseColor("#66FFFFFF")
+    }
+    private val cancelText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = 34f
+        typeface = Typeface.DEFAULT_BOLD
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+    }
+
+    private val cancelRect = RectF()
+    private var cancelPressed = false
 
     init {
         isClickable = true
         setBackgroundColor(Color.TRANSPARENT)
     }
 
+    /** 取消按钮的矩形在尺寸确定时算一次，供 [onTouchEvent] 做命中判定。 */
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        val bw = minOf(w * 0.42f, 380f)
+        val bh = 104f
+        val margin = 48f
+        cancelRect.set((w - bw) / 2f, h - bh - margin, (w + bw) / 2f, h - margin)
+    }
+
     override fun onTouchEvent(e: MotionEvent): Boolean {
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                finishPressed = finishRect.contains(e.x, e.y)
-                if (finishPressed) invalidate()
+                cancelPressed = cancelRect.contains(e.x, e.y)
+                if (cancelPressed) invalidate()
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                if (finishPressed && !finishRect.contains(e.x, e.y)) {
-                    finishPressed = false
+                if (cancelPressed && !cancelRect.contains(e.x, e.y)) {
+                    cancelPressed = false
                     invalidate()
                 }
                 return true
             }
             MotionEvent.ACTION_UP -> {
-                if (finishPressed) {
-                    finishPressed = false
+                if (cancelPressed) {
+                    cancelPressed = false
                     invalidate()
-                    onFinish?.invoke()      // 点的是「完成」按钮 → 退出采集，不记录坐标
+                    onFinish?.invoke()      // 点的是「取消」→ 退出采集，不记录坐标
                     return true
                 }
-                if (width <= 0 || height <= 0) return true
-                val nx = (e.x / width).coerceIn(0f, 1f)
-                val ny = (e.y / height).coerceIn(0f, 1f)
+                // 一个槽位只采一个点：已经采到了就忽略后续点击，等 [OverlayService] 摘掉这一层。
+                if (width <= 0 || height <= 0 || points.isNotEmpty()) return true
+                val screen = ScreenGeometry.read(context)
+                val nx = (e.rawX / screen.width).coerceIn(0f, 1f)
+                val ny = (e.rawY / screen.height).coerceIn(0f, 1f)
                 points.add(nx to ny)
                 onPick?.invoke(points.size, nx, ny)
                 invalidate()
@@ -119,19 +139,6 @@ class PickView(ctx: Context, private val hint: String = "") : View(ctx) {
             }
         }
         return super.onTouchEvent(e)
-    }
-
-    fun clearAll() {
-        points.clear()
-        invalidate()
-    }
-
-    /** 导出成便于粘贴的文本。 */
-    fun export(prefix: String = "点"): String {
-        if (points.isEmpty()) return "（还没有采集任何坐标）"
-        return points.mapIndexed { i, (x, y) ->
-            "%s%d = [%.4f, %.4f]".format(prefix, i + 1, x, y)
-        }.joinToString("\n")
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -145,9 +152,12 @@ class PickView(ctx: Context, private val hint: String = "") : View(ctx) {
             canvas.drawLine(0f, h * i / 10f, w, h * i / 10f, guide)
         }
 
+        val screen = ScreenGeometry.read(context)
+        val origin = IntArray(2)
+        getLocationOnScreen(origin)
         points.forEachIndexed { i, (nx, ny) ->
-            val cx = nx * w
-            val cy = ny * h
+            val cx = nx * screen.width - origin[0]
+            val cy = ny * screen.height - origin[1]
             val r = 30f
             canvas.drawCircle(cx, cy, r + 3f, halo)
             canvas.drawCircle(cx, cy, r, cross)
@@ -155,43 +165,32 @@ class PickView(ctx: Context, private val hint: String = "") : View(ctx) {
             canvas.drawLine(cx - r - 14f, cy, cx + r + 14f, cy, cross)
             canvas.drawLine(cx, cy - r - 14f, cx, cy + r + 14f, halo)
             canvas.drawLine(cx, cy - r - 14f, cx, cy + r + 14f, cross)
-            // 编号（带黑底描边，保证在任何画面上都看得清）
+            // 编号（带底色圆点，保证在任何画面上都看得清）
             val n = "${i + 1}"
             canvas.drawCircle(cx + r + 22f, cy - r - 22f, 20f, dot)
             canvas.drawText(n, cx + r + 22f - (if (n.length > 1) 16f else 9f), cy - r - 11f, text)
         }
 
         drawHint(canvas, w)
-        drawFinishButton(canvas, w, h)
+        drawCancelButton(canvas)
     }
 
     /** 顶部提示条：明确告诉用户"现在标的是哪一项"，避免标错槽位。 */
     private fun drawHint(canvas: Canvas, w: Float) {
         if (hint.isBlank()) return
-        val tw = text.measureText(hint)
-        val boxW = tw + 40f
+        val tw = hintText.measureText(hint)
+        val boxW = minOf(tw + 56f, w - 32f)
         val left = (w - boxW) / 2f
-        finishBg.color = Color.parseColor("#E6000000")
-        canvas.drawRoundRect(
-            android.graphics.RectF(left, 24f, left + boxW, 24f + 62f), 16f, 16f, finishBg
-        )
-        text.color = Color.WHITE
-        canvas.drawText(hint, left + 20f, 24f + 44f, text)
+        canvas.drawRoundRect(RectF(left, 20f, left + boxW, 96f), 20f, 20f, hintBg)
+        val baseline = 20f + 48f - (hintText.descent() + hintText.ascent()) / 2f
+        canvas.drawText(hint, w / 2f, baseline, hintText)
     }
 
-    private fun drawFinishButton(canvas: Canvas, w: Float, h: Float) {
-        val bw = 380f
-        val bh = 104f
-        val margin = 56f
-        finishRect.set(
-            (w - bw) / 2f, h - bh - margin,
-            (w - bw) / 2f + bw, h - margin
-        )
-        finishBg.color = if (finishPressed) Color.parseColor("#E63B82F6") else Color.parseColor("#E62563EB")
-        canvas.drawRoundRect(finishRect, 22f, 22f, finishBg)
-        canvas.drawRoundRect(finishRect, 22f, 22f, finishEdge)
-        val label = if (points.isEmpty()) "完成标注（还没点）" else "完成标注（已点 ${points.size} 个）"
-        val cy = finishRect.centerY() - (finishText.descent() + finishText.ascent()) / 2f
-        canvas.drawText(label, finishRect.centerX(), cy, finishText)
+    private fun drawCancelButton(canvas: Canvas) {
+        cancelBg.color = if (cancelPressed) Color.parseColor("#E6B4453C") else Color.parseColor("#B3151A21")
+        canvas.drawRoundRect(cancelRect, 22f, 22f, cancelBg)
+        canvas.drawRoundRect(cancelRect, 22f, 22f, cancelEdge)
+        val cy = cancelRect.centerY() - (cancelText.descent() + cancelText.ascent()) / 2f
+        canvas.drawText("取消标注", cancelRect.centerX(), cy, cancelText)
     }
 }

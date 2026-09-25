@@ -34,7 +34,6 @@ class Updater(
     companion object {
         private const val PREF = "updater"
         private const val KEY_URL = "apk_url"
-        private const val KEY_AUTO = "auto_check"
         /**
          * 默认更新源：GitHub Release 的 latest 固定地址。
          * 它**永远指向最新 release**，所以配一次就永久有效 —— 以后每次发新版
@@ -74,7 +73,12 @@ class Updater(
 
     // ------------------------------------------------------------ 配置持久化
 
-    /** 已保存的更新源；没保存过则返回 [DEFAULT_URL]。 */
+    /**
+     * 「使用指定文件更新」那一栏记住的地址；没保存过则返回 [DEFAULT_URL]。
+     *
+     * 只记地址、不记"是否自动检查"：更新**只应该**在用户手动点击时发生（设计原则），
+     * 所以没有 auto-check 这个开关 —— 有了它就会有人打开，然后半夜把正在挂机的机器重启掉。
+     */
     fun savedUrl(): String {
         val u = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString(KEY_URL, "") ?: ""
         return u.ifBlank { DEFAULT_URL }
@@ -83,15 +87,10 @@ class Updater(
     fun saveUrl(u: String) =
         ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putString(KEY_URL, u.trim()).apply()
 
-    /** 启动时是否自动检查更新。**默认关闭** —— 更新只应在手动点击时发生。 */
-    fun autoCheck(): Boolean =
-        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean(KEY_AUTO, false)
-
-    fun setAutoCheck(b: Boolean) =
-        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putBoolean(KEY_AUTO, b).apply()
-
     fun currentVersionCode(): Long = try {
-        ctx.packageManager.getPackageInfo(ctx.packageName, 0).longVersionCode
+        ctx.packageManager.getPackageInfo(ctx.packageName, 0).let {
+            if (android.os.Build.VERSION.SDK_INT >= 28) it.longVersionCode else it.versionCode.toLong()
+        }
     } catch (_: Throwable) {
         1L
     }
@@ -103,7 +102,6 @@ class Updater(
     }
 
     /** 读取上次自更新的日志。应用被 pm install 杀掉后，下次启动靠它确认结果。 */
-    /** 确保 root shell 可用；未建立时自动建立。 */
     private fun ensure(): Boolean = if (sh.isAlive) true else sh.open()
 
     fun readUpdateLog(): String {
@@ -111,10 +109,6 @@ class Updater(
         val t = sh.exec("cat $LOGFILE 2>/dev/null", 5000)
         return t.ifBlank { "(暂无更新日志)" }
     }
-
-    /** 判断上次自更新是否留下了待确认的结果。 */
-    fun hasUpdateLog(): Boolean =
-        ensure() && sh.exec("test -f $LOGFILE && echo YES", 4000).contains("YES")
 
     // ------------------------------------------------------------ 多源自动更新
 
@@ -125,14 +119,14 @@ class Updater(
      * 因为 jsDelivr 这类 CDN 可能仍缓存旧版，若先下到旧包就立刻判定
      * 「已是最新」，会导致**静默地永远不更新**。所以每个源都要校验 versionCode。
      */
-    fun updateAuto(force: Boolean): String {
+    fun updateAuto(): String {
         if (!ensure()) return "root shell 不可用，无法自更新"
         val cur = currentVersionCode()
         val sb = StringBuilder()
         sb.append("当前版本 versionCode=$cur (${currentVersionName()})\n")
         sb.append("依次尝试 ${SOURCES.size} 个更新源…\n\n")
 
-        var anyReachable = false
+        var anyValid = false
         for ((name, url) in SOURCES) {
             val apk = File(ctx.cacheDir, "update.apk")
             sb.append("▸ $name\n")
@@ -144,14 +138,14 @@ class Updater(
                 false
             }
             if (!got) continue
-            anyReachable = true
 
             val info = ctx.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)
             if (info == null) { sb.append("   不是有效 APK\n"); continue }
             if (info.packageName != ctx.packageName) {
                 sb.append("   包名不匹配: ${info.packageName}\n"); continue
             }
-            val v = info.longVersionCode
+            anyValid = true
+            val v = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
             sb.append("   下载 ${apk.length() / 1024} KB   versionCode=$v\n")
             if (v > cur) {
                 sb.append("\n✅ 找到更高版本（$cur → $v），来源：$name\n\n")
@@ -163,7 +157,7 @@ class Updater(
 
         sb.append("\n")
         sb.append(
-            if (!anyReachable) "❌ 所有更新源都不可达。网络受限时可改用「安装本地APK」。"
+            if (!anyValid) "更新检查失败：没有获得有效更新包，请查看各来源错误。"
             else "✅ 已是最新版本（所有可达源都未提供更高版本）"
         )
         return sb.toString()
@@ -197,7 +191,7 @@ class Updater(
             if (info.packageName != ctx.packageName) {
                 return sb.append("包名不匹配：期望 ${ctx.packageName}，实际 ${info.packageName}").toString()
             }
-            val newVer = info.longVersionCode
+            val newVer = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
             val curVer = currentVersionCode()
             sb.append("版本: 当前 $curVer (${currentVersionName()}) → 目标 $newVer\n")
             if (newVer <= curVer && !force) {
@@ -221,12 +215,12 @@ class Updater(
         val path = pathInput.trim()
         if (path.isEmpty()) return "路径为空"
 
-        val exists = sh.exec("test -f '$path' && echo YES || echo NO", 4000)
+        val exists = sh.exec("test -f ${RootShell.quote(path)} && echo YES || echo NO", 4000)
         if (!exists.contains("YES")) return "文件不存在（用 root 也看不到）: $path"
 
         val staged = File(ctx.cacheDir, "local.apk")
         staged.delete()
-        val cp = sh.exec("cp '$path' '${staged.absolutePath}'", 15000)
+        val cp = sh.exec("cp ${RootShell.quote(path)} ${RootShell.quote(staged.absolutePath)}", 15000)
         if (!staged.exists() || staged.length() < 1000) {
             return "复制失败: $cp"
         }
@@ -235,10 +229,11 @@ class Updater(
             ?: return "不是有效 APK"
         if (info.packageName != ctx.packageName) return "包名不匹配: ${info.packageName}"
         val curVer = currentVersionCode()
-        if (info.longVersionCode <= curVer && !force) {
-            return "本地 APK 版本 ${info.longVersionCode} 不高于当前 $curVer（可勾选「强制」重装）"
+        val localVersion = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
+        if (localVersion <= curVer && !force) {
+            return "本地 APK 版本 $localVersion 不高于当前 $curVer（可勾选「强制」重装）"
         }
-        return "本地 APK 版本 ${info.longVersionCode}（当前 $curVer）\n\n" +
+        return "本地 APK 版本 $localVersion（当前 $curVer）\n\n" +
             installDetached(staged.absolutePath)
     }
 
@@ -267,13 +262,14 @@ class Updater(
         """.trimIndent()
 
         val b64 = Base64.encodeToString(script.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-        sh.exec("echo '$b64' | base64 -d > $SCRIPT", 6000)
-        sh.exec("chmod 755 $SCRIPT", 4000)
+        val write = sh.execute("echo '$b64' | base64 -d > $SCRIPT && chmod 700 $SCRIPT", 6000)
+        check(write.ok) { "无法准备更新脚本：${write.text()}" }
 
-        val hasSetsid = sh.exec("which setsid", 3000).trim()
-        val launcher = if (hasSetsid.isNotEmpty()) "setsid $SCRIPT" else "nohup $SCRIPT"
-        // execRaw：不追加 2>&1，否则会破坏这里精确控制的重定向顺序
-        sh.execRaw("$launcher >/dev/null 2>&1 </dev/null &", 4000)
+        val hasSetsid = sh.execute("command -v setsid", 3000).ok
+        val launcher = if (hasSetsid) "setsid $SCRIPT" else "nohup $SCRIPT"
+        // 用 execute 而不是 exec：这里要的是精确控制的重定向顺序，不能给命令追加任何东西。
+        val launch = sh.execute("$launcher >/dev/null 2>&1 </dev/null &", 4000)
+        check(launch.ok) { "无法启动更新：${launch.text()}" }
 
         return """
             已启动后台安装（$launcher）
@@ -295,6 +291,7 @@ class Updater(
         readMs: Int = 60_000,
         onPct: (Int) -> Unit = {}
     ) {
+        require(URL(rawUrl).protocol == "https") { "更新地址必须使用 HTTPS" }
         out.delete()
         // ★ 缓存破坏参数，必须有。
         // GitHub 的 /releases/latest/download/ 重定向会被 CDN 按 URL 缓存。

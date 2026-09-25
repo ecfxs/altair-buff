@@ -6,10 +6,12 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -31,36 +33,36 @@ import java.util.Locale
  *
  * ## 为什么悬浮窗用 dp 而不是 sp
  * 覆盖层里的 sp 会跟随系统字体缩放。目标机是 1280x720 横屏，系统字号一旦调大，
- * 悬浮球和面板里的字就会撑破框 —— 那里一律用 [dpText] 显式换算成像素。
+ * 悬浮球和面板里的字就会撑破框 —— 那里一律用 `COMPLEX_UNIT_DIP` 显式换算。
  * 主界面是普通 Activity，用 sp 没问题（也跟随用户的字号偏好，是应该的）。
+ *
+ * ## 状态色只有一个来源
+ * 按钮的"选中/危险"、状态灯的颜色，全部走 [paint] 与 [statusColor]。
+ * 直接在业务代码里 `background = shape(...)` 会**丢掉水波纹**，
+ * 那正是改造前"按钮点下去没反应"的来源 —— 状态变化请用 [paint]。
  */
 object Ui {
 
     // ------------------------------------------------------------ 颜色
 
-    /** 页面底色。接近黑但不是死黑，比原来的 #0F1216 有层次。 */
-    val BG = Color.parseColor("#12161C")
+    /** 页面底色。接近黑但不是死黑。 */
+    val BG = Color.parseColor("#111916")
 
     /** 卡片面。比底色亮一档，用来分层。 */
-    val SURFACE = Color.parseColor("#1A2029")
+    val SURFACE = Color.parseColor("#1A2520")
 
     /** 输入框底、次级按钮底。 */
-    val SURFACE_2 = Color.parseColor("#232B36")
+    val SURFACE_2 = Color.parseColor("#26342D")
 
     /** 描边。 */
-    val BORDER = Color.parseColor("#232B36")
+    val BORDER = Color.parseColor("#35463B")
 
-    /** 主文字。 */
-    val TEXT = Color.parseColor("#E6EDF5")
-
-    /** 次文字（标签、次要信息）。 */
-    val TEXT_DIM = Color.parseColor("#94A3B8")
-
-    /** 说明文字（最弱的一级）。 */
-    val TEXT_FAINT = Color.parseColor("#64748B")
+    val TEXT = Color.parseColor("#F0F3EA")
+    val TEXT_DIM = Color.parseColor("#B1BFB4")
+    val TEXT_FAINT = Color.parseColor("#9BAB9E")
 
     /** 主色（选中、主要动作）。 */
-    val PRIMARY = Color.parseColor("#3B82F6")
+    val PRIMARY = Color.parseColor("#347B59")
 
     val OK = Color.parseColor("#22C55E")
     val WARN = Color.parseColor("#F59E0B")
@@ -69,7 +71,7 @@ object Ui {
     /** 日志区底，比页面底更深，让等宽文字更清楚。 */
     val LOGBG = Color.parseColor("#0B0E12")
 
-    /** 页签条、状态条的底。 */
+    /** 顶栏 / 底部操作条的底。 */
     val BAR = Color.parseColor("#151A21")
 
     /** 按压反馈的白色水波纹（低透明度）。 */
@@ -89,42 +91,15 @@ object Ui {
 
     fun dp(ctx: Context, v: Int): Int = (v * scale(ctx)).toInt()
 
-    /**
-     * dp 当字号用。
-     *
-     * `TypedValue.COMPLEX_UNIT_DIP` 在 `setTextSize` 里就是"按密度换算、不跟随系统字号"，
-     * 正是悬浮窗需要的。用这个而不是自己乘 —— 免得缩放逻辑和系统不一致。
-     */
-    fun dpText(v: Float) = TypedValue.applyDimension(
-        TypedValue.COMPLEX_UNIT_DIP, v,
-        android.content.res.Resources.getSystem().displayMetrics
-    )
-
     // ------------------------------------------------------------ 形状与背景
 
     /** 统一的圆角矩形工厂。[stroke] 为 0 时不画描边。 */
-    fun shape(ctx: Context, fill: Int, radiusDp: Int = RADIUS_CTRL, stroke: Int = 0, strokeDp: Int = 1)
-            : GradientDrawable = GradientDrawable().apply {
-        setColor(fill)
-        cornerRadius = dp(ctx, radiusDp).toFloat()
-        if (stroke != 0) setStroke(dp(ctx, strokeDp), stroke)
-    }
-
-    /** 左边圆角、右边直角（页签用）。 */
-    fun shapeCorners(
-        ctx: Context, fill: Int, radiusDp: Int, stroke: Int = 0,
-        tl: Boolean = true, tr: Boolean = true, br: Boolean = true, bl: Boolean = true
-    ): GradientDrawable = GradientDrawable().apply {
-        setColor(fill)
-        val r = dp(ctx, radiusDp).toFloat()
-        cornerRadii = floatArrayOf(
-            if (tl) r else 0f, if (tl) r else 0f,
-            if (tr) r else 0f, if (tr) r else 0f,
-            if (br) r else 0f, if (br) r else 0f,
-            if (bl) r else 0f, if (bl) r else 0f
-        )
-        if (stroke != 0) setStroke(dp(ctx, 1), stroke)
-    }
+    fun shape(ctx: Context, fill: Int, radiusDp: Int = RADIUS_CTRL, stroke: Int = 0): GradientDrawable =
+        GradientDrawable().apply {
+            setColor(fill)
+            cornerRadius = dp(ctx, radiusDp).toFloat()
+            if (stroke != 0) setStroke(dp(ctx, 1), stroke)
+        }
 
     /** 给一个 View 套上圆角底 + 按压水波纹。水波纹是"现代感"最主要的来源。 */
     fun ripple(ctx: Context, base: GradientDrawable, radiusDp: Int = RADIUS_CTRL): RippleDrawable =
@@ -152,23 +127,23 @@ object Ui {
         else if (mono) typeface = Typeface.MONOSPACE
     }
 
-    /** 小节标题。 */
-    fun section(ctx: Context, title: String): TextView = text(ctx, title, 11f, TEXT_DIM, bold = true).apply {
-        setPadding(0, dp(ctx, 16), 0, dp(ctx, 6))
-    }
-
-    /** 说明文字（灰色小字，通常跟在控件后面解释"为什么"). */
-    fun doc(ctx: Context, s: String): TextView = text(ctx, s, 10.5f, TEXT_FAINT).apply {
+    /** 说明文字（灰色小字，通常跟在控件后面解释"为什么"）。 */
+    fun doc(ctx: Context, s: String): TextView = text(ctx, s, 12f, TEXT_FAINT).apply {
         setLineSpacing(dp(ctx, 3).toFloat(), 1f)
         setPadding(0, dp(ctx, 8), 0, 0)
     }
+
+    /** 状态圆点。颜色代表状态，实际颜色由调用方按 [statusColor] 更新。 */
+    fun dot(ctx: Context, color: Int): TextView = text(ctx, "●", 13f, color, bold = true)
 
     // ------------------------------------------------------------ 卡片
 
     /**
      * 圆角卡片。背景**先**上色、再 `setStroke()` —— 反过来描边会被底色盖掉。
+     *
+     * [trailing] 放在标题行右侧（计数、开关状态之类的短信息），没有就不占位。
      */
-    fun card(ctx: Context, title: String?, body: View): LinearLayout {
+    fun card(ctx: Context, title: String?, body: View, trailing: View? = null): LinearLayout {
         val box = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             background = shape(ctx, SURFACE, RADIUS_CARD, BORDER)
@@ -178,9 +153,17 @@ object Ui {
             ).apply { bottomMargin = dp(ctx, 10) }
         }
         if (!title.isNullOrBlank()) {
-            box.addView(text(ctx, title, 11f, TEXT_DIM).apply {
+            val head = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
                 setPadding(0, 0, 0, dp(ctx, 8))
-            })
+            }
+            head.addView(
+                text(ctx, title, 12f, TEXT_DIM, bold = true),
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            if (trailing != null) head.addView(trailing)
+            box.addView(head)
         }
         box.addView(body)
         return box
@@ -191,13 +174,38 @@ object Ui {
     /** 按钮的四种角色。 */
     enum class Kind { PRIMARY, SECONDARY, GHOST, DANGER }
 
+    /** 角色 → (底色, 文字色, 描边色)。 */
+    private fun palette(kind: Kind): Triple<Int, Int, Int> = when (kind) {
+        Kind.PRIMARY -> Triple(PRIMARY, Color.WHITE, 0)
+        Kind.DANGER -> Triple(DANGER, Color.WHITE, 0)
+        Kind.SECONDARY -> Triple(SURFACE_2, TEXT, BORDER)
+        Kind.GHOST -> Triple(Color.TRANSPARENT, TEXT_DIM, BORDER)
+    }
+
+    /**
+     * 按角色重绘一颗按钮。
+     *
+     * ★ 状态切换（"启动任务" ↔ "停止任务"）**必须**走这里，不要自己 `background = shape(...)`：
+     * 那样会把 [RippleDrawable] 换成一个静态底，按钮从此失去按压反馈。
+     *
+     * `tag` 记住上一次的角色，值没变就直接返回 —— 底部操作条是 500ms 刷一次的，
+     * 每次都重建两个 Drawable 是纯浪费。
+     */
+    fun paint(b: Button, kind: Kind, force: Boolean = false) {
+        if (!force && b.tag == kind) return
+        b.tag = kind
+        val (fill, fg, stroke) = palette(kind)
+        b.setTextColor(fg)
+        b.background = ripple(b.context, shape(b.context, fill, RADIUS_CTRL, stroke), RADIUS_CTRL)
+    }
+
     /**
      * 一个按钮。做法是 `Button` 换掉默认背景 —— 默认背景在深色主题下是浅灰圆角矩形，
      * 和现代化配色完全不搭，这是改造前"看着不现代"的主要原因。
      *
      * ## 宽度
      * `layoutParams` 给的是 `WRAP_CONTENT`，**由父容器决定怎么撑**：
-     * [btnRow] 会把它改成等宽平分（水平），[btn] 单独用则自适应内容。
+     * [btnRow] 会把它改成等宽平分（水平），[btnFull] 让它整行。
      * 刻意不用"width=0 + weight=1"当默认值 —— 那个组合一旦被放进**垂直**容器，
      * 权重会沿纵轴分配，宽度算出来是 0，按钮直接看不见。
      */
@@ -205,22 +213,14 @@ object Ui {
         ctx: Context,
         label: String,
         kind: Kind = Kind.SECONDARY,
-        sizeSp: Float = 12f,
+        sizeSp: Float = 13f,
         heightDp: Int = TOUCH_MIN,
         onClick: () -> Unit
     ): Button {
-        val (fill, fg, stroke) = when (kind) {
-            Kind.PRIMARY -> Triple(PRIMARY, Color.WHITE, 0)
-            Kind.DANGER -> Triple(DANGER, Color.WHITE, 0)
-            Kind.SECONDARY -> Triple(SURFACE_2, TEXT, BORDER)
-            Kind.GHOST -> Triple(Color.TRANSPARENT, TEXT_DIM, BORDER)
-        }
         return Button(ctx).apply {
             text = label
             isAllCaps = false
             setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp)
-            setTextColor(fg)
-            background = ripple(ctx, shape(ctx, fill, RADIUS_CTRL, stroke), RADIUS_CTRL)
             setPadding(dp(ctx, 12), 0, dp(ctx, 12), 0)
             minWidth = 0
             minimumWidth = 0
@@ -230,6 +230,7 @@ object Ui {
                 LinearLayout.LayoutParams.WRAP_CONTENT, dp(ctx, heightDp)
             )
             setOnClickListener { onClick() }
+            paint(this, kind, force = true)
         }
     }
 
@@ -241,14 +242,10 @@ object Ui {
         sizeSp: Float = 14f,
         heightDp: Int = 46,
         onClick: () -> Unit
-    ): LinearLayout = btnRow(ctx, Triple(label, kind, onClick)).also { row ->
-        // 单按钮整行：给它全部宽度
-        (row.getChildAt(0).layoutParams as LinearLayout.LayoutParams).let {
-            it.width = LinearLayout.LayoutParams.MATCH_PARENT
-            it.weight = 0f
-        }
-        (row.getChildAt(0) as Button).setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp)
-        row.getChildAt(0).layoutParams.height = dp(ctx, heightDp)
+    ): Button = btn(ctx, label, kind, sizeSp, heightDp, onClick).also { b ->
+        b.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, heightDp)
+        ).apply { bottomMargin = dp(ctx, GAP) }
     }
 
     /**
@@ -274,70 +271,101 @@ object Ui {
         return r
     }
 
-    /**
-     * 一行"标签 + 可折叠"的标题条。点一下展开/收起。
-     *
-     * 返回 (标题条, 内容容器)。调用方自行往容器里加内容，并决定初始是否可见。
-     */
-    fun collapsible(ctx: Context, title: String): Pair<TextView, LinearLayout> {
-        val head = text(ctx, "▸ $title", 12f, TEXT_DIM, bold = true).apply {
-            setPadding(0, dp(ctx, 10), 0, dp(ctx, 8))
-            isClickable = true
-        }
-        val body = LinearLayout(ctx).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-        }
-        head.setOnClickListener {
-            val show = body.visibility != View.VISIBLE
-            body.visibility = if (show) View.VISIBLE else View.GONE
-            head.text = (if (show) "▾ " else "▸ ") + title
-        }
-        return head to body
-    }
-
     // ------------------------------------------------------------ 输入行
 
     /**
-     * "左标签 + 右输入框 + 单位"的一行。
+     * 统一样式的输入框。
      *
      * 改造前是靠 `EditText.hint` 当标签用 —— 用户一输入标签就没了，回头看不出这格是什么。
-     * 现在标签固定在左边，永远可见。
+     * 现在标签固定在控件左边（[labeledRow]），永远可见。
+     *
+     * 宽度默认 `MATCH_PARENT`（可以单独放进垂直容器）；[labeledRow] / [checkRow] 会把它
+     * 改成 `width=0 + weight=1` 让父容器分配。
      */
+    fun input(
+        ctx: Context,
+        value: String = "",
+        hint: String = "",
+        numeric: Boolean = false,
+        textSize: Float = 14f
+    ): EditText = EditText(ctx).apply {
+        setText(value)
+        this.hint = hint
+        setSingleLine(true)
+        setSelectAllOnFocus(true)
+        inputType = if (numeric) InputType.TYPE_CLASS_NUMBER
+        else InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, textSize)
+        setTextColor(TEXT)
+        setHintTextColor(TEXT_FAINT)
+        background = shape(ctx, LOGBG, RADIUS_CTRL, BORDER)
+        setPadding(dp(ctx, 10), dp(ctx, 9), dp(ctx, 10), dp(ctx, 9))
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        )
+    }
+
+    /** 把输入框改成"由父容器按权重分配宽度" —— 只在水平容器里调用。 */
+    private fun flex(input: EditText) {
+        input.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+    }
+
+    /** "左标签 + 右输入框 + 单位"的一行。 */
     fun labeledRow(
         ctx: Context,
         label: String,
         input: EditText,
         unit: String? = null,
-        labelWidthDp: Int = 92
+        labelWidthDp: Int = 96
     ): LinearLayout {
         val r = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(ctx, 3), 0, dp(ctx, 3))
         }
-        r.addView(text(ctx, label, 12f, TEXT_DIM).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(ctx, labelWidthDp), LinearLayout.LayoutParams.WRAP_CONTENT)
+        r.addView(text(ctx, label, 13f, TEXT_DIM).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                dp(ctx, labelWidthDp), LinearLayout.LayoutParams.WRAP_CONTENT
+            )
         })
-        input.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        input.setTextColor(TEXT)
-        input.setHintTextColor(TEXT_FAINT)
-        input.background = shape(ctx, LOGBG, RADIUS_CTRL, BORDER)
-        input.setPadding(dp(ctx, 10), dp(ctx, 8), dp(ctx, 10), dp(ctx, 8))
-        input.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        flex(input)
         r.addView(input)
-        if (!unit.isNullOrBlank()) {
-            r.addView(text(ctx, "  $unit", 11f, TEXT_FAINT))
-        }
+        if (!unit.isNullOrBlank()) r.addView(text(ctx, "  $unit", 12f, TEXT_FAINT))
         r.layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply { bottomMargin = dp(ctx, 6) }
         return r
     }
 
-    /** 状态徽章：一个圆点 + 一行字。 */
-    fun badge(ctx: Context, dotColor: Int, s: String, sizeSp: Float = 13f): TextView =
-        text(ctx, "● $s", sizeSp, dotColor, bold = true)
+    /** 统一样式的复选框（默认方块在深色底上几乎看不见，这里指定主色）。 */
+    fun check(ctx: Context, label: String, checked: Boolean): CheckBox = CheckBox(ctx).apply {
+        text = label
+        isChecked = checked
+        setTextColor(TEXT)
+        textSize = 14f
+        buttonTintList = ColorStateList.valueOf(PRIMARY)
+        setPadding(0, 0, dp(ctx, 6), 0)
+        layoutParams = LinearLayout.LayoutParams(
+            0, dp(ctx, TOUCH_MIN), 1f
+        )
+    }
+
+    /** "复选框 + 数值输入 + 单位"的一行（技能间隔用）。 */
+    fun checkRow(ctx: Context, box: CheckBox, input: EditText, unit: String = "秒", inputWidthDp: Int = 84): LinearLayout {
+        val r = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        r.addView(box)
+        input.layoutParams = LinearLayout.LayoutParams(dp(ctx, inputWidthDp), dp(ctx, TOUCH_MIN - 4))
+        input.gravity = Gravity.CENTER
+        r.addView(input)
+        r.addView(text(ctx, "  $unit", 12f, TEXT_DIM))
+        r.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(ctx, 4) }
+        return r
+    }
 
     // ------------------------------------------------------------ 其它
 
@@ -352,8 +380,7 @@ object Ui {
     /**
      * 毫秒倒计时 → `MM:SS`。
      *
-     * 悬浮球和面板摘要都需要短格式。`Engine.countdown()` 返回的是 `"4分12秒后"` 这种中文串，
-     * 球上放不下，所以这里单独算。未运行 / 已到点分别用 `--:--` 和 `00:00` 表示。
+     * 悬浮球和面板摘要都需要短格式。未运行 / 已到点分别用 `--:--` 和 `00:00` 表示。
      */
     fun mmss(remainMs: Long, running: Boolean): String {
         if (!running) return "--:--"
@@ -364,8 +391,8 @@ object Ui {
 
     /** 状态色：引擎状态 + 前台是否为目标游戏 → 一个颜色。 */
     fun statusColor(running: Boolean, error: Boolean, armed: Boolean): Int = when {
-        !running -> TEXT_DIM
         error -> DANGER
+        !running -> TEXT_DIM
         armed -> OK
         else -> WARN
     }

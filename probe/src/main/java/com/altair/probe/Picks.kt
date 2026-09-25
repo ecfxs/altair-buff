@@ -18,14 +18,15 @@ import java.util.Locale
  *
  * ## 槽位
  * ```
- *   技能1..技能4   → 补 BUFF 时依次点的位置（对应设置的 BUFF1..BUFF4）
- *   跳跃           → 原地走位结尾点一下的位置
- *   轮盘           → 左下角摇杆中心；推杆以它为原点，走位时左推/右推
+ *   技能1..技能4   → 补 BUFF 时依次点的位置（**必需**，但只要求"已勾选启用"的那几个）
+ *   轮盘           → 左下角摇杆中心；推杆以它为原点，走位时左推/右推（**必需**）
+ *   跳跃           → 原地走位结尾点一下的位置（**可选**，缺了就走位不跳）
  * ```
+ * 必需性只在 [required] 里定义一次，界面与引擎都从它派生 —— 见 [checklist]。
  *
  * ## 存储
  * SharedPreferences `picks`，每个槽位一个键，值形如 `"0.74160,0.56730"`：
- * **归一化坐标**（0~1，按屏幕宽高比例），横竖屏切换也不会点偏。
+ * **归一化坐标**（0~1），另存显示屏尺寸及方向；变化后必须重新标记。
  * 用文本而不是编码整数，是为了 `adb shell` 里直接看得懂、能手工改。
  *
  * ## 旧数据自动迁移
@@ -61,16 +62,8 @@ object Picks {
         else -> slot
     }
 
-    /**
-     * 全 App 统一的触摸按压参数。
-     *
-     * 历史上有过一个「按法」按钮在 短50/中90/长250/自绘150 之间循环 —— 那是为了排查
-     * "游戏接受哪种触摸"而存在的调试入口。既然触摸通道已经定下来（90ms + swipe 实测可用），
-     * 多档切换就是纯粹的复杂度：它还是"悬浮窗点1生效、引擎点击无效"这类 bug 的温床
-     * （两边档位不一致）。现在**定死一档**，两边共用同一份常量。
-     */
+    /** 技能按压时长；跳跃使用 WalkFlow 中单独保存的参数。 */
     const val TAP_PRESS_MS = 90
-    const val TAP_METHOD = "swipe"
 
     // ------------------------------------------------------------ 存储
 
@@ -98,12 +91,13 @@ object Picks {
     fun set(ctx: Context, slot: String, x: Float, y: Float) {
         val cx = x.coerceIn(0f, 1f)
         val cy = y.coerceIn(0f, 1f)
-        sp(ctx).edit().putString(slot, "${fmt(cx)},${fmt(cy)}").apply()
+        sp(ctx).edit().putString(slot, "${fmt(cx)},${fmt(cy)}")
+            .putString("${slot}_screen", ScreenGeometry.read(ctx).key).apply()
     }
 
     /** 清掉单个槽位。 */
     fun clear(ctx: Context, slot: String) {
-        sp(ctx).edit().remove(slot).apply()
+        sp(ctx).edit().remove(slot).remove("${slot}_screen").apply()
     }
 
     /** 清空所有标注（保留迁移标记，免得把旧数据又搬回来一遍）。 */
@@ -113,49 +107,58 @@ object Picks {
 
     // ------------------------------------------------------------ 查询辅助
 
-    /** 4 个技能坐标，缺的为 null。 */
-    fun skills(ctx: Context): List<Pair<Float, Float>?> = SKILLS.map { get(ctx, it) }
-
-    /** 技能 1-4 是否都标注了。补 BUFF 的启动前提。 */
-    fun skillsReady(ctx: Context): Boolean = SKILLS.all { get(ctx, it) != null }
-
-    /** 还没标注的槽位中文名。 */
-    fun missing(ctx: Context): List<String> = ALL.filter { get(ctx, it) == null }.map { label(it) }
-
-    /** 缺哪些技能（中文名），给启动失败提示用。 */
-    fun missingSkills(ctx: Context): List<String> =
-        SKILLS.filter { get(ctx, it) == null }.map { label(it) }
+    /** 当前勾选启用的技能槽位。 */
+    fun enabledSkills(ctx: Context): List<String> {
+        Engine.init(ctx)
+        return Engine.buffConfig().filter { it.enabled }.map { SKILLS[it.idx] }
+    }
 
     /**
-     * 轮盘中心。没标注时给一个左下角常见位置的兜底值 ——
-     * "没标也能试走一次"，比直接拒绝更有用；界面上会明确提示"用默认位置"。
+     * 启动前**必须**标记的槽位：启用的技能 + 轮盘中心。
+     *
+     * ★ 跳跃**不在**其中。设计文档 2.2 明确：跳跃只影响走位结尾跳不跳，
+     * 漏标它不该把整个任务拦在启动之外（那会让"能跑的"功能因为"锦上添花"的一项全废掉）。
+     * 未标记时 [WalkFlow] 会走完三段并写日志说明这次没跳。
      */
-    fun joystick(ctx: Context): Pair<Float, Float> = get(ctx, JOYSTICK) ?: (0.12f to 0.80f)
+    fun required(ctx: Context): List<String> = enabledSkills(ctx) + JOYSTICK
+
+    /**
+     * 界面清单：每项 = (槽位, 是否必需)。
+     *
+     * 界面要能一眼看出"哪些必须标、哪些标了更好"，所以必需性由 [required] 单点决定，
+     * 而不是让每个界面各自判断一遍（那是"悬浮窗说缺 3 项、主界面说缺 2 项"的根源）。
+     */
+    fun checklist(ctx: Context): List<Pair<String, Boolean>> {
+        val need = required(ctx).toSet()
+        return ALL.map { it to (it in need) }
+    }
+
+    /** 跳跃是否已标记。未标记时走位照走，只是结尾不跳。 */
+    fun jumpReady(ctx: Context): Boolean = get(ctx, JUMP) != null
+
+    fun joystick(ctx: Context): Pair<Float, Float> =
+        requireNotNull(get(ctx, JOYSTICK)) { "请先标记轮盘中心" }
 
     fun joystickAnnotated(ctx: Context): Boolean = get(ctx, JOYSTICK) != null
 
-    // ------------------------------------------------------------ 按标注点触摸
-
-    /**
-     * 点一个标注过的槽位。
-     *
-     * 返回 (是否成功, 说明)。成功判定沿用历史约定：tapNorm 的输出里含"点击"。
-     * 引擎与悬浮窗都走这一个入口，保证两边按压参数**永远一致**。
-     */
-    fun tap(ctx: Context, slot: String, what: String = ""): Pair<Boolean, String> {
-        val p = get(ctx, slot) ?: return false to "「${label(slot)}」还没有标注"
-        return tapPoint(p, what.ifBlank { label(slot) })
+    fun requireGeometry(ctx: Context, slots: List<String>): ScreenGeometry {
+        val geometry = ScreenGeometry.read(ctx)
+        val invalid = slots.filter { get(ctx, it) == null || sp(ctx).getString("${it}_screen", null) != geometry.key }
+        check(invalid.isEmpty()) { "请在当前游戏画面重新标记：${invalid.joinToString("、") { label(it) }}" }
+        return geometry
     }
 
-    /** 点一个裸坐标。 */
-    fun tapPoint(p: Pair<Float, Float>, what: String): Pair<Boolean, String> {
-        val r = runCatching {
-            ShellCore.probe.tapNorm(
-                p.first.toDouble(), p.second.toDouble(), what, TAP_PRESS_MS, TAP_METHOD
-            )
-        }.getOrElse { "触摸调用异常：${it.javaClass.simpleName}: ${it.message}" }
-        return r.contains("点击") to r.trim()
-    }
+    fun tap(ctx: Context, slot: String, what: String = label(slot)): Pair<Boolean, String> =
+        Actions.run(what) { token ->
+            token.check()
+            val geometry = requireGeometry(ctx, listOf(slot))
+            val point = requireNotNull(get(ctx, slot)) { "${label(slot)}未标记" }
+            val x = geometry.x(point.first)
+            val y = geometry.y(point.second)
+            InjectShield.aroundInject(x - 24, y - 24, x + 24, y + 24) {
+                ShellCore.probe.perform(listOf("tap", "$x", "$y", "$TAP_PRESS_MS"), TAP_PRESS_MS.toLong(), token, geometry)
+            }
+        }
 
     // ------------------------------------------------------------ 展示
 
@@ -191,7 +194,7 @@ object Picks {
                     val o = arr.optJSONArray(i) ?: continue
                     val x = o.optDouble(0, -1.0).toFloat()
                     val y = o.optDouble(1, -1.0).toFloat()
-                    if (x in 0f..1f && y in 0f..1f) {
+                    if (x in 0f..1f && y in 0f..1f && !p.contains(SKILLS[i])) {
                         e.putString(SKILLS[i], "${fmt(x)},${fmt(y)}")
                     }
                 }
@@ -203,7 +206,7 @@ object Picks {
             val m = ctx.getSharedPreferences("market", Context.MODE_PRIVATE)
             val cx = m.getLong("joyCxMilli", -1L)
             val cy = m.getLong("joyCyMilli", -1L)
-            if (cx >= 0 && cy >= 0) {
+            if (cx in 0..1000 && cy in 0..1000 && !p.contains(JOYSTICK)) {
                 e.putString(JOYSTICK, "${fmt((cx / 1000.0).toFloat())},${fmt((cy / 1000.0).toFloat())}")
             }
         }
