@@ -45,34 +45,56 @@ object Ui {
 
     // ------------------------------------------------------------ 颜色
 
-    /** 页面底色。接近黑但不是死黑。 */
-    val BG = Color.parseColor("#111916")
+    /**
+     * 主界面用的**中性黑**配色。
+     *
+     * 为什么是灰阶而不是带色的深绿：这套工具只在挂机时扫一眼，界面本身没有任何需要
+     * 表达的情绪，加了色调反而每个控件都在抢注意力。所以底色到卡片一律是黑灰阶，
+     * 颜色只留给**状态**（绿=正常 / 黄=等待 / 红=故障）—— 屏幕上唯一的彩色就是你该看的那一处。
+     */
+    val BG = Color.parseColor("#0A0A0B")
+    val SURFACE = Color.parseColor("#141416")
+    val SURFACE_2 = Color.parseColor("#1E1E21")
+    val BORDER = Color.parseColor("#2C2C31")
 
-    /** 卡片面。比底色亮一档，用来分层。 */
-    val SURFACE = Color.parseColor("#1A2520")
+    val TEXT = Color.parseColor("#F3F3F5")
+    val TEXT_DIM = Color.parseColor("#A6A6AE")
+    val TEXT_FAINT = Color.parseColor("#787880")
 
-    /** 输入框底、次级按钮底。 */
-    val SURFACE_2 = Color.parseColor("#26342D")
+    /** 主按钮：亮面。黑底上一块白，比任何彩色都更像"这里是主要动作"。 */
+    val PRIMARY = Color.parseColor("#E9E9EC")
 
-    /** 描边。 */
-    val BORDER = Color.parseColor("#35463B")
+    /** 亮面按钮上的文字。 */
+    val ON_PRIMARY = Color.parseColor("#0A0A0B")
 
-    val TEXT = Color.parseColor("#F0F3EA")
-    val TEXT_DIM = Color.parseColor("#B1BFB4")
-    val TEXT_FAINT = Color.parseColor("#9BAB9E")
-
-    /** 主色（选中、主要动作）。 */
-    val PRIMARY = Color.parseColor("#347B59")
-
-    val OK = Color.parseColor("#22C55E")
-    val WARN = Color.parseColor("#F59E0B")
-    val DANGER = Color.parseColor("#EF4444")
+    val OK = Color.parseColor("#4ADE80")
+    val WARN = Color.parseColor("#FBBF24")
+    val DANGER = Color.parseColor("#F05252")
 
     /** 日志区底，比页面底更深，让等宽文字更清楚。 */
-    val LOGBG = Color.parseColor("#0B0E12")
+    val LOGBG = Color.parseColor("#050506")
 
     /** 顶栏 / 底部操作条的底。 */
-    val BAR = Color.parseColor("#151A21")
+    val BAR = Color.parseColor("#0E0E10")
+
+    // ---- 悬浮面板专用：浮在游戏画面上，必须是**半透明黑** ----
+    // 用纯色会像在游戏画面上贴了张纸；半透明既能看清字，又能透出下面的血条/小地图，
+    // 挂机时不会因为看不见画面而误判。
+
+    /** 面板底：72% 黑。再透就压不住亮色游戏画面上的文字。 */
+    val PANEL_BG = Color.parseColor("#B80D0D0F")
+
+    /** 面板上的普通按钮（半透明白，叠在面板底上）。 */
+    val PANEL_CTRL = Color.parseColor("#2EFFFFFF")
+
+    /** 面板上"已生效/已标记"的按钮。 */
+    val PANEL_CTRL_ON = Color.parseColor("#59FFFFFF")
+
+    /** 面板描边。 */
+    val PANEL_BORDER = Color.parseColor("#38FFFFFF")
+
+    val PANEL_TEXT = Color.parseColor("#F5F5F7")
+    val PANEL_TEXT_DIM = Color.parseColor("#B4B4BC")
 
     /** 按压反馈的白色水波纹（低透明度）。 */
     private val RIPPLE = Color.parseColor("#33FFFFFF")
@@ -176,7 +198,7 @@ object Ui {
 
     /** 角色 → (底色, 文字色, 描边色)。 */
     private fun palette(kind: Kind): Triple<Int, Int, Int> = when (kind) {
-        Kind.PRIMARY -> Triple(PRIMARY, Color.WHITE, 0)
+        Kind.PRIMARY -> Triple(PRIMARY, ON_PRIMARY, 0)
         Kind.DANGER -> Triple(DANGER, Color.WHITE, 0)
         Kind.SECONDARY -> Triple(SURFACE_2, TEXT, BORDER)
         Kind.GHOST -> Triple(Color.TRANSPARENT, TEXT_DIM, BORDER)
@@ -369,12 +391,17 @@ object Ui {
 
     // ------------------------------------------------------------ 其它
 
-    /** 1dp 分隔线。 */
-    fun divider(ctx: Context, topMarginDp: Int = 5, bottomMarginDp: Int = 5): View = View(ctx).apply {
+    /** 1dp 分隔线。[color] 默认主界面的描边色；悬浮面板要传半透明白，否则在深色面板上看不见。 */
+    fun divider(
+        ctx: Context,
+        topMarginDp: Int = 5,
+        bottomMarginDp: Int = 5,
+        color: Int = BORDER
+    ): View = View(ctx).apply {
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 1)
         ).apply { topMargin = dp(ctx, topMarginDp); bottomMargin = dp(ctx, bottomMarginDp) }
-        setBackgroundColor(BORDER)
+        setBackgroundColor(color)
     }
 
     /**

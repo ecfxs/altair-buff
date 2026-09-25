@@ -156,6 +156,22 @@ public final class AutomationRegression {
         }
     }
 
+    /**
+     * 屏幕记录的三选一判定。
+     *
+     * ★ 回归的是"点启动立马停止"那个 bug：当时把「没有记录」当成「记录不匹配」，
+     * 于是所有旧版标记的使用者一升级就被拦在启动之外，而屏幕其实从没变过。
+     */
+    static void screenMatch() {
+        Picks p = Picks.INSTANCE;
+        check(p.screenMatch("1280,720,0", "1280,720,0") == Picks.ScreenMatch.OK, "记录一致 → 直接用");
+        check(p.screenMatch(null, "1280,720,0") == Picks.ScreenMatch.ADOPT,
+            "没有记录（旧版标记）→ 按当前屏幕补记，不能拦住启动");
+        check(p.screenMatch("720,1280,0", "1280,720,0") == Picks.ScreenMatch.STALE, "方向变了 → 必须重标");
+        check(p.screenMatch("1280,720,0", "1280,720,1") == Picks.ScreenMatch.STALE, "旋转变了 → 必须重标");
+        check(p.screenMatch("2340,1080,0", "1280,720,0") == Picks.ScreenMatch.STALE, "分辨率变了 → 必须重标");
+    }
+
     static void scheduling() {
         Schedule s = new Schedule();
         s.configure(280_000, 1000);
@@ -243,10 +259,12 @@ public final class AutomationRegression {
     public static void main(String[] args) throws Exception {
         sequence(); cancellation(); failure();
         walkWithoutJump(); walkOnlyCancellation(); injectGate();
+        screenMatch();
         scheduling(); actions(); shell();
         System.out.println(
             "PASS: 1:2:1 时序、1秒后单次跳跃、可选跳跃只走三段、按压设置、8+6 个取消阶段、" +
-                "失败松手、闸门两档与失败禁止注入、独立排期、互斥重启、命令退出码/超时/中断/转义"
+                "失败松手、闸门两档与失败禁止注入、屏幕记录三选一、独立排期、互斥重启、" +
+                "命令退出码/超时/中断/转义"
         );
     }
 }

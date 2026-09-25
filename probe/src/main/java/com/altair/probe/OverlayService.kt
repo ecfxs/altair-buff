@@ -71,8 +71,16 @@ class OverlayService : Service() {
         private const val CH_ID = "altair_controls"
         private const val NOTIF_ID = 1001
 
-        /** 展开态面板宽度（dp）。标注按钮要放得下 2 列。 */
-        private const val PANEL_W_FULL = 248
+        /** 展开态面板宽度（dp）。标注按钮要放得下 3 列。 */
+        private const val PANEL_W_FULL = 226
+
+        /**
+         * 面板上按钮的统一高度（dp）。
+         *
+         * 44 是 Android 的推荐触摸目标，但面板浮在游戏画面上，一行 3 列时每格只有 ~70dp 宽、
+         * 44dp 高会显得又矮又胖。36 在 720p 横屏上仍然点得中，整块面板却能矮掉近 1/3。
+         */
+        private const val PANEL_CELL_H = 36
 
         /** 悬浮球直径（dp）。48 是 Android 的最小触摸目标，再加一圈色环的视觉余量。 */
         private const val BALL_D = 56
@@ -320,14 +328,20 @@ class OverlayService : Service() {
         // 只在状态真的翻转时才重绘背景 —— 这段是 250ms 一次的，每次都建两个 Drawable
         // 会让悬浮窗一直在做无谓的分配。
         mainBtn?.let { b ->
-            val label = if (Engine.isRunning) "⏹  停止任务" else "▶  启动任务"
+            val label = if (Engine.isRunning) "⏹ 停止" else "▶ 启动"
             if (b.text != label) b.text = label
             if (mainBtnRunning != Engine.isRunning) {
                 mainBtnRunning = Engine.isRunning
                 // 带水波纹重绘 —— 直接赋 shape() 会把按压反馈换掉
+                b.setTextColor(if (Engine.isRunning) Color.WHITE else Ui.ON_PRIMARY)
                 b.background = Ui.ripple(
                     this,
-                    Ui.shape(this, if (Engine.isRunning) Ui.DANGER else Ui.PRIMARY, Ui.RADIUS_CTRL),
+                    Ui.shape(
+                        this,
+                        if (Engine.isRunning) Ui.DANGER else Ui.PANEL_CTRL_ON,
+                        Ui.RADIUS_CTRL,
+                        if (Engine.isRunning) 0 else Ui.PANEL_BORDER
+                    ),
                     Ui.RADIUS_CTRL
                 )
             }
@@ -345,16 +359,28 @@ class OverlayService : Service() {
         refreshAnnoBadges()
     }
 
-    /** 面板摘要：一行，替代改造前的 3 行 statusTv。 */
+    /**
+     * 面板摘要：一行（最多两行）。
+     *
+     * ★ 失败原因要**留在面板上**，不能只闪一下。
+     * 用户报过的现象是"点启动任务立马停止" —— 真实流程是启动校验没过、任务根本没跑起来，
+     * 但原因只在摘要里显示 2.5 秒就退回"已停止 · 标注 4/6"，看起来就像按钮坏了。
+     * 所以 ERROR 状态下摘要一直显示原因，直到用户下次动手。
+     */
     private fun buildStatus(): String {
         val armed = foregroundPkg == targetPkg
-        return if (Engine.isRunning) {
-            "补 " + Ui.mmss(Engine.nextBuffDueAt - android.os.SystemClock.elapsedRealtime(), true) +
-                " · 走 " + Ui.mmss(Engine.nextWalkDueAt - android.os.SystemClock.elapsedRealtime(), true) +
-                " · 补${Engine.buffCastCount}/走${Engine.walkCount}" +
-                if (Engine.failStreak > 0) " · 连败${Engine.failStreak}" else ""
-        } else {
-            "已停止 · 标注 " + annotationProgress() + (if (armed) "" else " · 非目标游戏")
+        return when {
+            Engine.isRunning ->
+                "补 " + Ui.mmss(Engine.nextBuffDueAt - android.os.SystemClock.elapsedRealtime(), true) +
+                    " · 走 " + Ui.mmss(Engine.nextWalkDueAt - android.os.SystemClock.elapsedRealtime(), true) +
+                    " · 补${Engine.buffCastCount}/走${Engine.walkCount}" +
+                    if (Engine.failStreak > 0) " · 连败${Engine.failStreak}" else ""
+
+            Engine.state == Engine.State.ERROR && Engine.lastError.isNotBlank() ->
+                "⛔ " + Engine.lastError.take(60)
+
+            else ->
+                "已停止 · 标注 " + annotationProgress() + (if (armed) "" else " · 非目标游戏")
         }
     }
 
@@ -392,14 +418,14 @@ class OverlayService : Service() {
             val mark = if (on) "✓ " else if (need) "○ " else "◌ "
             val want = mark + Picks.label(slot)
             if (btn.text != want) btn.text = want
-            btn.setTextColor(if (on) Ui.TEXT else Ui.TEXT_FAINT)
+            btn.setTextColor(if (on) Ui.PANEL_TEXT else Ui.PANEL_TEXT_DIM)
             btn.background = Ui.ripple(
                 this,
                 Ui.shape(
                     this,
-                    if (on) Ui.SURFACE_2 else Ui.BG,
+                    if (on) Ui.PANEL_CTRL_ON else Ui.PANEL_CTRL,
                     Ui.RADIUS_CTRL,
-                    if (on) Ui.PRIMARY else Ui.BORDER
+                    if (on) Ui.PANEL_BORDER else 0
                 ),
                 Ui.RADIUS_CTRL
             )
@@ -409,7 +435,7 @@ class OverlayService : Service() {
             val done = list.count { Picks.get(this, it.first) != null }
             val want = "$done/${list.size} 已标"
             if (tv.text != want) tv.text = want
-            tv.setTextColor(if (annotationReady()) Ui.OK else Ui.TEXT_FAINT)
+            tv.setTextColor(if (annotationReady()) Ui.OK else Ui.PANEL_TEXT_DIM)
         }
         marksBtn?.let { b ->
             val want = marksLabel()
@@ -747,8 +773,9 @@ class OverlayService : Service() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = Ui.shape(this@OverlayService, Ui.SURFACE, Ui.RADIUS_CARD, Ui.BORDER)
-            setPadding(dp(10), dp(8), dp(10), dp(10))
+            // 半透明黑：浮在游戏画面上，既看得清字又能透出血条/小地图
+            background = Ui.shape(this@OverlayService, Ui.PANEL_BG, Ui.RADIUS_CARD, Ui.PANEL_BORDER)
+            setPadding(dp(9), dp(7), dp(9), dp(9))
         }
 
         // ---------------- 标题栏（整条可拖动 + 点击收起）----------------
@@ -758,9 +785,9 @@ class OverlayService : Service() {
         }
         statusPill = TextView(this).apply {
             text = "…"
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11f)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Ui.TEXT_DIM)
+            setTextColor(Ui.PANEL_TEXT_DIM)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
@@ -769,9 +796,9 @@ class OverlayService : Service() {
         // 若让这个子 View 可点，它会把 ACTION_DOWN 独吞掉，在它身上起手就拖不动了。
         val collapseBtn = TextView(this).apply {
             text = "▾"
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14f)
-            setTextColor(Ui.TEXT_DIM)
-            setPadding(dp(10), dp(4), dp(4), dp(4))
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13f)
+            setTextColor(Ui.PANEL_TEXT_DIM)
+            setPadding(dp(10), dp(3), dp(3), dp(3))
         }
         titleBar.addView(statusPill)
         titleBar.addView(collapseBtn)
@@ -780,35 +807,44 @@ class OverlayService : Service() {
         // ---------------- 内容 ----------------
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(6), 0, 0)
+            setPadding(0, dp(5), 0, 0)
         }
 
-        // ① 单行摘要（改造前这里是 3 行，是面板占高的主因）
+        // ① 摘要 + 启停**同一行**。
+        // 启停原来是一整条 44dp 通栏按钮，加上摘要独占一行，光这两样就吃掉面板 1/4 高度。
+        // 合成一行后按钮小了、也更贴近它控制的那行状态；"跑着的时候再点就是停"依然一眼可见。
+        val statusRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         statusSummary = TextView(this).apply {
             text = "…"
-            setTextColor(Ui.TEXT_DIM)
+            setTextColor(Ui.PANEL_TEXT_DIM)
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10f)
             typeface = Typeface.MONOSPACE
-            maxLines = 1
+            maxLines = 2
             ellipsize = TextUtils.TruncateAt.END
-            setPadding(dp(2), 0, dp(2), dp(6))
+            setPadding(dp(2), 0, dp(6), 0)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        content.addView(statusSummary)
-
-        // ② 启停：合成一颗整行按钮（原来两颗并排，容易误点）
-        mainBtn = overlayBtn(if (Engine.isRunning) "⏹  停止任务" else "▶  启动任务",
-            fill = if (Engine.isRunning) Ui.DANGER else Ui.OK, heightDp = 44) {
+        statusRow.addView(statusSummary)
+        mainBtn = overlayBtn(if (Engine.isRunning) "⏹ 停止" else "▶ 启动",
+            fill = if (Engine.isRunning) Ui.DANGER else Ui.PANEL_CTRL_ON,
+            textColor = if (Engine.isRunning) Color.WHITE else Ui.ON_PRIMARY,
+            border = if (Engine.isRunning) 0 else Ui.PANEL_BORDER,
+            heightDp = 34, compact = false, fixedWidthDp = 76) {
             if (Engine.isRunning) stopEngine() else startEngine()
         }
-        content.addView(mainBtn)
-        content.addView(Ui.divider(this))
+        statusRow.addView(mainBtn)
+        content.addView(statusRow)
+        content.addView(Ui.divider(this, 6, 4, Ui.PANEL_BORDER))
 
-        // ③ 标注区（可折叠，默认展开）—— 每颗按钮自带"已标/未标"状态
+        // ② 标注区（可折叠，默认展开）—— 每颗按钮自带"已标/未标"状态
         val (annoHeader, annoBody) = collapsibleHeader("标记位置", open = !Engine.isRunning)
         annoHead = annoHeader
         annoCount = TextView(this).apply {
             text = "0/6 已标"
-            setTextColor(Ui.TEXT_FAINT)
+            setTextColor(Ui.PANEL_TEXT_DIM)
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10f)
         }
         content.addView(headerRow(annoHeader, annoCount))
@@ -819,8 +855,8 @@ class OverlayService : Service() {
         // 改成一行 3 个、6 项排满 2 行：更省纵向空间，单个按钮也更宽好点。
         slotBtns.clear()
         val slotCells = Picks.ALL.map { slot ->
-            overlayBtn(("○ ") + Picks.label(slot), fill = Ui.BG, border = Ui.BORDER,
-                heightDp = 44, compact = true) { startSlotPick(slot) }.also { b ->
+            overlayBtn(("○ ") + Picks.label(slot), fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
+                heightDp = PANEL_CELL_H, compact = true) { startSlotPick(slot) }.also { b ->
                 // ★ 长按 = 从这一颗起连续标注（技能3 → 3、4）
                 b.setOnLongClickListener {
                     if (slot in Picks.SKILLS) {
@@ -837,18 +873,20 @@ class OverlayService : Service() {
         annoBody.addView(compactGrid(slotCells, cols = 3))
 
         // 「按顺序标记」主入口：面板上直接可见，不用去摸长按
-        annoBody.addView(overlayBtn("按顺序标记所需位置", fill = Ui.SURFACE_2, border = Ui.PRIMARY,
-            heightDp = 44, compact = false) { startSkillSequence(Picks.SKILL1) })
+        annoBody.addView(overlayBtn("按顺序标记所需位置", fill = Ui.PANEL_CTRL_ON,
+            border = Ui.PANEL_BORDER, heightDp = PANEL_CELL_H, compact = false) {
+            startSkillSequence(Picks.SKILL1)
+        })
 
         cancelPickBtn = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             visibility = View.GONE
-            addView(overlayBtn("✕ 取消标注", fill = Ui.SURFACE_2, border = Ui.BORDER,
-                heightDp = 44, compact = true) { cancelSlotPick() })
+            addView(overlayBtn("✕ 取消标注", fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
+                heightDp = PANEL_CELL_H, compact = true) { cancelSlotPick() })
         }
         annoBody.addView(cancelPickBtn)
 
-        // ④ 工具区（可折叠，默认收起）
+        // ③ 工具区（可折叠，默认收起）
         val (toolHeader, toolBody) = collapsibleHeader("工具", open = false)
         content.addView(toolHeader)
         content.addView(toolBody)
@@ -856,17 +894,17 @@ class OverlayService : Service() {
         // 工具区排成一行 2 键的网格（标签比标注区更长，2 列才放得下）。
         // 4 颗整行按钮原来要占 4 行 —— 展开「工具」时面板高得离谱，也正是「点试走位、
         // 面板盖住轮盘、注入打在自己身上」那类事故的温床（见 [InjectShield]）。
-        val marks = overlayBtn(marksLabel(), fill = Ui.SURFACE_2, border = Ui.BORDER,
-            heightDp = 44, compact = true) { toggleMarks() }
+        val marks = overlayBtn(marksLabel(), fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
+            heightDp = PANEL_CELL_H, compact = true) { toggleMarks() }
         marksBtn = marks
         toolBody.addView(compactGrid(listOf(
             marks,
-            overlayBtn("试走位一次", fill = Ui.SURFACE_2, border = Ui.BORDER,
-                heightDp = 44, compact = true) { testStroll() },
-            overlayBtn("复位窗口", fill = Ui.SURFACE_2, border = Ui.BORDER,
-                heightDp = 44, compact = true) { resetPositions() },
-            overlayBtn("选择当前游戏", fill = Ui.SURFACE_2, border = Ui.BORDER,
-                heightDp = 44, compact = true) {
+            overlayBtn("试走位一次", fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
+                heightDp = PANEL_CELL_H, compact = true) { testStroll() },
+            overlayBtn("复位窗口", fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
+                heightDp = PANEL_CELL_H, compact = true) { resetPositions() },
+            overlayBtn("选择当前游戏", fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
+                heightDp = PANEL_CELL_H, compact = true) {
                 Engine.stop("重新选择游戏")
                 Thread {
                     val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
@@ -986,33 +1024,44 @@ class OverlayService : Service() {
     /**
      * 面板里的按钮。
      *
-     * 面板用的是 dp 而不是 sp —— 覆盖层里的 sp 跟随系统字体缩放，目标机 720p 横屏下
-     * 系统字号一大就撑破框。主界面是普通 Activity，那边用 sp 没问题。
+     * ## 尺寸为什么用 dp 而不是 sp
+     * 覆盖层里的 sp 跟随系统字体缩放。目标机 720p 横屏下系统字号一大就撑破框。
+     *
+     * ## 三档高度，全在 [PANEL_CELL_H] 附近
+     * 面板浮在游戏上，占的每一像素都是挡住的画面。所以网格格子和通栏按钮用同一个
+     * [PANEL_CELL_H]，只有启停那颗更矮一点 —— 它跟摘要同行，需要"小一号"的视觉权重。
+     * 统一高度也顺手解决了"按钮高矮不齐看着乱"。
      */
     private fun overlayBtn(
         label: String,
         fill: Int,
         border: Int = 0,
-        heightDp: Int = 44,
+        heightDp: Int = PANEL_CELL_H,
         compact: Boolean = false,
+        textColor: Int = Ui.PANEL_TEXT,
+        /** 非 0 时使用固定宽度（启停那颗用，不跟同行文字抢空间）。 */
+        fixedWidthDp: Int = 0,
         onClick: () -> Unit
     ): TextView = TextView(this).apply {
         text = label
         gravity = Gravity.CENTER
-        // 12dp：3 列网格里最长的标签是「○ 轮盘中心」，用 dp 而不是 sp 才不会随系统字号撑破框。
-        setTextSize(TypedValue.COMPLEX_UNIT_DIP, if (compact) 11.5f else 13f)
-        setTextColor(Ui.TEXT)
+        // 11.5dp：3 列网格里最长的标签是「○ 轮盘中心」，用 dp 而不是 sp 才不会随系统字号撑破框。
+        setTextSize(TypedValue.COMPLEX_UNIT_DIP, if (compact) 11.5f else 12.5f)
+        setTextColor(textColor)
         maxLines = 1
         ellipsize = TextUtils.TruncateAt.END
         setPadding(dp(2), 0, dp(2), 0)
-        background = Ui.ripple(this@OverlayService, Ui.shape(
-            this@OverlayService, fill, Ui.RADIUS_CTRL, border), Ui.RADIUS_CTRL)
+        background = Ui.ripple(
+            this@OverlayService,
+            Ui.shape(this@OverlayService, fill, Ui.RADIUS_CTRL, border),
+            Ui.RADIUS_CTRL
+        )
         isClickable = true
-        if (compact) {
-            // 网格里由父容器赋权重平分宽度
-            layoutParams = LinearLayout.LayoutParams(0, dp(heightDp), 1f)
-        } else {
-            layoutParams = LinearLayout.LayoutParams(
+        layoutParams = when {
+            fixedWidthDp > 0 -> LinearLayout.LayoutParams(dp(fixedWidthDp), dp(heightDp))
+            compact ->      // 网格里由父容器赋权重平分宽度
+                LinearLayout.LayoutParams(0, dp(heightDp), 1f)
+            else -> LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(heightDp)
             ).apply { bottomMargin = dp(3) }
         }
@@ -1076,10 +1125,10 @@ class OverlayService : Service() {
         }
         val head = TextView(this).apply {
             text = (if (open) "▾ " else "▸ ") + title
-            setTextColor(Ui.TEXT)
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5f)
+            setTextColor(Ui.PANEL_TEXT)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, dp(8), 0, dp(6))
+            setPadding(0, dp(7), 0, dp(5))
             isClickable = true
             setOnClickListener {
                 val show = body.visibility != View.VISIBLE
@@ -1404,7 +1453,7 @@ class BallView(private val ctx: Context) : View(ctx) {
     /** 球的底色：比面板深一点，浮在亮色游戏画面上也看得清。 */
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.parseColor("#F21A2029")
+        color = Color.parseColor("#C70D0D0F")
     }
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -1444,7 +1493,7 @@ class BallView(private val ctx: Context) : View(ctx) {
         // 中间倒计时。未运行时 Ui.mmss 返回 "--:--"，球上仍显示一个占位符，
         // 让"没在跑"和"跑着但还没算出时间"在视觉上一致（都是不动的字符）。
         textPaint.textSize = 12f * d
-        textPaint.color = if (running) Color.WHITE else Ui.TEXT_DIM
+        textPaint.color = if (running) Color.WHITE else Ui.PANEL_TEXT_DIM
         val label = Ui.mmss(remainMs, running)
         val baseline = cy - (textPaint.descent() + textPaint.ascent()) / 2f
         canvas.drawText(label, cx, baseline, textPaint)

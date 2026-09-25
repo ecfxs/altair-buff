@@ -46,10 +46,21 @@ object Engine {
             return
         }
         init(context)
-        val missing = Picks.required(context).filter { Picks.get(context, it) == null }
+        val need = Picks.required(context)
+        val missing = need.filter { Picks.get(context, it) == null }
         if (missing.isNotEmpty()) {
             state = State.ERROR
             lastError = "请先标记：${missing.joinToString("、") { Picks.label(it) }}"
+            LogBus.emit(lastError)
+            return
+        }
+        // ★ 几何也必须在**点击这一刻**校验。
+        // 曾经只校验"有没有标"，于是先报「✅ 任务已启动」，紧接着 worker 第一轮抛
+        // 「请在当前游戏画面重新标记」把任务停掉 —— 在用户看来就是"点启动立马停止"，
+        // 像是按钮坏了。校验放在这里，失败原因当场就说清楚。
+        Picks.geometryProblem(context, need)?.let {
+            state = State.ERROR
+            lastError = it
             LogBus.emit(lastError)
             return
         }

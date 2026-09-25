@@ -141,11 +141,98 @@ object Picks {
 
     fun joystickAnnotated(ctx: Context): Boolean = get(ctx, JOYSTICK) != null
 
+    /**
+     * 一个槽位的屏幕记录相对**当前**屏幕的判定结果。
+     *
+     * 把这个三选一单独抽出来，是因为它是"点启动立马停止"那个 bug 的正中心：
+     * 当时把 [ADOPT] 和 [STALE] 混为一谈，于是"没有记录"被当成"记录不匹配"处理。
+     */
+    enum class ScreenMatch {
+        /** 记录的正是当前屏幕，坐标可直接用。 */
+        OK,
+
+        /** 没有记录（旧版标的 / 从 v0.24 迁移来的）：按当前屏幕补记后可用。 */
+        ADOPT,
+
+        /** 记录的是**另一块**屏幕：归一化坐标必然错位，必须重标。 */
+        STALE
+    }
+
+    /** 纯函数，便于离线回归测试 —— 不碰 SharedPreferences，也不碰屏幕。 */
+    fun screenMatch(recorded: String?, current: String): ScreenMatch = when {
+        recorded == null -> ScreenMatch.ADOPT
+        recorded == current -> ScreenMatch.OK
+        else -> ScreenMatch.STALE
+    }
+
+    /**
+     * 校验这些槽位是不是"为**当前**这块屏幕标的"，顺带返回几何。
+     *
+     * ## 两种失败要分开对待
+     * | 记录 | 含义 | 怎么办 |
+     * |---|---|---|
+     * | 写着**另一个**屏幕 key | 屏幕真的换过（分辨率/方向变了），归一化坐标必然错位 | **拒绝**，让用户重标 |
+     * | **没有**屏幕记录 | 旧版（v0.25 之前）标的、或从 v0.24 迁移来的 | **接受并按当前屏幕补记** |
+     *
+     * 第二行是踩过的坑：老用户升级到新版后，坐标明明标在同一台机器上，却每次启动都被
+     * "请在当前游戏画面重新标记"挡回去 —— 而重标一次就好了，说明屏幕根本没变，
+     * 只是**没有记录可比**。拿"没有证据"当成"证据表明不匹配"，结果就是升级一次、
+     * 全部重标一次，在用户看来就是"点启动按钮立马停止"。
+     *
+     * 补记时写一条日志说明用了哪个屏幕；用户随时可以用悬浮窗「回显:开」在游戏画面上
+     * 看到落点，一眼确认对不对。真正换过屏幕的情况仍然照旧拒绝。
+     */
     fun requireGeometry(ctx: Context, slots: List<String>): ScreenGeometry {
         val geometry = ScreenGeometry.read(ctx)
-        val invalid = slots.filter { get(ctx, it) == null || sp(ctx).getString("${it}_screen", null) != geometry.key }
-        check(invalid.isEmpty()) { "请在当前游戏画面重新标记：${invalid.joinToString("、") { label(it) }}" }
+        val prefs = sp(ctx)
+        val pending = prefs.edit()
+        val adopted = mutableListOf<String>()
+        val invalid = mutableListOf<String>()
+        slots.forEach { slot ->
+            if (get(ctx, slot) == null) {
+                invalid += slot
+                return@forEach
+            }
+            when (screenMatch(prefs.getString("${slot}_screen", null), geometry.key)) {
+                ScreenMatch.OK -> Unit
+                ScreenMatch.ADOPT -> {
+                    pending.putString("${slot}_screen", geometry.key)
+                    adopted += slot
+                }
+                ScreenMatch.STALE -> invalid += slot
+            }
+        }
+        if (adopted.isNotEmpty()) {
+            pending.apply()
+            LogBus.emit(
+                "旧标记（无屏幕记录）已按当前屏幕 ${geometry.key} 接受：" +
+                    adopted.joinToString("、") { label(it) } +
+                    "。用「回显:开」确认落点，不对就重新标记。"
+            )
+        }
+        check(invalid.isEmpty()) {
+            "屏幕已变化，请重新标记：${invalid.joinToString("、") { label(it) }}"
+        }
         return geometry
+    }
+
+    /**
+     * 启动前的"屏幕是否真的变过"预检，有问题返回说明，没问题返回 null。
+     *
+     * 与 [requireGeometry] 的区别：这里**不**补记缺失的屏幕记录（补记要留日志，属于真正
+     * 开始动手时的事），也**不**把"没有记录"当错误 —— 只回答"记录在案的屏幕和现在这块
+     * 是不是不一样"。这样启动点击当场就能给出准确原因，而不是先报成功再秒停。
+     */
+    fun geometryProblem(ctx: Context, slots: List<String>): String? = try {
+        val geometry = ScreenGeometry.read(ctx)
+        val prefs = sp(ctx)
+        val bad = slots.filter { slot ->
+            get(ctx, slot) == null ||
+                screenMatch(prefs.getString("${slot}_screen", null), geometry.key) == ScreenMatch.STALE
+        }
+        if (bad.isEmpty()) null else "屏幕已变化，请重新标记：${bad.joinToString("、") { label(it) }}"
+    } catch (e: Exception) {
+        "无法确定屏幕尺寸：${e.message}"
     }
 
     fun tap(ctx: Context, slot: String, what: String = label(slot)): Pair<Boolean, String> =

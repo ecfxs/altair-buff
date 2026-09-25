@@ -243,6 +243,13 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------ 任务页
 
+    /**
+     * 只留两张卡：**现在怎么样**、**还差什么**。
+     *
+     * 改造前这里是四张卡（当前状态 / 准备情况 / 走位动作 / 最近状态），其中"走位动作"
+     * 只是一句说明、"最近状态"往往和状态卡的最后一行重复 —— 用户要在一屏里滚过两张
+     * 没有信息量的卡片才能看到重点。走位怎么走、上次结果如何，塞进状态卡的附注行即可。
+     */
     private fun home(): View = page {
         val summary = LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.VERTICAL
@@ -253,6 +260,12 @@ class MainActivity : Activity() {
                 setLineSpacing(dp(5).toFloat(), 1f)
             }
             addView(countdown)
+            recent = Ui.text(context, "尚未执行动作", 12f, Ui.TEXT_FAINT).apply {
+                setPadding(0, dp(10), 0, 0)
+                maxLines = 2
+                setLineSpacing(dp(4).toFloat(), 1f)
+            }
+            addView(recent)
         }
         addView(Ui.card(this@MainActivity, "当前状态", summary))
 
@@ -261,22 +274,12 @@ class MainActivity : Activity() {
             setLineSpacing(dp(6).toFloat(), 1f)
         }
         guide.addView(readiness)
-        val gap = View(this@MainActivity).apply { layoutParams = LinearLayout.LayoutParams(-1, dp(10)) }
-        guide.addView(gap)
-        guide.addView(Ui.btnFull(this@MainActivity, "打开悬浮窗去标记位置", Ui.Kind.SECONDARY) { openOverlay() })
+        guide.addView(View(this@MainActivity).apply {
+            layoutParams = LinearLayout.LayoutParams(-1, dp(12))
+        })
+        guide.addView(Ui.btnFull(this@MainActivity, "打开悬浮窗去标记位置", Ui.Kind.PRIMARY) { openOverlay() })
         guide.addView(Ui.btnFull(this@MainActivity, "设置技能与走位间隔", Ui.Kind.SECONDARY) { showPage(1) })
         addView(Ui.card(this@MainActivity, "准备情况", guide))
-
-        addView(Ui.card(this@MainActivity, "走位动作", Ui.text(this@MainActivity,
-            "左 D  →  右 2D  →  左 D\n松开轮盘，等待 1 秒，跳一次", 14f).apply {
-            setLineSpacing(dp(7).toFloat(), 1f)
-        }))
-
-        recent = Ui.text(this@MainActivity, "尚未执行动作", 12f, Ui.TEXT_DIM).apply {
-            maxLines = 4
-            setLineSpacing(dp(4).toFloat(), 1f)
-        }
-        addView(Ui.card(this@MainActivity, "最近状态", recent))
     }
 
     // ------------------------------------------------------------ 设置页
@@ -399,37 +402,38 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------ 更多页
 
+    /**
+     * 三张卡：**悬浮窗与标记**、**软件更新**、**运行日志**。
+     *
+     * 改造前"悬浮窗与权限"和"位置标记"是两张卡，各塞两颗按钮 —— 一共四颗按钮分两处摆，
+     * 却都是"维护这台机器"的同一件事。合成一张、按使用顺序排好即可。
+     */
     private fun more(): View = page {
         val windowBody = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
         windowBody.addView(Ui.btnRow(this@MainActivity,
-            Triple("打开悬浮窗", Ui.Kind.SECONDARY) { openOverlay() },
+            Triple("打开悬浮窗", Ui.Kind.PRIMARY) { openOverlay() },
             Triple("关闭悬浮窗", Ui.Kind.SECONDARY) {
                 Engine.stop("关闭悬浮窗"); OverlayService.stop(this@MainActivity)
-            },
+            }
+        ))
+        windowBody.addView(Ui.btnRow(this@MainActivity,
+            Triple("查看标记", Ui.Kind.SECONDARY) { LogBus.emit(Picks.describe(this@MainActivity)) },
+            Triple("清空标记", Ui.Kind.GHOST) { confirmClearPicks() },
             Triple("检查 Root", Ui.Kind.SECONDARY) {
                 background("检查 Root") { ShellCore.probe.requestRoot() }
             }
         ))
         windowBody.addView(Ui.doc(this@MainActivity,
             "标记位置只能在游戏画面的悬浮窗里完成。Root 用于注入触摸与免确认安装。"))
-        addView(Ui.card(this@MainActivity, "悬浮窗与权限", windowBody))
-
-        val markBody = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-        markBody.addView(Ui.btnRow(this@MainActivity,
-            Triple("查看标记", Ui.Kind.SECONDARY) { LogBus.emit(Picks.describe(this@MainActivity)) },
-            Triple("清空标记", Ui.Kind.GHOST) { confirmClearPicks() }
-        ))
-        markBody.addView(Ui.doc(this@MainActivity, "标记按屏幕方向与分辨率保存；换了画面尺寸需要重标。"))
-        // 计数每次 refresh 重算，否则标完一圈回到这一页还显示旧数字
         markCount = Ui.text(this@MainActivity, annotationCount(), 12f, Ui.TEXT_FAINT)
-        addView(Ui.card(this@MainActivity, "位置标记", markBody, markCount))
+        addView(Ui.card(this@MainActivity, "悬浮窗与标记", windowBody, markCount))
 
         val updateBody = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
         updateBody.addView(Ui.btnRow(this@MainActivity,
             Triple("检查并更新", Ui.Kind.SECONDARY) { background("下载并更新") { updater.updateAuto() } },
             Triple("更新日志", Ui.Kind.SECONDARY) { background("读取更新日志") { updater.readUpdateLog() } }
         ))
-        sourceUrl = Ui.input(this@MainActivity, updater.savedUrl(), hint = "自定义 HTTPS 地址")
+        sourceUrl = Ui.input(this@MainActivity, updater.savedUrl(), hint = "自定义 HTTPS 地址或本地 APK 路径")
         updateBody.addView(sourceUrl)
         updateBody.addView(View(this@MainActivity).apply {
             layoutParams = LinearLayout.LayoutParams(-1, dp(8))
@@ -548,14 +552,23 @@ class MainActivity : Activity() {
         Ui.paint(startButton, if (active) Ui.Kind.DANGER else Ui.Kind.PRIMARY)
     }
 
-    /** 清单：必需项缺了标出来，可选项（跳跃）单独说明。 */
-    private fun checklistText(): String = Picks.checklist(this).joinToString("\n") { (slot, need) ->
-        val ok = Picks.get(this, slot) != null
-        when {
-            ok -> "✓ ${Picks.label(slot)}"
-            need -> "○ ${Picks.label(slot)}    未标记（必需）"
-            else -> "○ ${Picks.label(slot)}    未标记（可选，走位不跳）"
+    /**
+     * 清单：必需项缺了标出来，可选项（跳跃）单独说明。
+     *
+     * 第一行在"屏幕真的变过"时给出警告 —— 那种情况下这些坐标一定是错的，
+     * 光列 `✓` 会让人以为可以启动。
+     */
+    private fun checklistText(): String {
+        val lines = Picks.checklist(this).map { (slot, need) ->
+            val ok = Picks.get(this, slot) != null
+            when {
+                ok -> "✓ ${Picks.label(slot)}"
+                need -> "○ ${Picks.label(slot)}    未标记（必需）"
+                else -> "○ ${Picks.label(slot)}    未标记（可选，走位不跳）"
+            }
         }
+        val problem = Picks.geometryProblem(this, Picks.required(this))
+        return (if (problem == null) lines else listOf("⚠ $problem") + lines).joinToString("\n")
     }
 
     private fun annotationCount(): String {
