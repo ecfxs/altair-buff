@@ -77,6 +77,9 @@ object WalkFlow {
     /** 走完到跳之间的停顿。 */
     private const val JUMP_SETTLE_MS = 450L
 
+    /** 让路矩形外扩的像素数（见 [walkRectPx]）。 */
+    private const val WALK_RECT_PAD = 48
+
     // ------------------------------------------------------------ 主流程
 
     /**
@@ -84,6 +87,10 @@ object WalkFlow {
      *
      * 返回 (是否成功, 说明)。**只要三段走位发出去了就算成功**；
      * 跳跃没标注时不算失败（只是不跳），因为"走位"本身已经完成。
+     *
+     * 整段（4 段手势 + 跳）都包在 [InjectShield.aroundWalk] 里：轮盘在左下角，而展开后的
+     * 面板能盖住半个屏幕，注入会被面板自己吃掉（点「试走位」→ 面板收起成球、角色不动）。
+     * 让路必须在**整段**外面开一次，否则每段手势都要重新挪一次窗口。
      */
     fun strollAndJump(log: (String) -> Unit): Pair<Boolean, String> {
         val c = ctx ?: return false to "未初始化"
@@ -95,6 +102,19 @@ object WalkFlow {
         val rightX = (cx + off).coerceIn(0.02, 0.98)
         val d = legMs
 
+        val r = walkRectPx(c, cx, cy, leftX, rightX)
+        return InjectShield.aroundWalk(r[0], r[1], r[2], r[3]) {
+            stroll(c, cx, cy, leftX, rightX, d, log)
+        }
+    }
+
+    private fun stroll(
+        c: Context,
+        cx: Double, cy: Double,
+        leftX: Double, rightX: Double,
+        d: Long,
+        log: (String) -> Unit,
+    ): Pair<Boolean, String> {
         if (!Picks.joystickAnnotated(c)) {
             log("  ⚠ 轮盘中心未标注，先用默认位置 (%.3f, %.3f) —— 建议切到游戏点悬浮窗「标轮盘」"
                 .format(cx, cy))
@@ -128,6 +148,74 @@ object WalkFlow {
             "走位完成但跳跃点击失败：${r.second.take(80)}"
         }
         return r.first to msg
+    }
+
+    /**
+     * 走位手势自检：把"往左推一次"的 4 种发法各跑一遍，让用户看**哪一种角色真的走**。
+     *
+     * ## 为什么需要它
+     * 「角色不走」可能是坐标/让路的问题，也可能是**手势本身**这台机器上的游戏不认：
+     * `input motionevent` 的 DOWN / MOVE / UP 是**各自起一个进程**发的，时间戳与 downTime
+     * 由各进程生成，有些 ROM/游戏会把它当成残缺输入丢掉 —— 日志里一切正常，角色纹丝不动。
+     * 这只有实机能回答，所以把四种发法摆出来，用户在画面上看哪一号动。
+     *
+     * 结果只写日志（不判断"动没动" —— 那只有人眼能判断）。
+     */
+    fun selfTest(log: (String) -> Unit) {
+        val c = ctx ?: return
+        val joy = Picks.joystick(c)
+        val cx = joy.first.toDouble()
+        val cy = joy.second.toDouble()
+        val leftX = (cx - pushPct / 100.0).coerceIn(0.02, 0.98)
+        val hold = 700
+        val r = walkRectPx(c, cx, cy, leftX, leftX)
+
+        log("── 走位手势自检：轮盘中心 [%.4f, %.4f]，推杆 ${pushPct}% ──".format(cx, cy))
+        log("   轮盘中心${if (Picks.joystickAnnotated(c)) "已标注" else "未标注（用默认值）"}" +
+            "，每项都往左推 ${hold}ms，中间停 1.3 秒 —— 请看角色哪一种动了")
+
+        InjectShield.aroundWalk(r[0], r[1], r[2], r[3]) {
+            listOf(
+                "me" to "① motionevent：中心按下 → 拖到左侧 → 持续补 MOVE → 松开（当前默认通道）",
+                "swipe" to "② input swipe：中心 → 左侧，时长 ${hold}ms（单进程，边拖边推）",
+                "holdAt" to "③ input swipe：直接在左侧按住 ${hold}ms（单进程，按下点就在推杆位）",
+                "meAt" to "④ motionevent：按下点就在左侧（不经过中心）"
+            ).forEachIndexed { i, (kind, desc) ->
+                log("   $desc")
+                val out = runCatching {
+                    ShellCore.probe.gestureTest(kind, cx, cy, leftX, cy, hold)
+                }.getOrElse { "异常 ${it.javaClass.simpleName}: ${it.message}" }
+                log("      $out")
+                if (i < 3) sleep(1300)
+            }
+        }
+        log("   自检结束（角色会往左偏一点，正常）。哪一号动了就把编号告诉我。")
+    }
+
+    /**
+     * 整段走位在屏幕上覆盖的像素矩形 `[左, 上, 右, 下]`，给悬浮窗让路用。
+     *
+     * 用 displayMetrics 换算（与 [Probe] 里 screencap 出来的尺寸应当一致），并**外扩**
+     * [WALK_RECT_PAD] 像素：重叠判定宁可判宽一点（面板多让一次），也不能漏判
+     * （漏判就意味着注入又被面板吃掉，又变成"角色不动"）。
+     */
+    private fun walkRectPx(c: Context, cx: Double, cy: Double, leftX: Double, rightX: Double): IntArray {
+        val m = c.resources.displayMetrics
+        val w = m.widthPixels
+        val h = m.heightPixels
+        var l = (minOf(cx, leftX, rightX) * w).toInt()
+        var r = (maxOf(cx, leftX, rightX) * w).toInt()
+        var t = (cy * h).toInt()
+        var b = (cy * h).toInt()
+        // 跳跃点也要算进来：它同样是注入，同样会被挡
+        Picks.get(c, Picks.JUMP)?.let { j ->
+            val jx = (j.first * w).toInt()
+            val jy = (j.second * h).toInt()
+            l = minOf(l, jx); r = maxOf(r, jx)
+            t = minOf(t, jy); b = maxOf(b, jy)
+        }
+        val pad = WALK_RECT_PAD
+        return intArrayOf(l - pad, t - pad, r + pad, b + pad)
     }
 
     /**

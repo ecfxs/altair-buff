@@ -147,6 +147,22 @@ class Probe(
     }
 
     /**
+     * 截一帧拿到**当前真实方向**的屏幕尺寸。
+     *
+     * 为什么每次都截：横竖屏切换、云手机改分辨率都会让"上次的尺寸"失效，
+     * 而归一化坐标换算错了就会点到别的地方。代价约 200ms，手动动作完全可接受。
+     */
+    private fun screenSize(): Pair<Int, Int> {
+        if (!ensureShell()) return 1280 to 720
+        val d = if (bestDisplayId >= 0) bestDisplayId else 0
+        val ref = File(cache, "geom.raw")
+        ref.delete()
+        sh.timedExec("screencap -d $d ${ref.absolutePath}", 12000)
+        val hdr = parseRawHeader(ref)
+        return (hdr?.get(0) ?: 1280) to (hdr?.get(1) ?: 720)
+    }
+
+    /**
      * 在归一化坐标处点击。
      *
      * 每次都先截一帧拿到**当前真实方向**的尺寸（横屏 1280x720 / 竖屏 720x1280），
@@ -186,7 +202,7 @@ class Probe(
             else -> "input swipe $px $py $px $py $pressMs"
         }
         // ★ 注入期间让悬浮窗让路：否则这一下会打在我们自己的面板上（见 [InjectShield]）
-        val (ms, err) = InjectShield.withPassThrough { sh.timedExec(cmd, 8000) }
+        val (ms, err) = InjectShield.aroundInject(px, py, px, py) { sh.timedExec(cmd, 8000) }
         val tag = if (label.isBlank()) "" else "[$label] "
         val nx4 = "%.4f".format(nx)
         val ny4 = "%.4f".format(ny)
@@ -226,6 +242,9 @@ class Probe(
         val mx = (moveX * w).toInt().coerceIn(0, w - 1)
         val my = (moveY * h).toInt().coerceIn(0, h - 1)
         fun swipeCmd() = "input swipe $cx $cy $mx $my $holdMs"
+        // 这一段手势覆盖的屏幕矩形（给悬浮窗让路用）
+        val gl = minOf(cx, mx); val gt = minOf(cy, my)
+        val gr = maxOf(cx, mx); val gb = maxOf(cy, my)
 
         // ★ 保持期间必须**持续补发 MOVE**，这是走位能不能动的关键。
         //
@@ -252,7 +271,7 @@ class Probe(
 
         // 明确的 swipe 档位直接走兜底
         if (method == "swipe") {
-            val (ms, err) = InjectShield.withPassThrough {
+            val (ms, err) = InjectShield.aroundInject(gl, gt, gr, gb) {
                 sh.timedExec(swipeCmd(), (8000 + holdMs).toLong())
             }
             return "摇杆(swipe) ($cx,$cy)→($mx,$my) ${holdMs}ms  ${ms}ms ${err.take(40)}"
@@ -263,9 +282,11 @@ class Probe(
         // 命令构成：DOWN + MOVE + (sleep + MOVE) × frames + UP
         val inputCount = 2 + frames + 1
         val meTimeout = 4000L + holdMs + inputCount * perCallMs
-        // ★ 整段手势（含保持期间的 MOVE）都在"悬浮窗不吃触摸"的窗口里跑 ——
+        // ★ 整段手势（含保持期间的 MOVE）都在"悬浮窗让路"的窗口里跑 ——
         //   否则第一个 DOWN 就会被面板吃掉，角色一步都不会动（见 [InjectShield]）
-        val (ms, err) = InjectShield.withPassThrough { sh.timedExec(meCmd(), meTimeout) }
+        val (ms, err) = InjectShield.aroundInject(gl, gt, gr, gb) {
+            sh.timedExec(meCmd(), meTimeout)
+        }
         val failed = err.contains("not found", true) || err.contains("Unknown", true) ||
             err.contains("Error", true) || err.contains("inaccessible", true)
         if (!failed) {
@@ -273,10 +294,67 @@ class Probe(
                 "  ${ms}ms ${err.take(40)}"
         }
         // 该机型的 input 没有 motionevent 子命令 → 退回 swipe
-        val (ms2, err2) = InjectShield.withPassThrough {
+        val (ms2, err2) = InjectShield.aroundInject(gl, gt, gr, gb) {
             sh.timedExec(swipeCmd(), (8000 + holdMs).toLong())
         }
         return "摇杆(swipe兜底，motionevent 不可用) ($cx,$cy)→($mx,$my) ${holdMs}ms  ${ms2}ms ${err2.take(40)}"
+    }
+
+    /**
+     * 走位手势自检：把"往某个方向推一次"的几种发法各试一遍，返回原始输出。
+     *
+     * ## 为什么需要它
+     * 「角色不走」可能是**手势本身**在这台机器上不被游戏接受，而不是坐标或让路的问题：
+     * `input motionevent` 每条都是**新进程**（DOWN / MOVE / UP 各起一个 app_process），
+     * 事件的时间戳/downTime 由各自进程生成；有的 ROM 或游戏引擎会把这种"拼起来的手势"
+     * 当成残缺输入丢掉 —— 表现就是"日志里一切正常，角色纹丝不动"。
+     * 这件事只有实机能回答，所以这里把几种发法摆出来让用户看哪一种真的能走。
+     *
+     * [kind]：
+     * ```
+     *   me       motionevent：DOWN 中心 → MOVE 偏移 → 补帧 MOVE → UP（当前默认通道）
+     *   swipe    input swipe 中心→偏移，时长 = holdMs（单进程，线性推杆）
+     *   holdAt   input swipe 偏移→偏移，即在推杆位**直接按住**（单进程）
+     *   meAt     motionevent：DOWN 就在推杆位（不经过中心）
+     * ```
+     */
+    fun gestureTest(
+        kind: String,
+        centerX: Double, centerY: Double,
+        moveX: Double, moveY: Double,
+        holdMs: Int,
+    ): String {
+        val (w, h) = screenSize()
+        val cx = (centerX * w).toInt().coerceIn(0, w - 1)
+        val cy = (centerY * h).toInt().coerceIn(0, h - 1)
+        val mx = (moveX * w).toInt().coerceIn(0, w - 1)
+        val my = (moveY * h).toInt().coerceIn(0, h - 1)
+        val gl = minOf(cx, mx); val gt = minOf(cy, my)
+        val gr = maxOf(cx, mx); val gb = maxOf(cy, my)
+
+        val perCallMs = 30L
+        val frames = (holdMs / 120L).coerceIn(2L, 20L).toInt()
+        val sleepMs = (holdMs - frames * perCallMs).coerceAtLeast(0L) / frames
+        val s = "%.3f".format(sleepMs / 1000.0)
+
+        val cmd = when (kind) {
+            "swipe" -> "input swipe $cx $cy $mx $my $holdMs"
+            "holdAt" -> "input swipe $mx $my $mx $my $holdMs"
+            "meAt" -> buildString {
+                append("input motionevent DOWN $mx $my; ")
+                repeat(frames) { append("sleep $s; input motionevent MOVE $mx $my; ") }
+                append("input motionevent UP $mx $my")
+            }
+            else -> buildString {   // "me"
+                append("input motionevent DOWN $cx $cy; ")
+                append("input motionevent MOVE $mx $my; ")
+                repeat(frames) { append("sleep $s; input motionevent MOVE $mx $my; ") }
+                append("input motionevent UP $mx $my")
+            }
+        }
+        val timeout = 5000L + holdMs + (frames + 3) * perCallMs
+        val (ms, err) = InjectShield.aroundInject(gl, gt, gr, gb) { sh.timedExec(cmd, timeout) }
+        return "($cx,$cy)→($mx,$my) ${holdMs}ms  ${ms}ms  ${err.trim().take(60)}"
     }
 
     /**

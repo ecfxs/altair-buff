@@ -10,6 +10,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.os.Build
 import android.os.Handler
@@ -82,6 +83,18 @@ class OverlayService : Service() {
         /** 标点回显开关的持久化键（放 overlay prefs，和门禁目标同一份）。 */
         private const val KEY_MARKS = "marksOn"
 
+        /**
+         * 走位让路方式的持久化键。
+         *
+         * `move`（默认）= 把与注入区重叠的窗口临时挪走 + 置灰；`flag` = 只置灰。
+         * 留这个开关的理由：挪窗口是**几何事实**，任何 ROM 都拦不住，所以默认它；
+         * 但挪走会让面板在走位那几秒里看不见 —— 如果这台机器的 ROM 老实实现了
+         * `FLAG_NOT_TOUCHABLE`（置灰就够），用户切到 `flag` 就能保住"面板一直看得见"。
+         */
+        private const val KEY_GATE = "gateMode"
+        private const val GATE_MOVE = "move"
+        private const val GATE_FLAG = "flag"
+
         /** 面板与球的落点记忆 —— 省得每次启动都重新摆一次。 */
         private const val KEY_PANEL_X = "panelX"
         private const val KEY_PANEL_Y = "panelY"
@@ -128,6 +141,9 @@ class OverlayService : Service() {
     private var ballParams: WindowManager.LayoutParams? = null
     private var pickParams: WindowManager.LayoutParams? = null
 
+    /** 走位让路期间被"挪开"的窗口 —— (视图, 参数, 原始 x/y/w/h)，走完照原样放回去。 */
+    private val vacated = mutableListOf<Pair<View, IntArray>>()
+
     private var panelScroll: ScrollView? = null
 
     private var statusPill: TextView? = null
@@ -137,6 +153,7 @@ class OverlayService : Service() {
     private var annoCount: TextView? = null
     private var cancelPickBtn: LinearLayout? = null
     private var marksBtn: TextView? = null
+    private var gateBtn: TextView? = null
 
     /** 标注按钮：槽位 → 按钮。用来刷新"已标/未标"的状态前缀。 */
     private val slotBtns = LinkedHashMap<String, TextView>()
@@ -173,12 +190,14 @@ class OverlayService : Service() {
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         startForeground(NOTIF_ID, buildNotification())
         LogBus.add(logListener)
-        // 注入输入时把覆盖层切成"不吃触摸"，否则注入会打在自己面板上（见 [InjectShield]）。
-        // 传进来的是"是否正在注入"，所以触摸开关要取反。
-        InjectShield.bind { injecting -> setOverlayTouchable(touchable = !injecting) }
+        // 注入输入时让覆盖层让路，否则注入会打在自己面板上（见 [InjectShield]）
+        InjectShield.bind { mode, on, l, t, r, b -> onInjectGate(mode, on, l, t, r, b) }
         showBall()
         running = true
-        LogBus.emit("悬浮控制台已启动。点悬浮球展开控制台 → 标注坐标 → 启动任务。")
+        LogBus.emit(
+            "悬浮控制台已启动（v${versionName()} · code ${versionCode()}）。" +
+                "点悬浮球展开控制台 → 标注坐标 → 启动任务。"
+        )
         Thread {
             ShellCore.ensureRoot()
             ui.post { refreshStatus(true) }
@@ -345,6 +364,10 @@ class OverlayService : Service() {
             val want = marksLabel()
             if (b.text != want) b.text = want
         }
+        gateBtn?.let { b ->
+            val want = gateLabel()
+            if (b.text != want) b.text = want
+        }
         // 只在采点进行中才显示「取消标注」—— 平时它只会误导。
         cancelPickBtn?.visibility = if (pickSlot != null) View.VISIBLE else View.GONE
     }
@@ -378,34 +401,54 @@ class OverlayService : Service() {
         p.y = p.y.coerceIn(0, (sh - h).coerceAtLeast(0))
     }
 
+    // ------------------------------------------------------------ 注入让路
+
+    /** 当前所有"可触摸"的自有窗口（回显层本来就是 NOT_TOUCHABLE，不算）。 */
+    private fun overlayWindows(): List<Pair<View, WindowManager.LayoutParams>> = listOfNotNull(
+        panel?.let { v -> panelParams?.let { v to it } },
+        ball?.let { v -> ballParams?.let { v to it } },
+        pickView?.let { v -> pickParams?.let { v to it } }
+    )
+
     /**
-     * 覆盖层的「触摸穿透」开关 —— 由 [InjectShield] 在注入输入前后调用。
+     * 在 UI 线程**同步**执行并等它做完。
      *
-     * ## 为什么必须有它
-     * `input` 注入的触摸由系统按 **z 序**交给最上面那个可触摸窗口，而悬浮面板就浮在游戏之上。
-     * 只要面板盖住了轮盘中心 / 技能键的位置，注入的 DOWN/MOVE/UP 就全打在**面板自己的按钮**上：
-     * 展开「工具」会让面板变高、正好盖住左下角轮盘，此时点「试走位一次」，
-     * 注入的第一个 DOWN 落在面板下部的「复位窗口位置」上 —— 用户看到的就是
-     * 「一点试走位，悬浮窗自己消失了」，而游戏里角色一步都没动。
+     * 窗口参数（位置 / flags）只能在 UI 线程改：`updateViewLayout` 最终会走 ViewRootImpl
+     * 的遍历调度，在没有 Looper 的注入线程上调会抛异常。但闸门必须在**注入命令发出之前**
+     * 落地，所以 post 过去之后用闩等回来。正常情况下是毫秒级；超时只是兜底。
+     */
+    private fun onUiSync(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+            return
+        }
+        val done = CountDownLatch(1)
+        ui.post {
+            runCatching { block() }
+            done.countDown()
+        }
+        runCatching { done.await(1500, TimeUnit.MILLISECONDS) }
+    }
+
+    /** [InjectShield] 的入口：按让路方式分派。 */
+    private fun onInjectGate(mode: InjectShield.Mode, on: Boolean, l: Int, t: Int, r: Int, b: Int) {
+        when (mode) {
+            InjectShield.Mode.INJECT -> setOverlayTouchable(touchable = !on)
+            InjectShield.Mode.WALK -> walkGate(on, l, t, r, b)
+        }
+    }
+
+    /**
+     * 单次注入的让路：把覆盖层临时置灰（`FLAG_NOT_TOUCHABLE`）。
      *
-     * 注入期间挂上 [WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE]，事件就落回游戏；
-     * 注入结束立刻摘掉。采点层也要一起切：任务运行中用户正在标注时，引擎的注入点击
-     * 会被全屏的采点层吃掉，**静默存下一个错误坐标** —— 这是本项目最忌讳的失败模式。
-     * 回显层 [MarksView] 本来就是 NOT_TOUCHABLE，不用管。
-     *
-     * ## 为什么从注入线程同步等待
-     * 改窗口参数只能在 UI 线程做（`updateViewLayout` 最终会走 ViewRootImpl 的遍历调度），
-     * 但闸门必须**在注入命令发出之前**落地 —— 所以 post 过去之后用闩等它做完。
-     * 正常情况下这是毫秒级；超时只是兜底，免得远程 UI 线程卡住时把注入线程一起拖住。
+     * 覆盖我们**所有**注入路径（点技能、走位的每一段、跳跃），代价最小。
+     * 采点层也要一起切：任务运行中用户正在标注时，引擎的注入点击会被全屏的采点层吃掉，
+     * **静默存下一个错误坐标** —— 这是本项目最忌讳的失败模式。
      */
     private fun setOverlayTouchable(touchable: Boolean) {
-        val wins = listOfNotNull(
-            panel?.let { v -> panelParams?.let { v to it } },
-            ball?.let { v -> ballParams?.let { v to it } },
-            pickView?.let { v -> pickParams?.let { v to it } }
-        )
+        val wins = overlayWindows()
         if (wins.isEmpty()) return
-        val apply = Runnable {
+        onUiSync {
             wins.forEach { (v, p) ->
                 p.flags = if (touchable) {
                     p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
@@ -415,18 +458,83 @@ class OverlayService : Service() {
                 runCatching { wm.updateViewLayout(v, p) }
             }
         }
-        // 已经在 UI 线程就直接改 —— post + 等闩会变成"自己等自己"，白等满 1 秒超时
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            apply.run()
+    }
+
+    /**
+     * 整段走位的让路：把**与注入区域重叠**的窗口直接挪出画面。
+     *
+     * ## 为什么不只靠置灰
+     * 轮盘在左下角，而展开后的面板最高能到屏幕 88% —— 面板与摇杆区重叠是**常态**，
+     * 这是用户实际踩到的场景（点「试走位」→ 面板吃掉注入 → 面板自己收起成球、角色不动）。
+     * 置灰依赖 ROM 正确实现 `FLAG_NOT_TOUCHABLE`；挪窗口是几何事实，不依赖任何 flag 语义，
+     * 所以走位这条路上两者都上：重叠的挪走，其余置灰。
+     *
+     * ## 挪去哪
+     * 缩成 1×1 并移到屏幕左上角。**不**用"移到屏幕外"：位置是否被 WindowManager 夹回
+     * 显示区取决于 ROM，1×1 在 (0,0) 则不可能压到左下角摇杆/右下角跳跃键。
+     * 走完按原 x/y/w/h 放回去。
+     */
+    private fun walkGate(on: Boolean, l: Int, t: Int, r: Int, b: Int) {
+        // ---- 收尾：全部恢复 ----
+        if (!on) {
+            val back = synchronized(vacated) {
+                val copy = vacated.toList()
+                vacated.clear()
+                copy
+            }
+            onUiSync {
+                overlayWindows().forEach { (v, p) ->
+                    p.flags = p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                    runCatching { wm.updateViewLayout(v, p) }
+                }
+                back.forEach { (v, xy) ->
+                    val p = overlayWindows().firstOrNull { it.first === v }?.second ?: return@forEach
+                    p.x = xy[0]; p.y = xy[1]; p.width = xy[2]; p.height = xy[3]
+                    runCatching { wm.updateViewLayout(v, p) }
+                }
+            }
+            if (back.isNotEmpty()) LogBus.emit("🛡 走位让路结束：${back.size} 个窗口已放回原位")
             return
         }
-        val done = CountDownLatch(1)
-        ui.post {
-            apply.run()
-            done.countDown()
+
+        // ---- 开始：与注入区重叠的挪走，其余置灰 ----
+        // 置灰档只切 flag（面板保持可见）；挪开档才动几何位置。
+        val move = gateMoves()
+        val inject = Rect(l, t, r, b)
+        var moved = 0
+        onUiSync {
+            overlayWindows().forEach { (v, p) ->
+                val overlaps = move && v.width > 0 && v.height > 0 &&
+                    Rect.intersects(Rect(p.x, p.y, p.x + v.width, p.y + v.height), inject)
+                if (overlaps) {
+                    synchronized(vacated) {
+                        vacated.add(v to intArrayOf(p.x, p.y, p.width, p.height))
+                    }
+                    p.x = 0; p.y = 0; p.width = 1; p.height = 1
+                    moved++
+                }
+                p.flags = p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                runCatching { wm.updateViewLayout(v, p) }
+            }
         }
-        runCatching { done.await(1000, TimeUnit.MILLISECONDS) }
+        LogBus.emit(
+            when {
+                moved > 0 -> "🛡 走位让路：$moved 个窗口与注入区重叠，已临时收起（走完放回）"
+                !move -> "🛡 走位让路：置灰档（只切 FLAG_NOT_TOUCHABLE，面板保持可见）"
+                else -> "🛡 走位让路：没有窗口与注入区重叠（仅置灰）"
+            }
+        )
     }
+
+    /** 版本号，写进启动日志 —— 远程排查时第一眼要看的就是"跑的是哪一版"。 */
+    private fun versionName(): String = runCatching {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+    }.getOrDefault("?")
+
+    private fun versionCode(): Long = runCatching {
+        val pi = packageManager.getPackageInfo(packageName, 0)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) pi.longVersionCode else pi.versionCode.toLong()
+    }.getOrDefault(-1L)
 
     /**
      * 挂上"拖动 + 点击"监听：整条 view 可拖，位置落盘；没拖动就是点击，调 [onTap]。
@@ -502,9 +610,13 @@ class OverlayService : Service() {
      * 折叠态：一个球。色环表示状态，中间是下次补 BUFF 的倒计时。
      *
      * 点一下展开面板，拖动换位置 —— 两者共用一套触摸处理（见 [attachDrag] 的 moved 判定）。
+     *
+     * [why] 只用来写日志：面板"自己消失"是用户实际报过的问题，日志里必须能看出
+     * 每次「面板 ↔ 球」是谁触发的（用户点的 / 注入的点击打中的 / 我们主动收的）。
      */
-    private fun showBall() {
+    private fun showBall(why: String = "") {
         if (ball != null) return
+        if (why.isNotBlank()) LogBus.emit("▸ 面板 → 球：$why")
         removePanel()
 
         val v = BallView(this)
@@ -525,7 +637,7 @@ class OverlayService : Service() {
         if (p.x < 0) p.x = (screenSize().first - dp(BALL_D) - dp(12)).coerceAtLeast(0)
 
         // 拖动之外的抬手 = 点击 → 展开面板
-        attachDrag(v, p, KEY_BALL_X, KEY_BALL_Y) { showPanel() }
+        attachDrag(v, p, KEY_BALL_X, KEY_BALL_Y) { showPanel("点了悬浮球") }
 
         v.running = Engine.isRunning
         v.error = Engine.state == Engine.State.ERROR
@@ -552,8 +664,9 @@ class OverlayService : Service() {
 
     // ------------------------------------------------------------ 展开面板
 
-    private fun showPanel() {
+    private fun showPanel(why: String = "") {
         if (panel != null) return
+        if (why.isNotBlank()) LogBus.emit("▸ 球 → 面板：$why")
         removeBall()
 
         val root = LinearLayout(this).apply {
@@ -674,6 +787,10 @@ class OverlayService : Service() {
             marks,
             overlayBtn("试走位一次", fill = Ui.SURFACE_2, border = Ui.BORDER,
                 heightDp = 30, compact = true) { testStroll() },
+            overlayBtn("走位自检", fill = Ui.SURFACE_2, border = Ui.BORDER,
+                heightDp = 30, compact = true) { selfTestWalk() },
+            overlayBtn(gateLabel(), fill = Ui.SURFACE_2, border = Ui.BORDER,
+                heightDp = 30, compact = true) { toggleGate() }.also { gateBtn = it },
             overlayBtn("复位窗口", fill = Ui.SURFACE_2, border = Ui.BORDER,
                 heightDp = 30, compact = true) { resetPositions() },
             overlayBtn("清空标注", fill = Ui.SURFACE_2, border = Ui.DANGER,
@@ -707,7 +824,7 @@ class OverlayService : Service() {
         }
 
         // 标题条上除了拖动，抬手还要收起面板（拖动时不触发 —— 见 attachDrag）
-        attachDrag(titleBar, p, KEY_PANEL_X, KEY_PANEL_Y) { showBall() }
+        attachDrag(titleBar, p, KEY_PANEL_X, KEY_PANEL_Y) { showBall("点了标题条（收起）") }
 
         panel = root
         panelParams = p
@@ -731,11 +848,17 @@ class OverlayService : Service() {
         annoHead = null
         annoCount = null
         marksBtn = null
+        gateBtn = null
         cancelPickBtn = null
         slotBtns.clear()
     }
 
     private fun marksLabel() = if (marksOnOf(this)) "回显:开" else "回显:关"
+
+    /** 走位让路是否要"挪窗口"（默认要；置灰档位见 [KEY_GATE]）。 */
+    private fun gateMoves() = prefs().getString(KEY_GATE, GATE_MOVE) != GATE_FLAG
+
+    private fun gateLabel() = if (gateMoves()) "让路:挪开" else "让路:置灰"
 
     /**
      * 高度兜底：横屏可用高度只有 720px，展开后的面板很容易顶出屏幕。
@@ -761,7 +884,12 @@ class OverlayService : Service() {
             .remove(KEY_BALL_X).remove(KEY_BALL_Y)
             .remove(KEY_PANEL_X).remove(KEY_PANEL_Y).apply()
         val ok = ball != null || panel != null
-        if (ball != null) { showBall() } else if (panel != null) { removePanel(); showBall() }
+        if (ball != null) {
+            showBall("复位窗口位置")
+        } else if (panel != null) {
+            removePanel()
+            showBall("复位窗口位置")
+        }
         LogBus.emit(if (ok) "窗口位置已复位。点悬浮球重新展开。" else "窗口位置已复位。")
         flashStatus("已复位窗口位置")
     }
@@ -926,9 +1054,25 @@ class OverlayService : Service() {
         Thread {
             LogBus.emit("▸ 试走位一次")
             LogBus.emit("   " + WalkFlow.describe(this).replace("\n", "；"))
-            val (ok, msg) = WalkFlow.strollAndJump { LogBus.emit(it) }
-            LogBus.emit(if (ok) "   ✅ $msg" else "   ⚠ $msg")
-            flashStatus(if (ok) "✅ 走位完成" else "⚠ 走位有问题")
+            val r = runCatching { WalkFlow.strollAndJump { LogBus.emit(it) } }
+                .getOrElse { false to "走位异常：${it.javaClass.simpleName}: ${it.message}" }
+            LogBus.emit(if (r.first) "   ✅ ${r.second}" else "   ⚠ ${r.second}")
+            flashStatus(if (r.first) "✅ 走位完成" else "⚠ 走位有问题")
+            ui.post { refreshStatus(true) }
+        }.apply { isDaemon = true }.start()
+    }
+
+    /**
+     * 走位手势自检：4 种推杆发法各跑一遍，用户看角色哪一种动了。
+     *
+     * 走位不动到底是"注入被面板吃掉"还是"手势本身这台机器不认"，只有实机能区分；
+     * 这个按钮把前者排除掉（自检也走 [InjectShield] 让路），剩下的答案就落在手势上。
+     */
+    private fun selfTestWalk() {
+        Thread {
+            runCatching { WalkFlow.selfTest { LogBus.emit(it) } }
+                .onFailure { LogBus.emit("   自检异常：${it.javaClass.simpleName}: ${it.message}") }
+            flashStatus("走位自检完成")
             ui.post { refreshStatus(true) }
         }.apply { isDaemon = true }.start()
     }
@@ -992,7 +1136,7 @@ class OverlayService : Service() {
                 pickSlot = null
                 pickQueue.clear()
                 LogBus.emit("标注层添加失败：${it.message}")
-                ui.post { showPanel() }
+                ui.post { showPanel("采点层添加失败，退回面板") }
             }
     }
 
@@ -1028,7 +1172,7 @@ class OverlayService : Service() {
                 if (wasSequence) "；连续标注已中止" else ""
         )
         flashStatus("已取消标注")
-        showPanel()
+        showPanel("取消标注")
     }
 
     /**
@@ -1074,10 +1218,32 @@ class OverlayService : Service() {
             ui.post { startSlotPick(next) }
             return
         }
-        showPanel()      // 采完回到展开面板
+        showPanel("标注完成")      // 采完回到展开面板
     }
 
     // ------------------------------------------------------------ 标点回显
+
+    /**
+     * 切换走位让路方式：挪开 ↔ 仅置灰。
+     *
+     * 两种都保证"注入不落到自己面板上"，区别只在**能不能依赖 ROM 正确实现
+     * FLAG_NOT_TOUCHABLE**：挪开是几何事实（一定生效，但走位那几秒面板看不见），
+     * 置灰只改 flag（面板一直看得见，但依赖 ROM）。默认挪开 —— 先保证能走。
+     */
+    private fun toggleGate() {
+        val next = if (gateMoves()) GATE_FLAG else GATE_MOVE
+        prefs().edit().putString(KEY_GATE, next).apply()
+        gateBtn?.text = gateLabel()
+        LogBus.emit(
+            if (next == GATE_MOVE) {
+                "走位让路＝挪开：与摇杆区重叠的窗口会在走位期间临时收起（走完放回）"
+            } else {
+                "走位让路＝仅置灰：只切 FLAG_NOT_TOUCHABLE，面板保持可见；" +
+                    "若走位时面板还会自己动，说明这台机器没按标准处理该 flag，改回「挪开」"
+            }
+        )
+        flashStatus(gateLabel())
+    }
 
     private fun toggleMarks() {
         val on = !marksOnOf(this)
