@@ -71,7 +71,12 @@ class Probe(
             }
             reader.join(300)
             val text = output.toString()
-            text.lineSequence().filter { it.startsWith("TOUCH_RELEASE") }.forEach { log(it) }
+            // 把 agent 的所有提示转进日志（TOUCH_OK 是成功标记本身，不用重复）。
+            // 其中两类必须看得见：TOUCH_RELEASE 是"确实松手了"的现场证据；
+            // TOUCH_JUMP_FAILED 说明"三段走位成功、只有收尾那一跳没跳出去"。
+            text.lineSequence()
+                .filter { it.startsWith("TOUCH_") && it != "TOUCH_OK" }
+                .forEach { log(it) }
             token.check()
             check(process.exitValue() == 0 && text.lineSequence().any { it == "TOUCH_OK" }) {
                 "输入未完成（退出码 ${process.exitValue()}）：${text.trim().take(400)}"

@@ -11,6 +11,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /** 由 root app_process 执行；整次走位在一个进程内完成，不在事件之间启动 shell。 */
 public final class TouchAgent {
+    /** 事件名，只用于日志可读性。 */
+    private static String actionName(int action) {
+        if (action == MotionEvent.ACTION_DOWN) return "DOWN";
+        if (action == MotionEvent.ACTION_MOVE) return "MOVE";
+        if (action == MotionEvent.ACTION_UP) return "UP";
+        return "ACTION_" + action;
+    }
+
     public static void main(String[] args) {
         AtomicBoolean cancelled = new AtomicBoolean();
         int code = 0;
@@ -34,15 +42,18 @@ public final class TouchAgent {
                 MotionEvent event = MotionEvent.obtain(down, time, action, x, y, 0);
                 event.setSource(InputDevice.SOURCE_TOUCHSCREEN);
                 try {
-                    // 同步确认系统接收事件；拒绝注入必须明确失败。
+                    // 同步确认系统接收事件；拒绝注入必须明确失败（由 GestureSequence 决定重试）。
                     if (!Boolean.TRUE.equals(inject.invoke(manager, event, 2))) {
-                        throw new IllegalStateException("系统拒绝触摸注入");
+                        // ★ 必须带上动作与坐标：只写"系统拒绝触摸注入"的话，
+                        // 远程排查时无法判断是按下被拒（人没动）还是松手被拒（可能卡住手指）。
+                        throw new IllegalStateException(
+                            "系统拒绝触摸注入 " + actionName(action) + "(" + x + "," + y + ")");
                     }
                     if (action == MotionEvent.ACTION_UP) {
                         System.out.println("TOUCH_RELEASE " + x + "," + y + " held=" + (time - down) + "ms");
                     }
                 } finally { event.recycle(); }
-            }, cancelled::get);
+            }, cancelled::get, System.out::println);
             if (args.length == 4 && "tap".equals(args[0])) {
                 int x = Integer.parseInt(args[1]), y = Integer.parseInt(args[2]);
                 sequence.hold(x, y, x, y, Long.parseLong(args[3]));

@@ -211,10 +211,21 @@ object Picks {
             )
         }
         check(invalid.isEmpty()) {
-            "屏幕已变化，请重新标记：${invalid.joinToString("、") { label(it) }}"
+            "屏幕已变化，请重新标记：${staleDetail(ctx, invalid, geometry.key)}"
         }
         return geometry
     }
+
+    /**
+     * 把"这个槽位记录的屏幕"和"现在的屏幕"并排写出来。
+     *
+     * 只说"屏幕已变化"是不够的：远程排查时无法判断到底是分辨率变了、方向变了，
+     * 还是判定逻辑本身有问题。把两个 key 都打出来，一眼就能定性。
+     */
+    private fun staleDetail(ctx: Context, slots: List<String>, current: String): String =
+        slots.joinToString("、") { slot ->
+            "${label(slot)}（标记于 ${sp(ctx).getString("${slot}_screen", null) ?: "未知"}，现在 $current）"
+        }
 
     /**
      * 启动前的"屏幕是否真的变过"预检，有问题返回说明，没问题返回 null。
@@ -226,11 +237,12 @@ object Picks {
     fun geometryProblem(ctx: Context, slots: List<String>): String? = try {
         val geometry = ScreenGeometry.read(ctx)
         val prefs = sp(ctx)
-        val bad = slots.filter { slot ->
+        val stale = slots.filter { slot ->
             get(ctx, slot) == null ||
                 screenMatch(prefs.getString("${slot}_screen", null), geometry.key) == ScreenMatch.STALE
         }
-        if (bad.isEmpty()) null else "屏幕已变化，请重新标记：${bad.joinToString("、") { label(it) }}"
+        if (stale.isEmpty()) null
+        else "屏幕已变化，请重新标记：${staleDetail(ctx, stale, geometry.key)}"
     } catch (e: Exception) {
         "无法确定屏幕尺寸：${e.message}"
     }

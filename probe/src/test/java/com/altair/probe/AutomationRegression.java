@@ -15,16 +15,38 @@ public final class AutomationRegression {
             this.action = action; this.down = down; this.time = time; this.x = x; this.y = y;
         }
     }
-    static final class Rig implements GestureSequence.Clock, GestureSequence.Input {
+    static class Rig implements GestureSequence.Clock, GestureSequence.Input {
         long now = 1000, cancelAt = Long.MAX_VALUE;
-        int failMoveAt = -1, moves;
+        /**
+         * 从第 N 次 MOVE 起**持续**失败（0 = 不启用）。
+         *
+         * 必须是"持续"而不是"只失败那一次"：注入层现在会对单个事件重试，
+         * 只失败一次会被重试救回来 —— 那正是它该做的事。
+         */
+        int failMovesFrom = 0, moves;
+        /** 开头的 N 次发送直接失败，用来验证重试。 */
+        int rejectFirst = 0, sent;
+        /** 所有 UP 都失败：验证松手失败不会盖掉真正的失败原因。 */
+        boolean failUps = false;
+        /** 在这个坐标上的 DOWN 一律被拒（Integer.MIN_VALUE = 不启用）。 */
+        int refuseDownX = Integer.MIN_VALUE, refuseDownY = Integer.MIN_VALUE;
         final List<Event> events = new ArrayList<>();
-        final GestureSequence sequence = new GestureSequence(this, this, () -> now >= cancelAt);
+        final List<String> notices = new ArrayList<>();
+        final GestureSequence sequence =
+            new GestureSequence(this, this, () -> now >= cancelAt, notices::add);
         public long now() { return now; }
         public void sleep(long ms) { now += ms; }
         public void send(int action, long down, long time, int x, int y) throws Exception {
+            if (action == GestureSequence.UP && failUps) throw new Exception("release refused");
+            if (action == GestureSequence.DOWN && x == refuseDownX && y == refuseDownY) {
+                throw new Exception("injection refused");
+            }
+            if (++sent <= rejectFirst) throw new Exception("injection refused");
             events.add(new Event(action, down, time, x, y));
-            if (action == GestureSequence.MOVE && ++moves == failMoveAt) throw new Exception("injection failed");
+            if (action == GestureSequence.MOVE) {
+                moves++;
+                if (failMovesFrom > 0 && moves >= failMovesFrom) throw new Exception("injection failed");
+            }
         }
         List<Event> of(int action) {
             List<Event> result = new ArrayList<>();
@@ -66,7 +88,7 @@ public final class AutomationRegression {
         }
     }
     static void failure() throws Exception {
-        Rig rig = new Rig(); rig.failMoveAt = 5;
+        Rig rig = new Rig(); rig.failMovesFrom = 5;
         try { rig.walk(); throw new AssertionError("注入失败不应显示成功"); }
         catch (Exception expected) { check("injection failed".equals(expected.getMessage()), "保留失败原因"); }
         check(rig.of(0).size() == 1 && rig.of(1).size() == 1, "失败后松手，不执行右段或跳跃");
@@ -172,6 +194,78 @@ public final class AutomationRegression {
         check(p.screenMatch("2340,1080,0", "1280,720,0") == Picks.ScreenMatch.STALE, "分辨率变了 → 必须重标");
     }
 
+    /**
+     * 注入被系统丢弃时要重试。
+     *
+     * ★ 回归的是实机日志里的 `系统拒绝触摸注入`：InputDispatcher 在窗口切换/卡顿时会丢弃
+     * 单次注入并返回 false。v0.26.4 用 `input swipe` 子进程从不检查送达，所以这种丢包一直
+     * 是静默的；改成检查返回值之后第一次变成硬失败，表现为"三段走位都成功，只有最后那一跳
+     * 被拒，于是整轮算失败"。
+     */
+    static void injectionRetry() throws Exception {
+        // 开头两次发送被拒：重试应当救回来，且落点与一次成功完全一致
+        Rig retried = new Rig();
+        retried.rejectFirst = 2;
+        retried.walkOnly();
+        check(retried.of(0).size() == 3 && retried.of(1).size() == 3, "重试后三段仍然完整");
+
+        Rig clean = new Rig();
+        clean.walkOnly();
+        for (int i = 0; i < 3; i++) {
+            check(retried.of(0).get(i).x == clean.of(0).get(i).x, "重试不改变推杆落点");
+        }
+    }
+
+    /** 按下本身就被拒时，绝不能补发一个 UP —— 那等于朝没按下的手指发释放事件。 */
+    static void noReleaseWithoutPress() throws Exception {
+        Rig rig = new Rig();
+        rig.rejectFirst = 3;                       // DOWN 的 3 次尝试全部失败
+        try {
+            rig.sequence.hold(100, 500, 100, 500, 600);
+            throw new AssertionError("按下失败应当抛出");
+        } catch (Exception expected) {
+            check("injection refused".equals(expected.getMessage()), "保留失败原因");
+        }
+        check(rig.of(0).isEmpty() && rig.of(1).isEmpty(), "没按下过就不该有 DOWN/UP");
+    }
+
+    /**
+     * 三段走位成功、只有收尾的跳跃被拒 —— 这一轮走位仍然算成功。
+     *
+     * 跳跃坐标本来就是可选项，把它算成失败会让"人已经走完一轮"的战果被一个装饰动作抹掉，
+     * 还会连锁触发引擎熔断把任务停掉（实机日志里正是这个现象）。
+     */
+    static void jumpFailureIsNotFatal() throws Exception {
+        Rig rig = new Rig();
+        // 只让跳跃那一下的 DOWN 被拒：跳跃落在 (900,500)，三段走位的 DOWN 都在 (100,500)。
+        rig.refuseDownX = 900;
+        rig.refuseDownY = 500;
+        rig.walk();                                 // 不应抛出
+        check(rig.of(0).size() == 3, "三段走位照常完成");
+        check(rig.of(1).size() == 3, "三段走位都松了手");
+        check(rig.notices.size() == 1 && rig.notices.get(0).startsWith("TOUCH_JUMP_FAILED"),
+            "跳跃失败要留下可查的提示，而不是无声无息");
+    }
+
+    /**
+     * 松手失败不能盖掉真正的失败原因。
+     *
+     * 松手在 `finally` 里执行；那里再抛异常的话，排查时看到的就是 UP 的错误，
+     * 而真正的问题（这里是 MOVE 注入失败）被吞掉了 —— 日志会指向完全错误的方向。
+     */
+    static void releaseFailureDoesNotMask() throws Exception {
+        Rig rig = new Rig();
+        rig.failMovesFrom = 5;
+        rig.failUps = true;
+        try {
+            rig.walk();
+            throw new AssertionError("MOVE 注入失败应当抛错");
+        } catch (Exception expected) {
+            check("injection failed".equals(expected.getMessage()),
+                "报出的必须是 MOVE 的真实原因，而不是松手失败");
+        }
+    }
+
     static void scheduling() {
         Schedule s = new Schedule();
         s.configure(280_000, 1000);
@@ -259,12 +353,14 @@ public final class AutomationRegression {
     public static void main(String[] args) throws Exception {
         sequence(); cancellation(); failure();
         walkWithoutJump(); walkOnlyCancellation(); injectGate();
+        injectionRetry(); noReleaseWithoutPress(); jumpFailureIsNotFatal();
+        releaseFailureDoesNotMask();
         screenMatch();
         scheduling(); actions(); shell();
         System.out.println(
             "PASS: 1:2:1 时序、1秒后单次跳跃、可选跳跃只走三段、按压设置、8+6 个取消阶段、" +
-                "失败松手、闸门两档与失败禁止注入、屏幕记录三选一、独立排期、互斥重启、" +
-                "命令退出码/超时/中断/转义"
+                "失败松手、闸门两档与失败禁止注入、屏幕记录三选一、注入重试、未按下不松手、" +
+                "跳跃失败不致命、独立排期、互斥重启、命令退出码/超时/中断/转义"
         );
     }
 }

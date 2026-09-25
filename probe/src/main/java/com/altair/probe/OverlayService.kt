@@ -1245,7 +1245,9 @@ class OverlayService : Service() {
      * ★ 必须先摘下面板再加采点层，否则采点层盖住面板，用户便无法点「取消标注」。
      */
     private fun startSlotPick(slot: String) {
-        Engine.stop("标记位置，完成后请重新启动")
+        // 只有真的在跑才需要停。否则每点一次「标技能N」都写一条「任务停止：标记位置…」，
+        // 日志里全是这些什么都没停成的空动作，真正要看的东西反而被淹掉。
+        if (Engine.isRunning || Engine.isStopping) Engine.stop("标记位置，完成后请重新启动")
         picking = true
         val generation = ++pickGeneration
         fun begin() {
