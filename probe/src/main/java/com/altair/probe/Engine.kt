@@ -22,6 +22,24 @@ object Engine {
     @Volatile private var worker: Thread? = null
     private var ctx: Context? = null
     const val DEFAULT_DUR_SEC = 280
+
+    /**
+     * 两次补 BUFF 之间的等待。
+     *
+     * 技能点击不是"发出去就到"的：游戏要放完上一个技能的施法动画才会接受下一次输入。
+     * 间隔太短的话后一次点击会被游戏**吞掉**，而注入层看到的是"注入成功" ——
+     * 于是日志上一切正常、游戏里只上了一个 BUFF，属于最难查的那类失败。
+     */
+    private const val BUFF_GAP_MS = 1000L
+
+    /**
+     * 补 BUFF 与走位之间的等待（两个方向都要）。
+     *
+     * 走位第一件事就是按住摇杆。如果此刻上个技能的施法动画还在放，摇杆的 DOWN 会被吞 ——
+     * **人一步没走却报「走位完成」**；反过来，走位结尾是跳一下，紧接着补 BUFF 同样会撞在
+     * 跳跃动作上。所以两类动作之间必须留出一段干净的间隔，而不能只靠"上一步正好睡过"。
+     */
+    private const val SEQUENCE_GAP_MS = 1000L
     val isRunning: Boolean get() = running
     val isStopping: Boolean get() = !running && worker != null
     data class BuffSlot(val idx: Int, val enabled: Boolean, val durSec: Int)
@@ -107,9 +125,27 @@ object Engine {
         if (!running || Thread.currentThread().isInterrupted) throw InterruptedException()
     }
 
+    /**
+     * 按 [ActionPacer] 的裁决睡够间隔。
+     *
+     * ★ 分片睡（最多 200ms 一片）而不是一次睡满：一次睡 1.5 秒会让「停止任务」最多迟钝
+     * 1.5 秒才响应，用户会以为按钮没生效、然后连点。分片后停止几乎是立刻生效。
+     */
+    private fun ActionPacer.await(kind: Int) {
+        while (true) {
+            checkRunning()
+            val delay = delayBefore(kind, SystemClock.elapsedRealtime())
+            if (delay <= 0) return
+            Thread.sleep(minOf(delay, 200L))
+        }
+    }
+
     private fun loop(c: Context) {
         val skills = Array(Picks.SKILL_COUNT) { Schedule() }
         val walk = Schedule()
+        // 动作之间的间隔规则集中在这里：补 BUFF 之间等施法动画，补 BUFF 与走位之间留得更足。
+        // 具体数值与理由见 [BUFF_GAP_MS] / [SEQUENCE_GAP_MS]。
+        val pacer = ActionPacer(BUFF_GAP_MS, SEQUENCE_GAP_MS)
         try {
             while (running) {
                 val now = SystemClock.elapsedRealtime()
@@ -131,13 +167,17 @@ object Engine {
                 checkRunning()
                 state = State.WAITING
                 Picks.requireGeometry(c, Picks.required(c))
+
+                // ---- 补 BUFF：间隔由 pacer 统一裁决 ----
                 for (slot in config.filter { it.enabled }) {
                     checkRunning()
                     val schedule = skills[slot.idx]
                     if (!schedule.ready(SystemClock.elapsedRealtime())) continue
+                    pacer.await(ActionPacer.BUFF)
                     state = State.CASTING
                     val result = Picks.tap(c, Picks.SKILLS[slot.idx])
                     checkRunning()
+                    pacer.done(ActionPacer.BUFF, SystemClock.elapsedRealtime())
                     lastResult = result.second
                     LogBus.emit(result.second)
                     if (result.first) {
@@ -150,13 +190,18 @@ object Engine {
                         check(schedule.failures < 3) { "${Picks.label(Picks.SKILLS[slot.idx])}连续失败 3 次，任务停止" }
                     }
                     failStreak = skills.maxOf { it.failures }
-                    Thread.sleep(1500)
                 }
+
+                // ---- 走位 ----
                 checkRunning()
                 if (walk.ready(SystemClock.elapsedRealtime())) {
+                    // 与上一次补 BUFF 之间留足间隔：摇杆的 DOWN 撞在施法动画上会被吞，
+                    // 就会出现"人没走、却报走位完成"。反向（走位→补 BUFF）同样由 pacer 兜住。
+                    pacer.await(ActionPacer.WALK)
                     state = State.CASTING
                     val result = WalkFlow.strollAndJump { LogBus.emit(it) }
                     checkRunning()
+                    pacer.done(ActionPacer.WALK, SystemClock.elapsedRealtime())
                     lastWalkResult = result.second
                     LogBus.emit(result.second)
                     // 部分走位失败后位置未知，不能从新起点自动重放整个往返。

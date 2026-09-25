@@ -266,6 +266,41 @@ public final class AutomationRegression {
         }
     }
 
+    /**
+     * 动作之间的间隔规则。
+     *
+     * ★ 回归的是"注入成功但游戏没接受"：游戏要放完上一个动作的动画才接受下一次输入，
+     * 而注入层只知道事件送到了。没有间隔时日志一切正常、游戏里什么都没发生。
+     */
+    static void actionPacing() {
+        ActionPacer pacer = new ActionPacer(1000, 1000);
+
+        // 第一个动作不受约束
+        check(pacer.delayBefore(ActionPacer.BUFF, 5000) == 0, "首个动作立即执行");
+
+        pacer.done(ActionPacer.BUFF, 5000);
+        check(pacer.delayBefore(ActionPacer.BUFF, 5000) == 1000, "紧接着再补要等满间隔");
+        check(pacer.delayBefore(ActionPacer.BUFF, 5500) == 500, "只等到差额");
+        check(pacer.delayBefore(ActionPacer.BUFF, 6000) == 0, "等满后不再等待");
+        check(pacer.delayBefore(ActionPacer.BUFF, 9000) == 0, "超时后不等待");
+
+        // 换类（补 BUFF ↔ 走位）走另一档间隔
+        check(pacer.delayBefore(ActionPacer.WALK, 5900) == 100, "补 BUFF 后走位要等换类间隔");
+        check(pacer.delayBefore(ActionPacer.WALK, 6000) == 0, "等满换类间隔");
+
+        pacer.done(ActionPacer.WALK, 7000);
+        check(pacer.delayBefore(ActionPacer.BUFF, 7000) == 1000, "走位后补 BUFF 同样要等");
+        check(pacer.delayBefore(ActionPacer.BUFF, 8000) == 0, "等满即可补");
+
+        // 两档可以不同：换类留得更足
+        ActionPacer wider = new ActionPacer(1000, 1500);
+        wider.done(ActionPacer.BUFF, 0);
+        check(wider.delayBefore(ActionPacer.BUFF, 0) == 1000, "同类用同类间隔");
+        check(wider.delayBefore(ActionPacer.WALK, 0) == 1500, "换类用换类间隔");
+
+        check(wider.sameKindGapMs() == 1000 && wider.switchKindGapMs() == 1500, "间隔可读");
+    }
+
     static void scheduling() {
         Schedule s = new Schedule();
         s.configure(280_000, 1000);
@@ -355,12 +390,12 @@ public final class AutomationRegression {
         walkWithoutJump(); walkOnlyCancellation(); injectGate();
         injectionRetry(); noReleaseWithoutPress(); jumpFailureIsNotFatal();
         releaseFailureDoesNotMask();
-        screenMatch();
+        screenMatch(); actionPacing();
         scheduling(); actions(); shell();
         System.out.println(
             "PASS: 1:2:1 时序、1秒后单次跳跃、可选跳跃只走三段、按压设置、8+6 个取消阶段、" +
                 "失败松手、闸门两档与失败禁止注入、屏幕记录三选一、注入重试、未按下不松手、" +
-                "跳跃失败不致命、独立排期、互斥重启、命令退出码/超时/中断/转义"
+                "跳跃失败不致命、动作间隔两类、独立排期、互斥重启、命令退出码/超时/中断/转义"
         );
     }
 }
