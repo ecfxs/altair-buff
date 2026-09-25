@@ -81,8 +81,8 @@ object Ui {
     // 用纯色会像在游戏画面上贴了张纸；半透明既能看清字，又能透出下面的血条/小地图，
     // 挂机时不会因为看不见画面而误判。
 
-    /** 面板底：72% 黑。再透就压不住亮色游戏画面上的文字。 */
-    val PANEL_BG = Color.parseColor("#B80D0D0F")
+    /** 面板底：91% 黑。再透就压不住亮色游戏画面上的文字。 */
+    val PANEL_BG = Color.parseColor("#E80D0D0F")
 
     /** 面板上的普通按钮（半透明白，叠在面板底上）。 */
     val PANEL_CTRL = Color.parseColor("#2EFFFFFF")
@@ -414,6 +414,21 @@ object Ui {
         val ms = remainMs.coerceAtLeast(0L)
         val total = ms / 1000
         return String.format(Locale.US, "%02d:%02d", total / 60, total % 60)
+    }
+
+    /**
+     * 已运行的时长 → `MM:SS`，超过 1 小时变 `H:MM:SS`。
+     *
+     * 和 [mmss] 分开是因为挂机一开就是几小时：用 [mmss] 会出现 `183:20` 这种读数，
+     * 既难读又撑宽度。
+     */
+    fun duration(ms: Long): String {
+        val total = ms.coerceAtLeast(0L) / 1000
+        val h = total / 3600
+        val m = (total % 3600) / 60
+        val s = total % 60
+        return if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, s)
+        else String.format(Locale.US, "%02d:%02d", m, s)
     }
 
     /** 状态色：引擎状态 + 前台是否为目标游戏 → 一个颜色。 */

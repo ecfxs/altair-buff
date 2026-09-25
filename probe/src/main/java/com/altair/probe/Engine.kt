@@ -15,6 +15,9 @@ object Engine {
     @Volatile var lastError = ""; private set
     @Volatile var lastResult = ""; private set
     @Volatile var lastWalkResult = ""; private set
+
+    /** 本次启动的时刻（`elapsedRealtime`）。用于在状态栏显示"已运行多久"。 */
+    @Volatile var startedAt = 0L; private set
     @Volatile private var running = false
     @Volatile private var worker: Thread? = null
     private var ctx: Context? = null
@@ -72,6 +75,7 @@ object Engine {
         }
         OverlayService.start(context)
         running = true
+        startedAt = SystemClock.elapsedRealtime()
         state = State.WAITING
         lastError = ""
         lastResult = "等待目标游戏进入前台"
@@ -89,6 +93,7 @@ object Engine {
 
     @Synchronized fun stop(reason: String = "手动停止") {
         running = false
+        startedAt = 0L
         Actions.cancel()
         worker?.interrupt()
         state = State.IDLE
@@ -170,6 +175,7 @@ object Engine {
         } finally {
             synchronized(this) {
                 running = false
+                startedAt = 0L
                 worker = null
                 nextBuffDueAt = 0
                 nextWalkDueAt = 0
@@ -177,6 +183,10 @@ object Engine {
             }
         }
     }
+
+    /** 本次已运行多久（毫秒）；没在跑返回 0。 */
+    fun runElapsedMs(): Long =
+        if (!running || startedAt <= 0) 0L else SystemClock.elapsedRealtime() - startedAt
 
     fun countdown(at: Long): String = if (!running || at <= 0) "—"
         else Ui.mmss(at - SystemClock.elapsedRealtime(), true)

@@ -75,12 +75,16 @@ class OverlayService : Service() {
         private const val PANEL_W_FULL = 226
 
         /**
-         * 面板上按钮的统一高度（dp）。
+         * 「标记位置」「工具」两组网格按钮的高度（dp）。
          *
-         * 44 是 Android 的推荐触摸目标，但面板浮在游戏画面上，一行 3 列时每格只有 ~70dp 宽、
-         * 44dp 高会显得又矮又胖。36 在 720p 横屏上仍然点得中，整块面板却能矮掉近 1/3。
+         * 这两组一共 10 颗，是面板高度的主要来源。压到 25dp（原 36 再减 30%）之后
+         * 整块面板矮掉约 1/4，展开工具时也不会挡住半个游戏画面。
+         * 格宽仍有 ~70dp，点击区域靠宽度补回来。
          */
-        private const val PANEL_CELL_H = 36
+        private const val PANEL_GRID_H = 25
+
+        /** 通栏按钮（「按顺序标记所需位置」）的高度，比网格高一档以便和网格区分。 */
+        private const val PANEL_WIDE_H = 30
 
         /** 悬浮球直径（dp）。48 是 Android 的最小触摸目标，再加一圈色环的视觉余量。 */
         private const val BALL_D = 56
@@ -160,6 +164,9 @@ class OverlayService : Service() {
 
     private var statusPill: TextView? = null
     private var statusSummary: TextView? = null
+
+    /** 标题栏右侧的"已运行 HH:MM"小字（只在运行中显示）。 */
+    private var runLabel: TextView? = null
     private var mainBtn: TextView? = null
     private var annoHead: TextView? = null
     private var annoCount: TextView? = null
@@ -301,11 +308,30 @@ class OverlayService : Service() {
             b.remainMs = Engine.nextBuffDueAt - now
             if (b.visibility == View.VISIBLE) b.invalidate()
         }
+        updateRunLabel()
         // 面板开着时摘要那行也要跟着跳
         if (panel != null && Engine.isRunning) {
             val s = buildStatus()
             if (statusSummary?.text != s) statusSummary?.text = s
         }
+    }
+
+    /**
+     * 「运行中」后面那行小字：本次已经跑了多久。
+     *
+     * 挂机是"开一整天"的用法，用户经常需要判断"这轮到底跑了多久、是不是刚重启过" ——
+     * 之前只能靠翻日志里的启动时间自己算。跟着 250ms 的倒计时一起刷新，不额外起线程。
+     */
+    private fun updateRunLabel() {
+        val tv = runLabel ?: return
+        val elapsed = Engine.runElapsedMs()
+        if (elapsed <= 0L) {
+            if (tv.visibility != View.GONE) tv.visibility = View.GONE
+            return
+        }
+        if (tv.visibility != View.VISIBLE) tv.visibility = View.VISIBLE
+        val want = "已运行 " + Ui.duration(elapsed)
+        if (tv.text != want) tv.text = want
     }
 
     /**
@@ -356,6 +382,7 @@ class OverlayService : Service() {
             if (b.visibility == View.VISIBLE) b.invalidate()
         }
 
+        updateRunLabel()
         refreshAnnoBadges()
     }
 
@@ -790,17 +817,38 @@ class OverlayService : Service() {
             setTextColor(Ui.PANEL_TEXT_DIM)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            // 刻意**不**设 weight：小字要紧跟在「运行中」后面，而不是被推到最右边。
+            // maxWidth 兜住极端文案，免得把右侧的收起图标挤出面板。
+            maxWidth = dp(140)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            )
         }
         // 收起按钮**刻意不设 OnClickListener**：整条标题栏才是"点一下收起、按住拖动"的热区。
         // 若让这个子 View 可点，它会把 ACTION_DOWN 独吞掉，在它身上起手就拖不动了。
+        // 尺寸放大到 20dp 并留出内边距：原来 13dp 太小，展开后几乎看不出那里可以收起。
         val collapseBtn = TextView(this).apply {
             text = "▾"
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20f)
+            setTextColor(Ui.PANEL_TEXT)
+            gravity = Gravity.CENTER
+            setPadding(dp(10), 0, dp(2), 0)
+        }
+        // 运行中才显示的"已运行多久"小字
+        runLabel = TextView(this).apply {
+            text = ""
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.5f)
             setTextColor(Ui.PANEL_TEXT_DIM)
-            setPadding(dp(10), dp(3), dp(3), dp(3))
+            maxLines = 1
+            setPadding(dp(7), 0, 0, 0)
+            visibility = View.GONE
         }
         titleBar.addView(statusPill)
+        titleBar.addView(runLabel)
+        // 弹簧：把小字和收起图标一起顶到右侧
+        titleBar.addView(View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(0, 1, 1f)
+        })
         titleBar.addView(collapseBtn)
         root.addView(titleBar)
 
@@ -856,7 +904,7 @@ class OverlayService : Service() {
         slotBtns.clear()
         val slotCells = Picks.ALL.map { slot ->
             overlayBtn(("○ ") + Picks.label(slot), fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
-                heightDp = PANEL_CELL_H, compact = true) { startSlotPick(slot) }.also { b ->
+                heightDp = PANEL_GRID_H, compact = true) { startSlotPick(slot) }.also { b ->
                 // ★ 长按 = 从这一颗起连续标注（技能3 → 3、4）
                 b.setOnLongClickListener {
                     if (slot in Picks.SKILLS) {
@@ -874,7 +922,7 @@ class OverlayService : Service() {
 
         // 「按顺序标记」主入口：面板上直接可见，不用去摸长按
         annoBody.addView(overlayBtn("按顺序标记所需位置", fill = Ui.PANEL_CTRL_ON,
-            border = Ui.PANEL_BORDER, heightDp = PANEL_CELL_H, compact = false) {
+            border = Ui.PANEL_BORDER, heightDp = PANEL_WIDE_H, compact = false) {
             startSkillSequence(Picks.SKILL1)
         })
 
@@ -882,7 +930,7 @@ class OverlayService : Service() {
             orientation = LinearLayout.HORIZONTAL
             visibility = View.GONE
             addView(overlayBtn("✕ 取消标注", fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
-                heightDp = PANEL_CELL_H, compact = true) { cancelSlotPick() })
+                heightDp = PANEL_GRID_H, compact = true) { cancelSlotPick() })
         }
         annoBody.addView(cancelPickBtn)
 
@@ -895,16 +943,16 @@ class OverlayService : Service() {
         // 4 颗整行按钮原来要占 4 行 —— 展开「工具」时面板高得离谱，也正是「点试走位、
         // 面板盖住轮盘、注入打在自己身上」那类事故的温床（见 [InjectShield]）。
         val marks = overlayBtn(marksLabel(), fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
-            heightDp = PANEL_CELL_H, compact = true) { toggleMarks() }
+            heightDp = PANEL_GRID_H, compact = true) { toggleMarks() }
         marksBtn = marks
         toolBody.addView(compactGrid(listOf(
             marks,
             overlayBtn("试走位一次", fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
-                heightDp = PANEL_CELL_H, compact = true) { testStroll() },
+                heightDp = PANEL_GRID_H, compact = true) { testStroll() },
             overlayBtn("复位窗口", fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
-                heightDp = PANEL_CELL_H, compact = true) { resetPositions() },
+                heightDp = PANEL_GRID_H, compact = true) { resetPositions() },
             overlayBtn("选择当前游戏", fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
-                heightDp = PANEL_CELL_H, compact = true) {
+                heightDp = PANEL_GRID_H, compact = true) {
                 Engine.stop("重新选择游戏")
                 Thread {
                     val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
@@ -963,6 +1011,7 @@ class OverlayService : Service() {
         // 这些是面板里的控件，跟着面板一起消失 —— 留着引用会指向已 detach 的 View
         statusPill = null
         statusSummary = null
+        runLabel = null
         mainBtn = null
         mainBtnRunning = null      // 按钮跟着面板一起没了，下次重建必须强制重绘一次
         annoHead = null
@@ -1027,16 +1076,19 @@ class OverlayService : Service() {
      * ## 尺寸为什么用 dp 而不是 sp
      * 覆盖层里的 sp 跟随系统字体缩放。目标机 720p 横屏下系统字号一大就撑破框。
      *
-     * ## 三档高度，全在 [PANEL_CELL_H] 附近
-     * 面板浮在游戏上，占的每一像素都是挡住的画面。所以网格格子和通栏按钮用同一个
-     * [PANEL_CELL_H]，只有启停那颗更矮一点 —— 它跟摘要同行，需要"小一号"的视觉权重。
-     * 统一高度也顺手解决了"按钮高矮不齐看着乱"。
+     * ## 三档高度，越次要的越矮
+     * ```
+     *   启停（摘要同行）   34dp    ← 主操作，最高
+     *   通栏（按顺序标记） 30dp
+     *   网格（标记 / 工具）25dp    ← 数量最多，压最矮
+     * ```
+     * 按档取整，而不是每颗按钮各写一个高度 —— 面板浮在游戏画面上，高矮参差比尺寸本身更显乱。
      */
     private fun overlayBtn(
         label: String,
         fill: Int,
         border: Int = 0,
-        heightDp: Int = PANEL_CELL_H,
+        heightDp: Int = PANEL_GRID_H,
         compact: Boolean = false,
         textColor: Int = Ui.PANEL_TEXT,
         /** 非 0 时使用固定宽度（启停那颗用，不跟同行文字抢空间）。 */
