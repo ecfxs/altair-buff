@@ -1,11 +1,13 @@
 package com.altair.probe
 
 import android.content.Context
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.util.Base64
 import java.io.File
-import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
+import java.security.MessageDigest
+import java.util.Locale
 
 /**
  * 应用内自更新
@@ -28,7 +30,8 @@ import java.net.URL
 class Updater(
     private val ctx: Context,
     private val sh: RootShell,
-    private val log: (String) -> Unit
+    private val log: (String) -> Unit,
+    private val releaseSignerSha256: String
 ) {
 
     companion object {
@@ -87,6 +90,53 @@ class Updater(
     fun saveUrl(u: String) =
         ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putString(KEY_URL, u.trim()).apply()
 
+    private fun certificateDigests(info: PackageInfo): Set<String> {
+        val certificates: Array<android.content.pm.Signature> = if (android.os.Build.VERSION.SDK_INT >= 28) {
+            runCatching {
+                val signing = info.signingInfo ?: return@runCatching emptyArray<android.content.pm.Signature>()
+                signing.apkContentsSigners
+            }.getOrDefault(emptyArray())
+        } else {
+            @Suppress("DEPRECATION")
+            info.signatures ?: emptyArray()
+        }
+        return certificates.map { signature ->
+            MessageDigest.getInstance("SHA-256").digest(signature.toByteArray())
+                .joinToString("") { byte -> "%02X".format(Locale.US, byte) }
+        }.toSet()
+    }
+
+    private fun signedByReleaseKey(info: PackageInfo): Boolean =
+        ApkSignerTrust.accepts(releaseSignerSha256, certificateDigests(info))
+
+    private fun archiveInfo(file: File): PackageInfo? = try {
+        val info = if (android.os.Build.VERSION.SDK_INT >= 33) {
+            ctx.packageManager.getPackageArchiveInfo(file.absolutePath,
+                PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong()))
+        } else {
+            @Suppress("DEPRECATION")
+            ctx.packageManager.getPackageArchiveInfo(file.absolutePath,
+                if (android.os.Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES
+                else PackageManager.GET_SIGNATURES)
+        }
+        info?.applicationInfo?.sourceDir = file.absolutePath
+        info
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun requireReleaseSignature(info: PackageInfo): String? {
+        if (!signedByReleaseKey(info)) return "签名不受信任：APK 与既有正式签名不匹配"
+        val installed = try {
+            @Suppress("DEPRECATION")
+            ctx.packageManager.getPackageInfo(ctx.packageName,
+                if (android.os.Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES
+                else PackageManager.GET_SIGNATURES)
+        } catch (_: Exception) { return "无法核对当前安装的签名，已停止更新" }
+        return if (certificateDigests(installed) == certificateDigests(info)) null
+            else "当前安装与更新包签名不同，无法覆盖升级；请先确认迁移策略"
+    }
+
     fun currentVersionCode(): Long = try {
         ctx.packageManager.getPackageInfo(ctx.packageName, 0).let {
             if (android.os.Build.VERSION.SDK_INT >= 28) it.longVersionCode else it.versionCode.toLong()
@@ -105,6 +155,11 @@ class Updater(
     private fun ensure(): Boolean = if (sh.isAlive) true else sh.open()
 
     fun readUpdateLog(): String {
+        reconcilePending()
+        if (InputController.mode(ctx) == InputController.Mode.ACCESSIBILITY) {
+            return ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString("systemInstallLog",
+                "暂无系统安装记录") + "\n当前版本：${currentVersionName()} (${currentVersionCode()})"
+        }
         if (!ensure()) return "(root shell 不可用)"
         val t = sh.exec("cat $LOGFILE 2>/dev/null", 5000)
         return t.ifBlank { "(暂无更新日志)" }
@@ -120,7 +175,7 @@ class Updater(
      * 「已是最新」，会导致**静默地永远不更新**。所以每个源都要校验 versionCode。
      */
     fun updateAuto(): String {
-        if (!ensure()) return "root shell 不可用，无法自更新"
+        if (hasPendingInstall()) return "已有经过校验的更新文件，请点击「安装已验证更新」或先丢弃它"
         val cur = currentVersionCode()
         val sb = StringBuilder()
         sb.append("当前版本 versionCode=$cur (${currentVersionName()})\n")
@@ -139,26 +194,32 @@ class Updater(
             }
             if (!got) continue
 
-            val info = ctx.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)
+            val info = archiveInfo(apk)
             if (info == null) { sb.append("   不是有效 APK\n"); continue }
             if (info.packageName != ctx.packageName) {
                 sb.append("   包名不匹配: ${info.packageName}\n"); continue
+            }
+            val signatureProblem = requireReleaseSignature(info)
+            if (signatureProblem != null) {
+                sb.append("   $signatureProblem\n")
+                continue
             }
             anyValid = true
             val v = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
             sb.append("   下载 ${apk.length() / 1024} KB   versionCode=$v\n")
             if (v > cur) {
                 sb.append("\n✅ 找到更高版本（$cur → $v），来源：$name\n\n")
-                sb.append(installDetached(apk.absolutePath))
+                sb.append(installValidated(apk))
                 return sb.toString()
             }
             sb.append("   不高于当前版本，继续试下一个源\n")
+            apk.delete()
         }
 
         sb.append("\n")
         sb.append(
             if (!anyValid) "更新检查失败：没有获得有效更新包，请查看各来源错误。"
-            else "✅ 已是最新版本（所有可达源都未提供更高版本）"
+            else "可达源未提供更高版本；不可达源及镜像缓存可能影响结果。"
         )
         return sb.toString()
     }
@@ -170,7 +231,7 @@ class Updater(
      * [force] 为 true 时即使版本不更高也强制重装（用于救砖/回滚）。
      */
     fun updateFromUrl(url: String, force: Boolean): String {
-        if (!ensure()) return "root shell 不可用，无法自更新"
+        if (hasPendingInstall()) return "已有待安装更新，请先安装或丢弃它"
         if (url.isBlank()) return "更新源 URL 为空"
         val sb = StringBuilder()
         val apk = File(ctx.cacheDir, "update.apk")
@@ -186,19 +247,22 @@ class Updater(
             }
             sb.append("下载完成 ${apk.length() / 1024} KB\n")
 
-            val info = ctx.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)
+            val info = archiveInfo(apk)
                 ?: return sb.append("下载的文件不是有效 APK").toString()
             if (info.packageName != ctx.packageName) {
                 return sb.append("包名不匹配：期望 ${ctx.packageName}，实际 ${info.packageName}").toString()
             }
+            val signerProblem = requireReleaseSignature(info)
+            if (signerProblem != null) return sb.append(signerProblem).toString()
             val newVer = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
             val curVer = currentVersionCode()
             sb.append("版本: 当前 $curVer (${currentVersionName()}) → 目标 $newVer\n")
             if (newVer <= curVer && !force) {
                 return sb.append("→ 已是最新，无需更新").toString()
             }
-            sb.append("\n").append(installDetached(apk.absolutePath))
+            sb.append("\n").append(installValidated(apk))
         } catch (t: Throwable) {
+            apk.delete()
             sb.append("更新失败: ${t.javaClass.simpleName}: ${t.message}")
         }
         return sb.toString()
@@ -211,30 +275,108 @@ class Updater(
      * 因为应用自身受 scoped storage 限制读不到 /sdcard，所以先用 root 拷进 cacheDir 再解析。
      */
     fun installLocal(pathInput: String, force: Boolean): String {
-        if (!ensure()) return "root shell 不可用"
+        if (hasPendingInstall()) return "已有待安装更新，请先安装或丢弃它"
         val path = pathInput.trim()
         if (path.isEmpty()) return "路径为空"
 
-        val exists = sh.exec("test -f ${RootShell.quote(path)} && echo YES || echo NO", 4000)
-        if (!exists.contains("YES")) return "文件不存在（用 root 也看不到）: $path"
-
         val staged = File(ctx.cacheDir, "local.apk")
         staged.delete()
+        if (InputController.mode(ctx) == InputController.Mode.ACCESSIBILITY) {
+            return try {
+                ApkFiles.copy(File(path).inputStream(), staged)
+                installStaged(staged, force)
+            } catch (e: Exception) { "无法读取本地 APK，请使用「选择本地 APK 文件」：${e.message}" }
+        }
+        if (!ensure()) return "root shell 不可用"
+        val exists = sh.exec("test -f ${RootShell.quote(path)} && echo YES || echo NO", 4000)
+        if (!exists.contains("YES")) return "文件不存在（用 root 也看不到）: $path"
         val cp = sh.exec("cp ${RootShell.quote(path)} ${RootShell.quote(staged.absolutePath)}", 15000)
         if (!staged.exists() || staged.length() < 1000) {
             return "复制失败: $cp"
         }
+        return installStaged(staged, force)
+    }
 
-        val info = ctx.packageManager.getPackageArchiveInfo(staged.absolutePath, 0)
-            ?: return "不是有效 APK"
+    fun installDocument(uri: Uri): String {
+        if (hasPendingInstall()) return "已有待安装更新，请先安装或丢弃它"
+        require(uri.scheme == "content") { "请选择系统文件选择器提供的 APK" }
+        val staged = File(ctx.cacheDir, "local.apk")
+        val input = ctx.contentResolver.openInputStream(uri) ?: error("无法读取所选文件")
+        ApkFiles.copy(input, staged)
+        return installStaged(staged, false)
+    }
+
+    private fun installStaged(staged: File, force: Boolean): String {
+        val info = archiveInfo(staged) ?: return "不是有效 APK"
         if (info.packageName != ctx.packageName) return "包名不匹配: ${info.packageName}"
+        if (info.applicationInfo != null) info.applicationInfo!!.sourceDir = staged.absolutePath
+        val signerProblem = requireReleaseSignature(info)
+        if (signerProblem != null) return signerProblem
         val curVer = currentVersionCode()
         val localVersion = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
         if (localVersion <= curVer && !force) {
-            return "本地 APK 版本 $localVersion 不高于当前 $curVer（可勾选「强制」重装）"
+            return "本地 APK 版本 $localVersion 不高于当前 $curVer"
         }
         return "本地 APK 版本 $localVersion（当前 $curVer）\n\n" +
-            installDetached(staged.absolutePath)
+            installValidated(staged)
+    }
+
+    private val pendingFile get() = File(ctx.filesDir, "pending-update.apk")
+    fun hasPendingInstall(): Boolean = pendingFile.isFile
+
+    private fun digest(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) { val n = input.read(buffer); if (n < 0) break; digest.update(buffer, 0, n) }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun installValidated(apk: File): String {
+        if (InputController.mode(ctx) == InputController.Mode.ROOT) {
+            check(ensure()) { "Root 不可用，未安装；不会自动切换安装方式" }
+            return installDetached(apk.absolutePath)
+        }
+        check(!hasPendingInstall()) { "已有待安装文件，请先处理" }
+        ApkFiles.copy(apk.inputStream(), pendingFile)
+        val info = checkNotNull(archiveInfo(pendingFile)) { "无法读取待安装文件" }
+        val targetVersion = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
+        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+            .putLong("pendingVersion", targetVersion).putString("pendingDigest", digest(pendingFile))
+            .putString("systemInstallLog", "已准备版本 $targetVersion，等待用户在系统安装界面确认").apply()
+        return "APK 已校验并保存。请点击「安装已验证更新」，在系统界面确认；此时尚未安装。"
+    }
+
+    /** 启动系统安装器前重新校验，持久文件不会被后续下载覆盖。 */
+    fun pendingInstallUri(): Uri {
+        check(hasPendingInstall()) { "没有待安装文件" }
+        val saved = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+        check(digest(pendingFile) == saved.getString("pendingDigest", null)) { "待安装文件摘要不一致，请丢弃后重新下载" }
+        val info = checkNotNull(archiveInfo(pendingFile)) { "不是有效 APK" }
+        check(info.packageName == ctx.packageName) { "包名不匹配" }
+        requireReleaseSignature(info)?.let { error(it) }
+        check(saved.getLong("pendingVersion", 0) > currentVersionCode()) { "待安装版本不高于当前版本" }
+        return Uri.parse("content://${ctx.packageName}.updates/pending.apk")
+    }
+
+    fun recordSystemInstall(message: String) {
+        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putString("systemInstallLog", message).apply()
+        log(message)
+    }
+
+    fun discardPending() {
+        check(!pendingFile.exists() || pendingFile.delete()) { "无法删除待安装文件" }
+        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+            .remove("pendingVersion").remove("pendingDigest").apply()
+    }
+
+    fun reconcilePending() {
+        val target = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getLong("pendingVersion", 0)
+        if (target > 0 && currentVersionCode() >= target) {
+            discardPending()
+            recordSystemInstall("当前安装版本已达到待更新版本 $target；请检查设置后手动启动任务")
+        }
     }
 
     // ------------------------------------------------------------ 安装（脱离进程）
@@ -291,45 +433,10 @@ class Updater(
         readMs: Int = 60_000,
         onPct: (Int) -> Unit = {}
     ) {
-        require(URL(rawUrl).protocol == "https") { "更新地址必须使用 HTTPS" }
-        out.delete()
-        // ★ 缓存破坏参数，必须有。
-        // GitHub 的 /releases/latest/download/ 重定向会被 CDN 按 URL 缓存。
-        // 实测：刚发完新版直接请求 latest 会拿到**上一个版本**的 APK，
-        // 结果是「下载到旧包 → 版本不更高 → 提示已是最新 → 静默永不更新」。
-        // 加上每次都不同的时间戳参数即可绕过。
-        val sep = if (rawUrl.contains("?")) "&" else "?"
-        val url = "$rawUrl${sep}_t=${System.currentTimeMillis()}"
-        var conn: HttpURLConnection? = null
-        try {
-            conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                connectTimeout = connectMs
-                readTimeout = readMs
-                instanceFollowRedirects = true
-                useCaches = false
-                setRequestProperty("User-Agent", "altair-probe")
-                setRequestProperty("Cache-Control", "no-cache, no-store, must-revalidate")
-                setRequestProperty("Pragma", "no-cache")
-            }
-            conn.connect()
-            val code = conn.responseCode
-            if (code !in 200..299) throw RuntimeException("HTTP $code")
-            val total = conn.contentLengthLong
-            conn.inputStream.use { ins ->
-                FileOutputStream(out).use { fos ->
-                    val buf = ByteArray(64 * 1024)
-                    var read = 0L
-                    while (true) {
-                        val n = ins.read(buf)
-                        if (n <= 0) break
-                        fos.write(buf, 0, n)
-                        read += n
-                        if (total > 0) onPct(((read * 100) / total).toInt().coerceIn(0, 100))
-                    }
-                }
-            }
-        } finally {
-            try { conn?.disconnect() } catch (_: Throwable) {}
-        }
+        // 在片段标识之前加缓存参数，避免缓存命中旧版 latest 重定向。
+        val address = rawUrl.substringBefore('#')
+        val sep = if (address.contains("?")) "&" else "?"
+        UpdateDownload.download("$address${sep}_t=${System.currentTimeMillis()}", out,
+            connectMs, readMs) { pct -> onPct(pct) }
     }
 }

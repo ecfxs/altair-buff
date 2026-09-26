@@ -251,15 +251,19 @@ object Picks {
         "无法确定屏幕尺寸：${e.message}"
     }
 
-    fun tap(ctx: Context, slot: String, what: String = label(slot)): Pair<Boolean, String> =
+    fun tap(ctx: Context, slot: String, what: String = label(slot)): RunResult =
         Actions.run(what) { token ->
             token.check()
             val geometry = requireGeometry(ctx, listOf(slot))
             val point = requireNotNull(get(ctx, slot)) { "${label(slot)}未标记" }
+            WalkPlan.requireNormalized(point.first, point.second, label(slot))
             val x = geometry.x(point.first)
             val y = geometry.y(point.second)
+            // 坐标必须在本轮真正用的那份几何里成立，否则这一次按压会落在错误的位置。
+            WalkPlan.validatePoint(x, y, geometry.width, geometry.height, label(slot))
             InjectShield.aroundInject(x - 24, y - 24, x + 24, y + 24) {
-                ShellCore.probe.perform(listOf("tap", "$x", "$y", "$TAP_PRESS_MS"), TAP_PRESS_MS.toLong(), token, geometry)
+                InputController.perform(ctx, TouchAction.tap(x, y, TAP_PRESS_MS.toLong()),
+                    TAP_PRESS_MS.toLong(), token, geometry)
             }
         }
 

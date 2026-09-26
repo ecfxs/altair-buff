@@ -20,8 +20,10 @@ object ShellCore {
     /** 探测逻辑（两个界面共用）。 */
     val probe: Probe by lazy { Probe(ctx(), root) { LogBus.emit(it) } }
 
-    /** 自更新（两个界面共用）。 */
-    val updater: Updater by lazy { Updater(ctx(), root) { LogBus.emit(it) } }
+    /** 自更新（两个界面共用），信任锚由提交的版本元数据提供。 */
+    val updater: Updater by lazy {
+        Updater(ctx(), root, { LogBus.emit(it) }, ctx().getString(R.string.release_signer_sha256))
+    }
 
     /** 确保 root shell 已建立，返回是否可用。 */
     fun ensureRoot(): Boolean = if (root.isAlive) true else root.open()

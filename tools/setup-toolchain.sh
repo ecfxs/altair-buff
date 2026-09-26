@@ -7,9 +7,9 @@
 #   .toolchain/gradle-8.2       Gradle 8.2
 #   .toolchain/android-sdk      Android SDK (cmdline-tools + platform-tools + platforms/build-tools)
 #   .toolchain/gradle-home      GRADLE_USER_HOME（依赖缓存也留在工作区内）
-#   .toolchain/go               Go 工具链（集控服务端 control/ 用）
-#   .toolchain/go-path          GOPATH / GOMODCACHE
-#   .toolchain/go-cache         GOCACHE（Go 构建缓存）
+#   .toolchain/go               Go 工具链（历史维护用；当前 Android 构建不需要）
+#   .toolchain/go-path          GOPATH / GOMODCACHE（历史维护用）
+#   .toolchain/go-cache         GOCACHE（历史维护用）
 #
 # 用法: bash tools/setup-toolchain.sh
 # ---------------------------------------------------------------------------
@@ -161,8 +161,8 @@ else
   SDK_OK=0
 fi
 
-# ---------------------------------------------------------------- 4.5) Go 工具链
-# 集控服务端 control/（Go）用。装在工作区内，不碰 /opt/homebrew 或 /usr/local。
+# ---------------------------------------------------------------- 4.5) 可选 Go 工具链
+# 仅用于历史/本地工具维护，不是当前 :probe Android 构建或发布的必需依赖。
 GO_DIR="$TC/go"
 if [ -x "$GO_DIR/bin/go" ]; then
   log "Go 已存在，跳过"

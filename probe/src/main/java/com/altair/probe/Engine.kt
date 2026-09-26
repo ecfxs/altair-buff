@@ -80,7 +80,21 @@ object Engine {
             LogBus.emit("请等待当前动作完全停止后再启动")
             return
         }
+        // ★ 闸门关闭时**连 worker 都不启动**：未确认松手之后，任务每跑一轮都会注入触摸，
+        // 而触摸状态是未知的。在这里拦住的代价最小，也说得出原因（比"启动了但一动不动"强）。
+        Actions.gate.blockReason()?.let {
+            state = State.ERROR
+            lastError = it
+            LogBus.emit("🛑 无法启动：$it")
+            return
+        }
         init(context)
+        InputController.readiness(context)?.let {
+            state = State.ERROR
+            lastError = it
+            LogBus.emit(it)
+            return
+        }
         val need = Picks.required(context)
         val missing = need.filter { Picks.get(context, it) == null }
         if (missing.isNotEmpty()) {
@@ -117,7 +131,7 @@ object Engine {
         failStreak = 0
         worker = Thread({ loop(context.applicationContext) }, "automation").apply { isDaemon = true; start() }
         LogBus.emit(
-            "任务启动：首次立即执行，之后按各自间隔执行" +
+            "任务启动（${InputController.mode(context).label}）：首次立即执行，之后按各自间隔执行" +
                 if (Picks.jumpReady(context)) "；走位回位后等待 1 秒跳一次"
                 else "；跳跃未标记，走位照走但不跳（可在悬浮窗补标）"
         )
@@ -162,6 +176,7 @@ object Engine {
         val pacer = ActionPacer(buffGapMs, ActionPacer.switchGapFor(buffGapMs, SEQUENCE_GAP_MIN_MS))
         try {
             while (running) {
+                InputController.readiness(c)?.let { error(it) }
                 val now = SystemClock.elapsedRealtime()
                 val config = buffConfig()
                 config.forEach { skills[it.idx].configure(if (it.enabled) slotPeriodMs(it.durSec) else 0L, now) }
@@ -179,7 +194,15 @@ object Engine {
                     Thread.sleep(200)
                     continue
                 }
-                if (ShellCore.probe.foregroundPackage() != OverlayService.targetPkgOf(c)) {
+                // 闸门可能在任务运行期间被拉上（动作层发现未确认松手）——此时立即退出循环，
+                // 不要等到下一个 ready 的动作再撞一次墙。
+                Actions.gate.blockReason()?.let { reason ->
+                    state = State.ERROR
+                    lastError = reason
+                    LogBus.emit("🛑 任务停止：$reason")
+                    return
+                }
+                if (InputController.foregroundPackage(c) != OverlayService.targetPkgOf(c)) {
                     state = State.PAUSED
                     lastResult = "等待目标游戏进入前台"
                     Thread.sleep(1500)
@@ -199,15 +222,21 @@ object Engine {
                     val result = Picks.tap(c, Picks.SKILLS[slot.idx])
                     checkRunning()
                     pacer.done(ActionPacer.BUFF, SystemClock.elapsedRealtime())
-                    lastResult = result.second
-                    LogBus.emit(result.second)
-                    if (result.first) {
+                    val resultText = result.describe(Picks.label(Picks.SKILLS[slot.idx]))
+                    lastResult = resultText
+                    LogBus.emit(resultText)
+                    if (result.isOk) {
                         schedule.success(SystemClock.elapsedRealtime())
                         buffCastCount++
                         lastError = ""      // 成功后清掉上一次的失败文案，免得状态栏一直挂着旧错误
                     } else {
                         schedule.failure(SystemClock.elapsedRealtime())
-                        lastError = result.second
+                        lastError = result.message
+                        // 危险结局（未确认松手）不走熔断计数，直接停：触摸状态未知时
+                        // 再补两次技能只会让事情更糟。闸门已经拉上，这里负责把话说清楚。
+                        check(!result.isDangerous) {
+                            "触摸状态未知（未确认松手），任务已停止：${result.message}"
+                        }
                         check(schedule.failures < 3) { "${Picks.label(Picks.SKILLS[slot.idx])}连续失败 3 次，任务停止" }
                     }
                     failStreak = skills.maxOf { it.failures }
@@ -223,10 +252,12 @@ object Engine {
                     val result = WalkFlow.strollAndJump { LogBus.emit(it) }
                     checkRunning()
                     pacer.done(ActionPacer.WALK, SystemClock.elapsedRealtime())
-                    lastWalkResult = result.second
-                    LogBus.emit(result.second)
+                    val resultText = result.describe("走位与跳跃")
+                    lastWalkResult = resultText
+                    LogBus.emit(resultText)
                     // 部分走位失败后位置未知，不能从新起点自动重放整个往返。
-                    check(result.first) { result.second }
+                    // 未确认松手同样在这里停下（而且闸门已拉上，不会再有下一次注入）。
+                    check(result.isOk) { resultText }
                     walk.success(SystemClock.elapsedRealtime())
                     walkCount++
                 }

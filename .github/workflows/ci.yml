@@ -5,9 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   android:
-    name: Android APK
+    name: Android verification
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,19 +19,76 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
 
       - uses: android-actions/setup-android@v3
 
-      # release 构建用工作区内的 keystore 签名（签名配置在 probe/build.gradle.kts 里）
-      - name: 构建 release APK
-        run: ./gradlew :probe:assembleRelease --no-daemon --stacktrace
+      - name: 检查 Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v3
+
+      - name: 回归测试与 lint
+        run: ./gradlew :probe:automationRegression :probe:lintDebug --no-daemon --stacktrace
+
+      - name: 标定服务访问边界回归
+        run: python3 -m unittest discover -s tools/calibrate -p 'test_*.py' -v
+
+      - name: 构建 debug APK
+        run: ./gradlew :probe:assembleDebug --no-daemon --stacktrace
 
       - name: 确认产物存在
-        run: |
-          ls -lh probe/build/outputs/apk/release/
-          test -f probe/build/outputs/apk/release/probe-release.apk
+        run: test -f probe/build/outputs/apk/debug/probe-debug.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: probe-release-apk
+          name: probe-debug-apk
+          path: probe/build/outputs/apk/debug/probe-debug.apk
+
+  release-signing:
+    name: Protected signed release build
+    needs: android
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: 检查 Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v3
+
+      - name: 解码受保护的正式签名文件
+        env:
+          ALTAIR_KEYSTORE_BASE64: ${{ secrets.ALTAIR_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$ALTAIR_KEYSTORE_BASE64"
+          umask 077
+          printf '%s' "$ALTAIR_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/probe-release.jks"
+          test -s "$RUNNER_TEMP/probe-release.jks"
+          echo "Keystore decoded; certificate fingerprint verification is performed on the built APK."
+          echo "ALTAIR_STORE_FILE=$RUNNER_TEMP/probe-release.jks" >> "$GITHUB_ENV"
+
+      - name: 构建并签名 release APK
+        env:
+          ALTAIR_STORE_PASSWORD: ${{ secrets.ALTAIR_STORE_PASSWORD }}
+          ALTAIR_KEY_ALIAS: ${{ secrets.ALTAIR_KEY_ALIAS }}
+          ALTAIR_KEY_PASSWORD: ${{ secrets.ALTAIR_KEY_PASSWORD }}
+          EXPECTED_SIGNER_SHA256: ${{ vars.ALTAIR_RELEASE_SIGNER_SHA256 }}
+        run: |
+          test -n "$EXPECTED_SIGNER_SHA256"
+          ./gradlew :probe:verifyReleaseSigning :probe:lintRelease :probe:assembleRelease --no-daemon --stacktrace
+          APK=probe/build/outputs/apk/release/probe-release.apk
+          ACTUAL_SIGNER="$("$ANDROID_SDK_ROOT/build-tools/33.0.1/apksigner" verify --print-certs "$APK" | sed -n 's/.*certificate SHA-256 digest: //p' | head -1 | tr '[:upper:]' '[:lower:]')"
+          EXPECTED="$(printf '%s' "$EXPECTED_SIGNER_SHA256" | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          test "$ACTUAL_SIGNER" = "$EXPECTED"
+          python3 tools/verify-artifact.py "$APK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-signed-release-apk
           path: probe/build/outputs/apk/release/probe-release.apk

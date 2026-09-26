@@ -29,7 +29,37 @@ object InjectShield {
 
     @Volatile private var handler: ((Mode, Boolean, Int, Int, Int, Int) -> Unit)? = null
 
-    fun bind(h: ((Mode, Boolean, Int, Int, Int, Int) -> Unit)?) { handler = h }
+    /**
+     * 让路能力尚未绑定时默认拒绝输入。只有明确声明当前没有需要让路的覆盖层时，
+     * 才可绑定 no-op adapter（例如离线测试或 Activity 尚未启动覆盖层的诊断）。
+     */
+    @Volatile private var allowUnbound = false
+    private val handlerMonitor = Object()
+    private const val READY_TIMEOUT_MS = 8_000L
+
+    fun bind(h: ((Mode, Boolean, Int, Int, Int, Int) -> Unit)?) = bind(h, false)
+
+    fun bind(h: ((Mode, Boolean, Int, Int, Int, Int) -> Unit)?, allowWithoutHandler: Boolean) {
+        synchronized(handlerMonitor) {
+            handler = h
+            allowUnbound = allowWithoutHandler
+            handlerMonitor.notifyAll()
+        }
+    }
+
+    private fun currentHandler(): ((Mode, Boolean, Int, Int, Int, Int) -> Unit)? {
+        if (allowUnbound) return handler
+        val deadline = System.nanoTime() + READY_TIMEOUT_MS * 1_000_000
+        synchronized(handlerMonitor) {
+            while (handler == null && !allowUnbound) {
+                val remaining = deadline - System.nanoTime()
+                check(remaining > 0) { "悬浮窗让路尚未就绪，已阻止触摸注入" }
+                val waitMs = (remaining / 1_000_000).coerceAtLeast(1)
+                handlerMonitor.wait(waitMs)
+            }
+            return handler
+        }
+    }
 
     /** 单次注入：只置灰，不动几何位置。 */
     fun <T> aroundInject(l: Int, t: Int, r: Int, b: Int, block: () -> T): T =
@@ -40,12 +70,21 @@ object InjectShield {
         gate(Mode.WALK, l, t, r, b, block)
 
     private fun <T> gate(mode: Mode, l: Int, t: Int, r: Int, b: Int, block: () -> T): T {
-        val h = handler ?: return block()
+        val h = currentHandler() ?: run {
+            check(allowUnbound) { "悬浮窗让路尚未就绪，已阻止触摸注入" }
+            return block()
+        }
         h(mode, true, l, t, r, b)                 // 让路失败 → 直接抛出，绝不注入
         val outcome = runCatching(block)
-        // 恢复失败要留证据，但不能盖掉 block 的真实异常（否则排查时看到的是无关错误）。
+        // 恢复失败不能假报成功；若动作本身也失败，则保留动作原错并附加恢复错误。
         val restore = runCatching { h(mode, false, l, t, r, b) }
-        restore.exceptionOrNull()?.let { LogBus.emit("⚠ 让路恢复失败：${it.message}") }
+        val restoreError = restore.exceptionOrNull()
+        if (restoreError != null) {
+            LogBus.emit("⚠ 让路恢复失败：${restoreError.message}")
+            val actionError = outcome.exceptionOrNull()
+            if (actionError != null) actionError.addSuppressed(restoreError)
+            else throw IllegalStateException("悬浮窗恢复失败，动作结果不可信", restoreError)
+        }
         return outcome.getOrThrow()
     }
 }

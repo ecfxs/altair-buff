@@ -6,6 +6,7 @@ build/
 */build/
 .gradle/
 local.properties
+signing.properties
 captures/
 *.apk
 !dist/*.apk

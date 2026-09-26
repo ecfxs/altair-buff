@@ -8,6 +8,8 @@
 #   bash tools/build.sh :probe:assembleDebug
 #
 # 依赖 tools/setup-toolchain.sh 装好的工作区内工具链。
+# 可通过 ALTAIR_BUILD_TASKS 选择任务，并通过 ALTAIR_VERSION_NAME/CODE 覆盖产物版本。
+# 正式发布还需 ALTAIR_STORE_FILE/ALTAIR_STORE_PASSWORD/ALTAIR_KEY_ALIAS/ALTAIR_KEY_PASSWORD。
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
@@ -28,7 +30,10 @@ if [ "${1:-}" = "clean" ]; then
   exit $?
 fi
 
-TASK="${1:-assembleDebug assembleRelease}"
+TASK="${1:-${ALTAIR_BUILD_TASKS:-assembleDebug assembleRelease}}"
+VERSION_ARGS=()
+[ -n "${ALTAIR_VERSION_NAME:-}" ] && VERSION_ARGS+=("-PaltairVersionName=$ALTAIR_VERSION_NAME")
+[ -n "${ALTAIR_VERSION_CODE:-}" ] && VERSION_ARGS+=("-PaltairVersionCode=$ALTAIR_VERSION_CODE")
 echo "=============================================="
 echo " JAVA_HOME = $JAVA_HOME"
 echo " SDK       = $ANDROID_SDK_ROOT"
@@ -36,7 +41,7 @@ echo " 任务      = $TASK"
 echo "=============================================="
 
 # shellcheck disable=SC2086
-"$TC/gradle-8.2/bin/gradle" $TASK --no-daemon --stacktrace
+"$TC/gradle-8.2/bin/gradle" $TASK "${VERSION_ARGS[@]}" --no-daemon --stacktrace
 RC=$?
 
 echo

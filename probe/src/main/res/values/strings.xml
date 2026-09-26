@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">阿尔泰挂机</string>
+    <string name="accessibility_name">阿尔泰手势辅助</string>
+    <string name="accessibility_description">按您标记的位置点击技能和操作轮盘。读取窗口所属应用以确认目标游戏在前台，不记录界面文字。需要您手动开启并启动任务，可随时从悬浮窗或通知停止。</string>
+    <string name="release_signer_sha256" translatable="false">d32bc8a79cd521effe61cf0cf7081b73ffdaf76131337c4bd0cb8008e0244167</string>
+    <string name="task_status_label">%1$s · 已用 %2$d 秒 · 完成后结果写入日志</string>
+    <string name="countdown_label">下次补技能 %1$s    下次走位 %2$s\n已执行 技能 %3$d 次 · 走位 %4$d 次</string>
 </resources>

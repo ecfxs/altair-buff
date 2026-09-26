@@ -79,11 +79,11 @@ class OverlayService : Service() {
          *
          * 这两组一共 10 颗，是面板高度的主要来源。压到 25dp（原 36 再减 30%）之后
          * 整块面板矮掉约 1/4，展开工具时也不会挡住半个游戏画面。
-         * 格宽仍有 ~70dp，点击区域靠宽度补回来。
+         * 控制台优先不遮挡游戏：单次注入按钮保持紧凑；悬浮球与底部取消操作为主要命中区。
          */
         private const val PANEL_GRID_H = 25
 
-        /** 通栏按钮（「按顺序标记所需位置」）的高度，比网格高一档以便和网格区分。 */
+        /** 通栏按钮（「按顺序标记所需位置」）的紧凑高度。 */
         private const val PANEL_WIDE_H = 30
 
         /** 悬浮球直径（dp）。48 是 Android 的最小触摸目标，再加一圈色环的视觉余量。 */
@@ -157,13 +157,29 @@ class OverlayService : Service() {
     private var ballParams: WindowManager.LayoutParams? = null
     private var pickParams: WindowManager.LayoutParams? = null
 
-    /** 走位让路期间被"挪开"的窗口 —— (视图, 参数, 原始 x/y/w/h)，走完照原样放回去。 */
-    private val vacated = mutableListOf<Pair<View, IntArray>>()
+    /** 注入期间自有触摸窗口的精确快照；恢复失败时保留它，阻止后续注入并供轮询自愈重试。 */
+    private data class GateSnapshot(
+        val view: View,
+        val params: WindowManager.LayoutParams,
+        val x: Int,
+        val y: Int,
+        val width: Int,
+        val height: Int,
+        val flags: Int
+    )
+    private val gatedWindows = mutableListOf<GateSnapshot>()
+    @Volatile private var gateRecoveryRequired = false
 
     private var panelScroll: ScrollView? = null
 
     private var statusPill: TextView? = null
     private var statusSummary: TextView? = null
+
+    /**
+     * 上一次刷新时闸门是否关闭。只在翻转时挂/摘点击监听 ——
+     * 250ms 一次的刷新里重建监听会白白产生对象，也会把按压反馈打断。
+     */
+    private var gateLocked = false
 
     /** 标题栏右侧的"已运行 HH:MM"小字（只在运行中显示）。 */
     private var runLabel: TextView? = null
@@ -231,7 +247,9 @@ class OverlayService : Service() {
                 "点悬浮球展开控制台 → 标注坐标 → 启动任务。"
         )
         Thread {
-            runCatching { ShellCore.ensureRoot() }.onFailure { LogBus.emit("Root 检查失败：${it.message}") }
+            if (InputController.mode(this@OverlayService) == InputController.Mode.ROOT) {
+                runCatching { ShellCore.ensureRoot() }.onFailure { LogBus.emit("Root 检查失败：${it.message}") }
+            } else LogBus.emit(InputController.status(this@OverlayService))
             ui.post { refreshStatus(true) }
         }.apply { isDaemon = true }.start()
         // 两条循环错开起跑：500ms 后开始跳秒（纯本地计算），1.2s 后开始查前台（要起 shell）
@@ -287,7 +305,7 @@ class OverlayService : Service() {
             if (!polling && !Actions.busy) {
                 polling = true
                 Thread {
-                    val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
+                    val fg = runCatching { InputController.foregroundPackage(this@OverlayService) }.getOrDefault("")
                     ui.post {
                         polling = false
                         if (running) {
@@ -344,7 +362,7 @@ class OverlayService : Service() {
      * requestLayout —— 在 250ms 的节奏下那会让整个窗口一直在重新测量。
      */
     private fun refreshStatus(@Suppress("UNUSED_PARAMETER") force: Boolean = true) {
-        val short = shortStatus()
+        val short = "${InputController.mode(this).label} · ${shortStatus()}"
         if (statusPill?.text != short) statusPill?.text = short
         statusPill?.setTextColor(pillColor())
 
@@ -352,6 +370,7 @@ class OverlayService : Service() {
             val s = buildStatus()
             if (statusSummary?.text != s) statusSummary?.text = s
         }
+        refreshGateSummary()
 
         // 主按钮跟着引擎状态换文案：跑着的时候必须一眼看出"再点就是停"。
         // 只在状态真的翻转时才重绘背景 —— 这段是 250ms 一次的，每次都建两个 Drawable
@@ -414,6 +433,10 @@ class OverlayService : Service() {
                     failPart
             }
 
+            // 触摸状态未知优先于一切：这时任务根本不该跑，先把"为什么停"和"怎么解除"说清楚。
+            Actions.gate.locked ->
+                "🛑 未确认松手 · 已阻止注入（点这里解除）"
+
             Engine.state == Engine.State.ERROR && Engine.lastError.isNotBlank() ->
                 "⛔ " + Engine.lastError.take(60)
 
@@ -422,8 +445,40 @@ class OverlayService : Service() {
         }
     }
 
+    /**
+     * 闸门关闭时，摘要行本身就是解除入口。
+     *
+     * ★ 面板是用户在**游戏画面里**唯一够得着的界面（主界面在后台）。未确认松手之后
+     * 如果只能回主界面才能解除，用户会以为"应用坏了、什么都点不动"。所以把解除按钮
+     * 直接长在这行状态字上，同时保证它**只**解锁、不启动任何动作。
+     */
+    private fun refreshGateSummary() {
+        val v = statusSummary ?: return
+        val locked = Actions.gate.locked
+        if (gateLocked != locked) {
+            gateLocked = locked
+            v.isClickable = locked
+            v.setOnClickListener(
+                if (locked) {
+                    View.OnClickListener {
+                        if (!Actions.confirmTouchReset()) {
+                            flashStatus("请等待当前动作完成收尾")
+                            return@OnClickListener
+                        }
+                        LogBus.emit("✅ 已解除注入阻止：确认触摸状态已复位，可以重新启动任务")
+                        flashStatus("已解除阻止")
+                        refreshStatus()
+                    }
+                } else null
+            )
+        }
+        if (locked) v.setTextColor(Ui.DANGER) else v.setTextColor(Ui.TEXT)
+    }
+
     /** 悬浮球下的短状态字。 */
     private fun shortStatus(): String = when {
+        // 闸门优先：这时"已停止"会误导用户去点启动，而启动会被挡住。
+        Actions.gate.locked -> "🛑 已阻止"
         !Engine.isRunning -> "已停止"
         Engine.state == Engine.State.ERROR -> "⛔ 熔断"
         Engine.state == Engine.State.CASTING -> "▶ 执行中"
@@ -504,17 +559,31 @@ class OverlayService : Service() {
 
     private fun dp(v: Int) = Ui.dp(this, v)
 
-    /** 屏幕可用区域，给拖动越界兜底用。 */
-    private fun screenSize(): Pair<Int, Int> {
-        val m = resources.displayMetrics
-        return m.widthPixels to m.heightPixels
+    /** 屏幕安全可用区域，给球/面板拖动越界与锚点布局使用。 */
+    private fun screenBounds(): ScreenBounds {
+        val geometry = ScreenGeometry.read(this)
+        val metrics = resources.displayMetrics
+        // Insets 本身是 API 29+ 的类型：取值必须留在版本判断块内部，lint 才能证明安全。
+        var safeLeft = 0
+        var safeTop = 0
+        var safeRight = 0
+        var safeBottom = (metrics.heightPixels - geometry.height).coerceAtLeast(0)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val insets = getSystemService(WindowManager::class.java).currentWindowMetrics.windowInsets
+                .getInsetsIgnoringVisibility(android.view.WindowInsets.Type.systemBars())
+            safeLeft = insets.left
+            safeTop = insets.top
+            safeRight = insets.right
+            safeBottom = insets.bottom
+        }
+        return ScreenBounds.from(geometry.width, geometry.height, safeLeft, safeTop, safeRight, safeBottom)
     }
 
     /** 把窗口位置夹回屏幕内 —— 否则球被拖出去就再也找不回来了。 */
     private fun clampPos(p: WindowManager.LayoutParams, w: Int, h: Int) {
-        val (sw, sh) = screenSize()
-        p.x = p.x.coerceIn(0, (sw - w).coerceAtLeast(0))
-        p.y = p.y.coerceIn(0, (sh - h).coerceAtLeast(0))
+        val bounds = screenBounds()
+        p.x = bounds.clampX(p.x, w)
+        p.y = bounds.clampY(p.y, h)
     }
 
     // ------------------------------------------------------------ 注入让路
@@ -525,6 +594,24 @@ class OverlayService : Service() {
         ball?.let { v -> ballParams?.let { v to it } },
         pickView?.let { v -> pickParams?.let { v to it } }
     )
+
+    private fun updateWindowOrThrow(view: View, params: WindowManager.LayoutParams) {
+        try {
+            wm.updateViewLayout(view, params)
+        } catch (e: Exception) {
+            throw IllegalStateException("无法安全更新悬浮窗让路状态", e)
+        }
+    }
+
+    private fun releaseEmergency() {
+        val view = emergency ?: return
+        try {
+            wm.removeView(view)
+            emergency = null
+        } catch (e: Exception) {
+            throw IllegalStateException("无法移除走位快捷停止按钮", e)
+        }
+    }
 
     /**
      * 在 UI 线程**同步**执行并等它做完。
@@ -555,13 +642,21 @@ class OverlayService : Service() {
     private fun showEmergency(l: Int, t: Int, r: Int, b: Int) {
         if (emergency != null) return
         val screen = ScreenGeometry.read(this)
+        val bounds = screenBounds()
         val w = dp(72); val h = dp(48); val margin = dp(8)
-        val candidates = listOf(margin to margin, screen.width - w - margin to margin,
-            margin to screen.height - h - margin, screen.width - w - margin to screen.height - h - margin)
+        val candidates = listOf(
+            (bounds.left + margin) to (bounds.top + margin),
+            (bounds.right - w - margin) to (bounds.top + margin),
+            (bounds.left + margin) to (bounds.bottom - h - margin),
+            (bounds.right - w - margin) to (bounds.bottom - h - margin)
+        )
         val position = candidates.firstOrNull { (x, y) ->
             x >= 0 && y >= 0 && !Rect.intersects(Rect(x, y, x + w, y + h), Rect(l, t, r, b))
         } ?: error("没有可放置停止按钮的区域，请调整标记位置")
-        val v = Ui.btn(this, "停止", Ui.Kind.DANGER) { Engine.stop("快捷停止") }
+        val v = Ui.btn(this, "停止", Ui.Kind.DANGER) { Engine.stop("快捷停止") }.apply {
+            contentDescription = "立即停止自动任务"
+            announceForAccessibility("走位期间可用此按钮停止任务")
+        }
         val p = WindowManager.LayoutParams(w, h, overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
                 or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
@@ -595,56 +690,81 @@ class OverlayService : Service() {
 
         // ---- 收尾：全部恢复 ----
         if (!on) {
-            val back = synchronized(vacated) {
-                val copy = vacated.toList()
-                vacated.clear()
-                copy
-            }
+            gateRecoveryRequired = true
             onUiSync {
+                var firstFailure: Throwable? = null
+                val windows = overlayWindows()
+                val snapshots = synchronized(gatedWindows) { gatedWindows.toList() }
+                snapshots.forEach { snapshot ->
+                    if (windows.none { it.first === snapshot.view }) return@forEach
+                    val p = snapshot.params
+                    p.x = snapshot.x
+                    p.y = snapshot.y
+                    p.width = snapshot.width
+                    p.height = snapshot.height
+                    p.flags = snapshot.flags
+                    try {
+                        updateWindowOrThrow(snapshot.view, p)
+                        synchronized(gatedWindows) { gatedWindows.removeAll { it.view === snapshot.view } }
+                    } catch (e: Exception) {
+                        if (firstFailure == null) firstFailure = e else firstFailure!!.addSuppressed(e)
+                    }
+                }
+                // 每个窗口均恢复成功后，才移除紧急停止入口并重新允许新的注入。
+                firstFailure?.let { throw it }
+                releaseEmergency()
                 injecting = false
-                emergency?.let { runCatching { wm.removeView(it) } }
-                emergency = null
-                overlayWindows().forEach { (v, p) ->
-                    p.flags = p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                    runCatching { wm.updateViewLayout(v, p) }
-                }
-                back.forEach { (v, xy) ->
-                    val p = overlayWindows().firstOrNull { it.first === v }?.second ?: return@forEach
-                    p.x = xy[0]; p.y = xy[1]; p.width = xy[2]; p.height = xy[3]
-                    runCatching { wm.updateViewLayout(v, p) }
-                }
             }
-            if (back.isNotEmpty()) LogBus.emit("🛡 让路结束：${back.size} 个窗口已放回原位")
+            val remaining = synchronized(gatedWindows) { gatedWindows.size }
+            if (remaining > 0) {
+                gateRecoveryRequired = true
+                throw IllegalStateException("仍有 $remaining 个悬浮窗未恢复，已阻止后续注入")
+            }
+            gateRecoveryRequired = false
+            if (walk) LogBus.emit("🛡 让路结束：悬浮窗已恢复原位")
             return
         }
 
         // ---- 开始 ----
         val inject = Rect(l, t, r, b)
         var moved = 0
-        onUiSync {
-            injecting = true
-            removeMarks()
-            if (walk) showEmergency(l, t, r, b)
-            overlayWindows().forEach { (v, p) ->
-                if (walk) {
+        try {
+            onUiSync {
+                check(!gateRecoveryRequired && synchronized(gatedWindows) { gatedWindows.isEmpty() }) {
+                    "上一次悬浮窗让路尚未恢复，已阻止触摸注入"
+                }
+                injecting = true
+                removeMarks()
+                if (walk) showEmergency(l, t, r, b)
+                overlayWindows().forEach { (v, p) ->
+                    val oldFlags = p.flags
+                    val oldX = p.x
+                    val oldY = p.y
+                    val oldWidth = p.width
+                    val oldHeight = p.height
                     val location = IntArray(2)
                     v.getLocationOnScreen(location)
-                    val overlaps = v.width > 0 && v.height > 0 &&
+                    val overlaps = walk && v.width > 0 && v.height > 0 &&
                         Rect.intersects(
                             Rect(location[0], location[1], location[0] + v.width, location[1] + v.height),
                             inject
                         )
+                    val snapshot = GateSnapshot(v, p, oldX, oldY, oldWidth, oldHeight, oldFlags)
+                    synchronized(gatedWindows) { gatedWindows.add(snapshot) }
                     if (overlaps) {
-                        synchronized(vacated) {
-                            vacated.add(v to intArrayOf(p.x, p.y, p.width, p.height))
-                        }
                         p.x = 0; p.y = 0; p.width = 1; p.height = 1
                         moved++
                     }
+                    p.flags = p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                    updateWindowOrThrow(v, p)
                 }
-                p.flags = p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                runCatching { wm.updateViewLayout(v, p) }
             }
+        } catch (e: Exception) {
+            // 开始让路中途失败：先锁住注入，再恢复此前已改动的窗口。
+            gateRecoveryRequired = true
+            runCatching { injectGate(mode, false, l, t, r, b) }
+                .exceptionOrNull()?.let(e::addSuppressed)
+            throw e
         }
         // INJECT 是每次点击都走的路径，不写日志 —— 否则日志会被"让路"刷屏，淹掉真正的结果。
         if (walk) {
@@ -656,17 +776,47 @@ class OverlayService : Service() {
     }
 
     /**
-     * 自愈：万一某次恢复没跑到（超时/异常），自有窗口会一直带着 `FLAG_NOT_TOUCHABLE` ——
-     * 表现为"面板看得见但点不动"。每 2 秒的轮询顺手检查一次，空闲时无条件清掉。
+     * 自愈：恢复失败会保留 gateRecoveryRequired 并拒绝后续注入。每 2 秒重试完整状态恢复，
+     * 只有快照全部恢复并通过 WindowManager 更新后，才清除锁；不通过单独清 flag 绕过几何恢复。
      */
     private fun healTouchability() {
-        if (injecting || Actions.busy) return
-        overlayWindows().forEach { (v, p) ->
-            if (p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE != 0) {
-                p.flags = p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                runCatching { wm.updateViewLayout(v, p) }
-                LogBus.emit("🛡 检测到窗口仍处于不可触摸状态，已自动恢复")
+        if (Actions.busy) return
+        val hasSnapshots = synchronized(gatedWindows) { gatedWindows.isNotEmpty() }
+        if (hasSnapshots) {
+            val healed = runCatching { injectGate(InjectShield.Mode.INJECT, false, 0, 0, 0, 0) }
+            if (healed.isSuccess) LogBus.emit("🛡 检测到未完成的让路状态，已恢复悬浮窗")
+            else LogBus.emit("⚠ 悬浮窗仍未恢复，继续阻止注入并重试：${healed.exceptionOrNull()?.message}")
+            return
+        }
+
+        val needsRecovery = gateRecoveryRequired || emergency != null || overlayWindows().any { (_, p) ->
+            p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE != 0
+        }
+        if (!needsRecovery) return
+
+        gateRecoveryRequired = true
+        val healed = runCatching {
+            onUiSync {
+                overlayWindows().forEach { (view, params) ->
+                    if (params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE != 0) {
+                        params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                        try {
+                            updateWindowOrThrow(view, params)
+                        } catch (e: Exception) {
+                            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                            throw e
+                        }
+                    }
+                }
+                releaseEmergency()
+                injecting = false
             }
+        }
+        if (healed.isSuccess) {
+            gateRecoveryRequired = false
+            LogBus.emit("🛡 检测到未完成的让路状态，已恢复悬浮窗")
+        } else {
+            LogBus.emit("⚠ 悬浮窗仍未恢复，继续阻止注入并重试：${healed.exceptionOrNull()?.message}")
         }
     }
 
@@ -683,16 +833,16 @@ class OverlayService : Service() {
     /**
      * 挂上"拖动 + 点击"监听：整条 view 可拖，位置落盘；没拖动就是点击，调 [onTap]。
      *
-     * ## 为什么点击必须在这里自己处理，而不是用 `setOnClickListener`
-     * `setOnTouchListener` 只在 `View.onTouchEvent()` **之前**被调用，而 `performClick()`
-     * 是在 `onTouchEvent` 的 ACTION_UP 分支里触发的。
+     * ## 拖动结束的轻触通过 `performClick()`
+     * `setOnTouchListener` 消费了整个手势，因此在轻触的 ACTION_UP 分支显式调用 `performClick()`，
+     * 让标准 click listener 与辅助技术点击动作共用同一入口。
      *
      * 这里 `ACTION_DOWN` 必须返回 `true`（不然后续事件收不到），可一旦返回 true，
      * 事件就被标记为已消费，`View.onTouchEvent()` 从此不再被调用 ——
      * 挂在同一个 View 上的 `setOnClickListener` **永远不会触发**。
      * 改造后第一次实测就是这个现象：拖得动，但点不开。
      *
-     * 所以点击由这里显式调用 [View.performClick] 来触发（它同时也照顾了无障碍事件）。
+     * 所以轻触由这里显式调用 [View.performClick] 来触发（它同时也照顾了无障碍事件）。
      */
     private fun attachDrag(
         v: View,
@@ -706,6 +856,8 @@ class OverlayService : Service() {
         var startX = 0
         var startY = 0
         var moved = false
+        v.contentDescription = "拖动以移动，轻触执行操作"
+        v.setOnClickListener { onTap() }
         v.setOnTouchListener { view, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -735,7 +887,7 @@ class OverlayService : Service() {
                         // 没移动 = 点击。直接用 onTap 而不是 view.performClick()：
                         // 这里已经是"消费事件"的分支，performClick 的返回值不重要，
                         // 而 onTap 少一层间接、意图更直白。
-                        onTap()
+                        view.performClick()
                     }
                     true
                 }
@@ -774,11 +926,12 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            // 默认落在右上角：游戏的血条/技能键都在下方和左侧，右上角最不容易挡住操作
-            x = prefs().getInt(KEY_BALL_X, -1)
-            y = prefs().getInt(KEY_BALL_Y, dp(24))
+            val bounds = screenBounds()
+            // 窗口 gravity 使用安全区局部坐标；默认靠近右边并避开左上角地图/游戏中心。
+            x = prefs().getInt(KEY_BALL_X, bounds.defaultRightX(dp(BALL_D), dp(12)))
+            y = prefs().getInt(KEY_BALL_Y, bounds.defaultTopY(dp(12), dp(BALL_D)))
         }
-        if (p.x < 0) p.x = (screenSize().first - dp(BALL_D) - dp(12)).coerceAtLeast(0)
+        clampPos(p, dp(BALL_D), dp(BALL_D))
 
         // 拖动之外的抬手 = 点击 → 展开面板
         attachDrag(v, p, KEY_BALL_X, KEY_BALL_Y) { showPanel("点了悬浮球") }
@@ -974,7 +1127,7 @@ class OverlayService : Service() {
                 heightDp = PANEL_GRID_H, compact = true) {
                 Engine.stop("重新选择游戏")
                 Thread {
-                    val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
+                    val fg = runCatching { InputController.foregroundPackage(this@OverlayService) }.getOrDefault("")
                     ui.post {
                         if (fg.isBlank() || fg == packageName) flashStatus("请先切到游戏")
                         else { setTargetPkgOf(this, fg); targetPkg = fg; flashStatus("已选择当前游戏") }
@@ -997,7 +1150,7 @@ class OverlayService : Service() {
         // ---------------- 窗口参数 ----------------
         val p = WindowManager.LayoutParams(
             dp(PANEL_W_FULL),
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
             overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
@@ -1008,6 +1161,7 @@ class OverlayService : Service() {
             x = prefs().getInt(KEY_PANEL_X, dp(10))
             y = prefs().getInt(KEY_PANEL_Y, dp(10))
         }
+        clampPos(p, dp(PANEL_W_FULL), dp(80))
 
         // 标题条上除了拖动，抬手还要收起面板（拖动时不触发 —— 见 attachDrag）
         attachDrag(titleBar, p, KEY_PANEL_X, KEY_PANEL_Y) { showBall("点了标题条（收起）") }
@@ -1030,6 +1184,8 @@ class OverlayService : Service() {
         // 这些是面板里的控件，跟着面板一起消失 —— 留着引用会指向已 detach 的 View
         statusPill = null
         statusSummary = null
+        // 监听器跟着 View 一起没了，状态标记也要复位，下次重建时才会重新挂上
+        gateLocked = false
         runLabel = null
         mainBtn = null
         mainBtnRunning = null      // 按钮跟着面板一起没了，下次重建必须强制重绘一次
@@ -1066,12 +1222,7 @@ class OverlayService : Service() {
     }
 
     /**
-     * 高度兜底：横屏可用高度只有 720px，展开后的面板很容易顶出屏幕。
-     * 把总高限制在屏幕 88% 以内，超出部分交给 ScrollView 内部滚动。
-     */
-    /**
-     * 高度兜底：横屏可用高度只有 720px，展开后的面板很容易顶出屏幕。
-     * 把总高限制在屏幕 88% 以内，超出部分交给 ScrollView 内部滚动。
+     * 面板不得高于 system-bars 安全显示区的 88%；超出内容在内部滚动，保留低遮挡空间。
      *
      * ## 为什么要能"缩回去"
      * 曾经这里只在超高时设一个**固定**高度，内容变矮之后从不恢复 —— 于是展开过一次「工具」，
@@ -1081,12 +1232,14 @@ class OverlayService : Service() {
     private fun capPanelHeight() {
         if (panel == null) return
         val scroll = panelScroll ?: return
-        val exact = resources.displayMetrics.heightPixels * 0.88f
+        val bounds = screenBounds()
+        val exact = (bounds.bottom - bounds.top) * 0.88f
         val titleH = (statusPill?.height ?: dp(20))
         val limit = (exact.toInt() - titleH - dp(12)).coerceAtLeast(dp(60))
         // 内容实际需要多高：ScrollView 里那个子 View 的测量高度。
         val content = (scroll.getChildAt(0) as? View)?.measuredHeight ?: return
-        val want = if (content > limit) limit else LinearLayout.LayoutParams.WRAP_CONTENT
+        val safeLimit = limit.coerceAtLeast(dp(60))
+        val want = if (content > safeLimit) safeLimit else LinearLayout.LayoutParams.WRAP_CONTENT
         val lp = scroll.layoutParams as? LinearLayout.LayoutParams ?: return
         if (lp.height == want) return
         lp.height = want
@@ -1264,10 +1417,17 @@ class OverlayService : Service() {
             flashStatus("请先停止任务并完成标记")
             return
         }
+        // 闸门关闭时连手动试走位也要挡住：那同样是在未知触摸状态上再加一次按压。
+        Actions.gate.blockReason()?.let {
+            flashStatus("已阻止注入，请先解除")
+            LogBus.emit("🛑 试走位未执行：$it")
+            return
+        }
         Thread {
             val result = WalkFlow.strollAndJump { LogBus.emit(it) }
-            LogBus.emit(result.second)
-            flashStatus(result.second)
+            val text = result.describe("试走位")
+            LogBus.emit(text)
+            ui.post { flashStatus(text) }
         }.apply { isDaemon = true; start() }
     }
 
@@ -1510,11 +1670,10 @@ class OverlayService : Service() {
                 )
             }
         }
-        val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            Notification.Builder(this, CH_ID) else @Suppress("DEPRECATION") Notification.Builder(this)
+        val b = Notification.Builder(this, CH_ID)
         return b.setContentTitle("阿尔泰挂机 · 悬浮控制台运行中")
             .setContentText("点悬浮球展开控制台")
-            .setSmallIcon(android.R.drawable.ic_menu_edit)
+            .setSmallIcon(com.altair.probe.R.drawable.ic_launcher)
             .addAction(android.R.drawable.ic_media_pause, "停止任务",
                 android.app.PendingIntent.getService(this, 1,
                     Intent(this, OverlayService::class.java).setAction("STOP"),

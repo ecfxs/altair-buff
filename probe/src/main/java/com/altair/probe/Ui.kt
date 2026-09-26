@@ -59,7 +59,8 @@ object Ui {
 
     val TEXT = Color.parseColor("#F3F3F5")
     val TEXT_DIM = Color.parseColor("#A6A6AE")
-    val TEXT_FAINT = Color.parseColor("#787880")
+    /** 说明与禁用控件文案的对比度，提升 720p 横屏小字可读性。 */
+    val TEXT_FAINT = Color.parseColor("#85858E")
 
     /** 主按钮：亮面。黑底上一块白，比任何彩色都更像"这里是主要动作"。 */
     val PRIMARY = Color.parseColor("#E9E9EC")
@@ -317,6 +318,7 @@ object Ui {
         setSelectAllOnFocus(true)
         inputType = if (numeric) InputType.TYPE_CLASS_NUMBER
         else InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+        if (hint.isBlank()) contentDescription = if (numeric) "数值输入" else "文本输入"
         setTextSize(TypedValue.COMPLEX_UNIT_SP, textSize)
         setTextColor(TEXT)
         setHintTextColor(TEXT_FAINT)
@@ -345,11 +347,14 @@ object Ui {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(ctx, 3), 0, dp(ctx, 3))
         }
-        r.addView(text(ctx, label, 13f, TEXT_DIM).apply {
+        val labelView = text(ctx, label, 13f, TEXT_DIM).apply {
+            id = View.generateViewId()
             layoutParams = LinearLayout.LayoutParams(
                 dp(ctx, labelWidthDp), LinearLayout.LayoutParams.WRAP_CONTENT
             )
-        })
+        }
+        input.labelFor = labelView.id
+        r.addView(labelView)
         flex(input)
         r.addView(input)
         if (!unit.isNullOrBlank()) r.addView(text(ctx, "  $unit", 12f, TEXT_FAINT))
@@ -362,6 +367,7 @@ object Ui {
     /** 统一样式的复选框（默认方块在深色底上几乎看不见，这里指定主色）。 */
     fun check(ctx: Context, label: String, checked: Boolean): CheckBox = CheckBox(ctx).apply {
         text = label
+        contentDescription = label
         isChecked = checked
         setTextColor(TEXT)
         textSize = 14f

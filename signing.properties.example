@@ -1,0 +1,6 @@
+# Copy to signing.properties (ignored by Git) or export equivalent ALTAIR_* variables.
+# Keep the existing release keystore and credentials to preserve in-place app updates.
+storeFile=keystore/probe.jks
+storePassword=replace-with-protected-secret
+keyAlias=replace-with-existing-alias
+keyPassword=replace-with-protected-secret

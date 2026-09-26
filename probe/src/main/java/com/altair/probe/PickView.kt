@@ -8,6 +8,7 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.view.MotionEvent
 import android.view.View
+import android.view.accessibility.AccessibilityNodeInfo
 
 /**
  * 坐标标注层
@@ -91,9 +92,12 @@ class PickView(ctx: Context, private val hint: String = "") : View(ctx) {
 
     private val cancelRect = RectF()
     private var cancelPressed = false
+    private var cancelClickPending = false
 
     init {
         isClickable = true
+        contentDescription = "${hint.ifBlank { "点击游戏中的目标位置进行标注" }}；辅助功能点击此层可取消标注"
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
         setBackgroundColor(Color.TRANSPARENT)
     }
 
@@ -123,8 +127,9 @@ class PickView(ctx: Context, private val hint: String = "") : View(ctx) {
             MotionEvent.ACTION_UP -> {
                 if (cancelPressed) {
                     cancelPressed = false
+                    cancelClickPending = true
                     invalidate()
-                    onFinish?.invoke()      // 点的是「取消」→ 退出采集，不记录坐标
+                    performClick()
                     return true
                 }
                 // 一个槽位只采一个点：已经采到了就忽略后续点击，等 [OverlayService] 摘掉这一层。
@@ -135,10 +140,36 @@ class PickView(ctx: Context, private val hint: String = "") : View(ctx) {
                 points.add(nx to ny)
                 onPick?.invoke(points.size, nx, ny)
                 invalidate()
+                performClick()
                 return true
             }
         }
         return super.onTouchEvent(e)
+    }
+
+    override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
+        super.onInitializeAccessibilityNodeInfo(info)
+        info.contentDescription = "${hint.ifBlank { "点击游戏中的目标位置进行标注" }}；点击此节点取消标注"
+        info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_CLICK)
+    }
+
+    override fun performAccessibilityAction(action: Int, arguments: android.os.Bundle?): Boolean {
+        if (action == AccessibilityNodeInfo.ACTION_CLICK) {
+            // The full-screen canvas has no point picker node; its screen-reader click safely cancels.
+            cancelClickPending = true
+            performClick()
+            return true
+        }
+        return super.performAccessibilityAction(action, arguments)
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        if (cancelClickPending) {
+            cancelClickPending = false
+            onFinish?.invoke()
+        }
+        return true
     }
 
     override fun onDraw(canvas: Canvas) {

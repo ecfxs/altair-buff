@@ -21,6 +21,7 @@ public final class TouchAgent {
 
     public static void main(String[] args) {
         AtomicBoolean cancelled = new AtomicBoolean();
+        AtomicBoolean touchActive = new AtomicBoolean();
         int code = 0;
         try {
             BufferedReader commands = new BufferedReader(new InputStreamReader(System.in));
@@ -39,6 +40,8 @@ public final class TouchAgent {
                 public long now() { return SystemClock.uptimeMillis(); }
                 public void sleep(long ms) throws InterruptedException { Thread.sleep(ms); }
             }, (action, down, time, x, y) -> {
+                // DOWN 的失败回执不能证明事件从未送达，保守保留未知状态。
+                if (action == MotionEvent.ACTION_DOWN) touchActive.set(true);
                 MotionEvent event = MotionEvent.obtain(down, time, action, x, y, 0);
                 event.setSource(InputDevice.SOURCE_TOUCHSCREEN);
                 try {
@@ -50,6 +53,7 @@ public final class TouchAgent {
                             "系统拒绝触摸注入 " + actionName(action) + "(" + x + "," + y + ")");
                     }
                     if (action == MotionEvent.ACTION_UP) {
+                        touchActive.set(false);
                         System.out.println("TOUCH_RELEASE " + x + "," + y + " held=" + (time - down) + "ms");
                     }
                 } finally { event.recycle(); }
@@ -76,6 +80,12 @@ public final class TouchAgent {
             code = 1;
             Throwable cause = e.getCause() == null ? e : e.getCause();
             System.out.println("TOUCH_ERROR " + cause.getClass().getSimpleName() + ": " + cause.getMessage());
+        }
+        if (touchActive.get()) {
+            System.out.println("TOUCH_RELEASE_FAILED 输入进程退出时未确认松手");
+            code = 1;
+        } else {
+            System.out.println("TOUCH_IDLE");
         }
         System.out.flush();
         System.exit(code);

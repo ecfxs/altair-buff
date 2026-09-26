@@ -75,18 +75,54 @@ public final class GestureSequence {
         }
     }
 
+    /** UP 未被系统确认时的安全失败；即使发生在可选跳跃，也不能当作普通跳跃失败吞掉。 */
+    public static final class ReleaseFailedException extends Exception {
+        public ReleaseFailedException(String message, Throwable cause) { super(message, cause); }
+    }
+
     /**
-     * 松手专用：只重试，绝不抛。
+     * 松手专用：取消期间仍做有限重试，但不能让收尾异常覆盖动作本身的失败。
      *
-     * 松手发生在 `finally` 里，那里再抛异常会**盖掉真正的失败原因** ——
-     * 排查时看到的就变成 UP 的错误，而真正的问题在 DOWN 或 MOVE 上。
+     * @return 最后一次失败；null 表示系统确认收到了 UP。
      */
-    private void quietSend(int action, long down, long time, int x, int y) {
+    private Exception release(int action, long down, long time, int x, int y) {
+        Exception last = null;
+        boolean interrupted = Thread.interrupted();
         try {
-            send(action, down, time, x, y);
-        } catch (Exception ignored) {
-            // 已经在收尾了；失败也没什么能做的，且不能覆盖真实原因。
+            for (int attempt = 1; attempt <= SEND_ATTEMPTS; attempt++) {
+                try {
+                    input.send(action, down, time, x, y);
+                    return null;
+                } catch (Exception e) {
+                    last = e;
+                    if (attempt < SEND_ATTEMPTS) {
+                        try {
+                            clock.sleep(SEND_RETRY_MS);
+                        } catch (InterruptedException e2) {
+                            // UP 比取消优先；继续尝试，并在离开清理代码时恢复中断标记。
+                            interrupted = true;
+                            last.addSuppressed(e2);
+                        }
+                    }
+                }
+            }
+            return last;
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
         }
+    }
+
+    private void ensureReleased(long down, long time, int x, int y, Throwable primary)
+            throws ReleaseFailedException {
+        Exception cause = release(UP, down, time, x, y);
+        if (cause == null) return;
+        String detail = cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage();
+        ReleaseFailedException failure = new ReleaseFailedException(
+                "系统未确认触摸松手 UP(" + x + "," + y + ")：" + detail, cause);
+        try { notice.accept("TOUCH_RELEASE_FAILED " + x + "," + y + ": " + detail); }
+        catch (RuntimeException ignored) { }
+        if (primary != null) primary.addSuppressed(failure);
+        else throw failure;
     }
 
     public void pause(long ms) throws InterruptedException {
@@ -111,6 +147,7 @@ public final class GestureSequence {
 
         // ★ DOWN 在 try 之外：它自己失败就没有"已按下"这回事，也就不该有 UP。
         send(DOWN, down, down, cx, cy);
+        Exception primary = null;
         try {
             check();
             send(MOVE, down, clock.now(), x, y);
@@ -121,10 +158,13 @@ public final class GestureSequence {
                 check();
                 if (clock.now() < end) send(MOVE, down, clock.now(), x, y);
             }
+        } catch (Exception e) {
+            primary = e;
+            throw e;
         } finally {
-            // 无论成功、被取消还是中途注入失败，只要按下过就必须松手 ——
-            // 否则游戏里会留下一根永远按着的手指。
-            quietSend(UP, down, clock.now(), x, y);
+            // 无论成功、被取消还是中途注入失败，只要按下过就必须松手。
+            // 释放失败时不得假报成功；若动作本身已失败，则把释放失败作为 suppressed 保留。
+            ensureReleased(down, clock.now(), x, y, primary);
         }
         check();
     }
@@ -145,7 +185,10 @@ public final class GestureSequence {
             hold(jx, jy, jx, jy, jumpMs);
         } catch (InterruptedException e) {
             throw e;                       // 用户取消：照旧向上传，别吞掉
+        } catch (ReleaseFailedException e) {
+            throw e;                       // 已按下但未确认松手，不属于可忽略的跳跃失败
         } catch (Exception e) {
+            if (ActionFailure.carriesReleaseFailure(e)) throw e;
             notice.accept("TOUCH_JUMP_FAILED " + e.getClass().getSimpleName() + ": " + e.getMessage());
         }
     }

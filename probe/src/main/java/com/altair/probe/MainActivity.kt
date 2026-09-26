@@ -6,6 +6,9 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
+import android.text.Editable
+import android.text.TextWatcher
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -74,9 +77,25 @@ class MainActivity : Activity() {
     private lateinit var jump: EditText
     private lateinit var target: EditText
 
-    /** 走位总开关 + 它下方的参数行（关闭时这些行变灰）。 */
+    /** 走位总开关与参数行。关闭时参数不可编辑，保存时不验证无关字段。 */
     private lateinit var walkToggle: CheckBox
-    private val walkInputs = mutableListOf<View>()
+    private val walkInputs = mutableListOf<EditText>()
+    private val walkRows = mutableListOf<View>()
+    private var walkToggleDirty = false
+    private var savedWalkAtDraft = true
+    private var syncingWalkToggle = false
+    private var walkEditBase = true
+    private var targetDraftDirty = false
+    private var targetEditBase = ""
+    private var savedTargetAtDraft = ""
+    private var syncingTarget = false
+    private lateinit var settingsNotice: TextView
+    private lateinit var inputStatus: TextView
+    private lateinit var installButton: Button
+    private lateinit var discardInstallButton: Button
+    private var resumed = false
+    private val pickApkRequest = 70
+    private val installRequest = 71
 
     // ---- 更多页 ----
     private lateinit var logs: TextView
@@ -132,6 +151,12 @@ class MainActivity : Activity() {
     }
 
     override fun onStart() { super.onStart(); ui.post(tick) }
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        runCatching { updater.reconcilePending() }.onFailure { LogBus.emit("更新记录检查失败：${it.message}") }
+    }
+    override fun onPause() { resumed = false; super.onPause() }
 
     override fun onStop() { ui.removeCallbacks(tick); super.onStop() }
 
@@ -277,6 +302,8 @@ class MainActivity : Activity() {
         val guide = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
         readiness = Ui.text(this@MainActivity, "", 13f, Ui.TEXT_DIM).apply {
             setLineSpacing(dp(6).toFloat(), 1f)
+            // 闸门关闭时这块文字就是解除入口；平时点击无效果（见 clearInjectBlock）。
+            setOnClickListener { clearInjectBlock() }
         }
         guide.addView(readiness)
         guide.addView(View(this@MainActivity).apply {
@@ -294,13 +321,34 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        bar.addView(Ui.text(this, "改完点右侧保存生效", 12f, Ui.TEXT_FAINT).apply {
+        settingsNotice = Ui.text(this, "改完点右侧保存生效", 12f, Ui.TEXT_FAINT).apply {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        })
+        }
+        bar.addView(settingsNotice)
         bar.addView(Ui.btn(this, "保存设置", Ui.Kind.PRIMARY, 14f, 40) { saveSettings() }.apply {
             layoutParams = LinearLayout.LayoutParams(dp(104), dp(40))
         })
         return page(bar) {
+            val inputBody = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+            inputStatus = Ui.text(this@MainActivity, InputController.status(this@MainActivity), 13f)
+            inputBody.addView(inputStatus)
+            inputBody.addView(Ui.btnRow(this@MainActivity,
+                Triple("Root", Ui.Kind.SECONDARY) { changeInputMode(InputController.Mode.ROOT) },
+                Triple("无障碍", Ui.Kind.SECONDARY) { changeInputMode(InputController.Mode.ACCESSIBILITY) }
+            ))
+            inputBody.addView(Ui.btnFull(this@MainActivity, "打开无障碍设置", Ui.Kind.SECONDARY) {
+                Engine.stop("打开无障碍设置")
+                runCatching { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                    .onFailure { toast("无法打开系统设置，请手动开启阿尔泰手势辅助") }
+            })
+            inputBody.addView(Ui.doc(this@MainActivity,
+                "操作方式点选后立即保存。切换前先停止任务；不会在失败后自动换通道。" +
+                    "无障碍需手动开启「阿尔泰手势辅助」，仅读取窗口所属应用并按标点操作。" +
+                    "若系统提示受限设置，请在应用信息中按系统提示允许后再开启。"))
+            addView(Ui.card(this@MainActivity, "操作方式", inputBody))
+            skillRows.clear()
+            walkInputs.clear()
+            walkRows.clear()
             val skillBody = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
             skillBody.addView(Ui.doc(this@MainActivity,
                 "勾选需要自动补的技能；秒数是该技能的重置周期。未勾选的技能不必标记。"))
@@ -328,7 +376,9 @@ class MainActivity : Activity() {
             addView(Ui.card(this@MainActivity, "技能间隔", skillBody))
 
             val walkBody = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-            walkToggle = Ui.check(this@MainActivity, "启用原地走位", WalkFlow.enabled)
+            walkEditBase = WalkFlow.enabled
+            savedWalkAtDraft = walkEditBase
+            walkToggle = Ui.check(this@MainActivity, "启用原地走位", walkEditBase)
             walkBody.addView(walkToggle)
             walkBody.addView(Ui.doc(this@MainActivity,
                 "开启后按下面的间隔自动走；关闭后完全不碰摇杆，只补技能，轮盘中心也不必标记。"))
@@ -336,22 +386,37 @@ class MainActivity : Activity() {
             leg = number(WalkFlow.legMs)
             push = number(WalkFlow.pushPct.toLong())
             jump = number(WalkFlow.jumpPressMs.toLong())
-            listOf(
+            val rows = listOf(
                 Ui.labeledRow(this@MainActivity, "执行间隔", interval, "分钟"),
                 Ui.labeledRow(this@MainActivity, "单程时长 D", leg, "毫秒"),
                 Ui.labeledRow(this@MainActivity, "推杆幅度", push, "% 屏宽"),
                 Ui.labeledRow(this@MainActivity, "跳跃按压", jump, "毫秒")
-            ).forEach { row -> walkBody.addView(row); walkInputs.add(row) }
+            )
+            rows.forEach { walkBody.addView(it); walkRows.add(it) }
+            walkInputs.addAll(listOf(interval, leg, push, jump))
             walkBody.addView(Ui.doc(this@MainActivity,
                 "回位后固定等待 1 秒再跳。推杆幅度越大走得越远，走过头就调小。"))
             // 开关只影响观感与保存结果；真正的判定在 WalkFlow/Engine —— 关掉后引擎直接把
             // 走位周期配成 0，根本不排期。
-            walkToggle.setOnCheckedChangeListener { _, on -> applyWalkLook(on) }
+            walkToggle.setOnCheckedChangeListener { _, on ->
+                if (!syncingWalkToggle) walkToggleDirty = true
+                applyWalkLook(on)
+            }
             applyWalkLook(WalkFlow.enabled)
             addView(Ui.card(this@MainActivity, "原地走位", walkBody))
 
             val targetBody = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-            target = Ui.input(this@MainActivity, OverlayService.targetPkgOf(context), hint = "游戏包名")
+            targetEditBase = OverlayService.targetPkgOf(context)
+            savedTargetAtDraft = targetEditBase
+            target = Ui.input(this@MainActivity, targetEditBase, hint = "游戏包名")
+            target.addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                    if (!syncingTarget) targetDraftDirty = true
+                }
+                override fun afterTextChanged(s: Editable?) = Unit
+            })
+            target.contentDescription = "目标游戏包名"
             targetBody.addView(target)
             targetBody.addView(View(this@MainActivity).apply {
                 layoutParams = LinearLayout.LayoutParams(-1, dp(8))
@@ -367,9 +432,62 @@ class MainActivity : Activity() {
 
     private fun number(value: Long) = Ui.input(this, value.toString(), numeric = true)
 
-    /** 走位关闭时把参数行压暗：让"这些设置现在不起作用"一眼可见。 */
+    private fun changeInputMode(mode: InputController.Mode) {
+        if (InputController.mode(this) == mode) return
+        Engine.stop("切换操作方式")
+        if (!InputController.select(this, mode)) toast("请等待动作收尾、结束标注或更新，再选择操作方式")
+        refresh()
+    }
+
+    /** 走位关闭时禁用参数输入，仍保留其值供重新开启时继续编辑。 */
     private fun applyWalkLook(on: Boolean) {
-        walkInputs.forEach { it.alpha = if (on) 1f else 0.35f }
+        walkInputs.forEach { input ->
+            input.isEnabled = on
+            input.isFocusable = on
+            input.isFocusableInTouchMode = on
+            input.alpha = if (on) 1f else 0.45f
+        }
+        walkRows.forEach { it.alpha = if (on) 1f else 0.45f }
+    }
+
+    private fun syncExternalSettings() {
+        var notice: String? = null
+        if (this::walkToggle.isInitialized) {
+            val current = WalkFlow.enabled
+            if (ActionGatePolicy.hasConflict(savedWalkAtDraft, current, walkToggle.isChecked)) {
+                notice = "悬浮窗已修改走位开关；保存前请确认本页选择"
+            }
+            if (!walkToggleDirty && walkToggle.isChecked != current) {
+                walkEditBase = current
+                savedWalkAtDraft = current
+                syncingWalkToggle = true
+                walkToggle.isChecked = current
+                syncingWalkToggle = false
+                applyWalkLook(current)
+            }
+        }
+        if (this::target.isInitialized) {
+            val current = OverlayService.targetPkgOf(this)
+            if (!targetDraftDirty && target.text.toString() == savedTargetAtDraft && current != savedTargetAtDraft) {
+                targetEditBase = current
+                savedTargetAtDraft = current
+            }
+            if (targetDraftDirty && current != savedTargetAtDraft) {
+                // 两类冲突都能同时成立：保留已算出的提示，不让目标分支把它覆盖掉。
+                notice = notice ?: "悬浮窗已更换目标游戏；保存前请确认本页包名"
+            }
+            if (!targetDraftDirty && target.text.toString() != current) {
+                targetEditBase = current
+                savedTargetAtDraft = current
+                syncingTarget = true
+                target.setText(current)
+                target.setSelection(target.text.length)
+                syncingTarget = false
+            }
+        }
+        val text = notice ?: "改完点右侧保存生效"
+        if (settingsNotice.text != text) settingsNotice.text = text
+        settingsNotice.setTextColor(if (notice != null) Ui.WARN else Ui.TEXT_FAINT)
     }
 
     private fun validated(edit: EditText, min: Long, max: Long): Long {
@@ -388,17 +506,25 @@ class MainActivity : Activity() {
             val walkOn = walkToggle.isChecked
             val seconds = skillRows.map { (_, edit) -> validated(edit, 1, 86_400).toInt() }
             val gapValue = validated(buffGap, Engine.MIN_BUFF_GAP_MS, Engine.MAX_BUFF_GAP_MS)
-            val intervalValue = validated(interval, 1, 1440)
-            val legValue = validated(leg, 100, 10_000)
-            val pushValue = validated(push, 1, 30).toInt()
-            val jumpValue = validated(jump, 30, 600).toInt()
+            // 走位关闭时保留现有走位参数，不校验被禁用输入框中的草稿。
+            val intervalValue = if (walkOn) validated(interval, 1, 1440) else WalkFlow.intervalMin
+            val legValue = if (walkOn) validated(leg, 100, 10_000) else WalkFlow.legMs
+            val pushValue = if (walkOn) validated(push, 1, 30).toInt() else WalkFlow.pushPct
+            val jumpValue = if (walkOn) validated(jump, 30, 600).toInt() else WalkFlow.jumpPressMs
             val pkg = target.text.toString().trim()
+            val currentSavedTarget = OverlayService.targetPkgOf(this)
+            if (currentSavedTarget != savedTargetAtDraft && pkg == savedTargetAtDraft) {
+                throw IllegalArgumentException("悬浮窗已更换目标游戏；请确认本页包名后再保存")
+            }
             require(Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+").matches(pkg)) {
                 "请输入有效游戏包名"
             }
             // 走位开关影响"必需标记"，所以它变了也要停任务重新校验。
+            if (ActionGatePolicy.hasConflict(savedWalkAtDraft, WalkFlow.enabled, walkToggle.isChecked)) {
+                throw IllegalArgumentException("悬浮窗已修改走位开关；请确认本页选择后再保存")
+            }
             if (walkOn != WalkFlow.enabled) Engine.stop("走位开关已更改")
-            if (pkg != OverlayService.targetPkgOf(this)) Engine.stop("目标游戏已更改")
+            if (pkg != currentSavedTarget) Engine.stop("目标游戏已更改")
             getSharedPreferences("buff", MODE_PRIVATE).edit().apply {
                 skillRows.forEachIndexed { i, (check, _) ->
                     putBoolean("enabled$i", check.isChecked); putInt("durSec$i", seconds[i])
@@ -411,6 +537,18 @@ class MainActivity : Activity() {
             WalkFlow.jumpPressMs = jumpValue
             Engine.buffGapMs = gapValue
             OverlayService.setTargetPkgOf(this, pkg)
+            walkToggleDirty = false
+            targetDraftDirty = false
+            walkEditBase = walkOn
+            savedWalkAtDraft = walkOn
+            targetEditBase = pkg
+            savedTargetAtDraft = pkg
+            settingsNotice.text = "改完点右侧保存生效"
+            settingsNotice.setTextColor(Ui.TEXT_FAINT)
+            syncingTarget = true
+            target.setText(pkg)
+            target.setSelection(target.text.length)
+            syncingTarget = false
             LogBus.emitStamped(
                 if (walkOn)
                     "设置已保存：技能按填写秒数执行、之间等 ${gapValue}ms；" +
@@ -428,13 +566,22 @@ class MainActivity : Activity() {
     /** 用当前前台应用填目标包名 —— 比让用户手抄包名可靠得多。 */
     private fun calibrateTarget() {
         background("标定目标游戏") {
-            val fg = runCatching { ShellCore.probe.foregroundPackage() }.getOrDefault("")
+            val fg = runCatching { InputController.foregroundPackage(this) }.getOrDefault("")
             when {
-                fg.isBlank() -> "读取前台应用失败：请确认 Root 可用，或手动填写包名"
+                fg.isBlank() -> "读取前台应用失败：请确认所选输入方式已就绪，或手动填写包名"
                 fg == packageName -> "当前前台是本应用，请先切到游戏再点「用当前前台应用标定」"
                 else -> {
                     OverlayService.setTargetPkgOf(this, fg)
-                    ui.post { target.setText(fg); refresh() }
+                    ui.post {
+                        syncingTarget = true
+                        target.setText(fg)
+                        target.setSelection(target.text.length)
+                        syncingTarget = false
+                        targetDraftDirty = false
+                        targetEditBase = fg
+                        savedTargetAtDraft = fg
+                        refresh()
+                    }
                     "目标游戏已标定为 $fg"
                 }
             }
@@ -460,12 +607,16 @@ class MainActivity : Activity() {
         windowBody.addView(Ui.btnRow(this@MainActivity,
             Triple("查看标记", Ui.Kind.SECONDARY) { LogBus.emit(Picks.describe(this@MainActivity)) },
             Triple("清空标记", Ui.Kind.GHOST) { confirmClearPicks() },
-            Triple("检查 Root", Ui.Kind.SECONDARY) {
-                background("检查 Root") { ShellCore.probe.requestRoot() }
+            Triple("检查输入", Ui.Kind.SECONDARY) {
+                background("检查输入") {
+                    if (InputController.mode(this@MainActivity) == InputController.Mode.ROOT)
+                        ShellCore.probe.requestRoot()
+                    else InputController.readiness(this@MainActivity) ?: InputController.status(this@MainActivity)
+                }
             }
         ))
         windowBody.addView(Ui.doc(this@MainActivity,
-            "标记位置只能在游戏画面的悬浮窗里完成。Root 用于注入触摸与免确认安装。"))
+            "标记位置只能在游戏画面的悬浮窗里完成。可在设置中选择 Root 或无障碍输入。"))
         markCount = Ui.text(this@MainActivity, annotationCount(), 12f, Ui.TEXT_FAINT)
         addView(Ui.card(this@MainActivity, "悬浮窗与标记", windowBody, markCount))
 
@@ -483,13 +634,32 @@ class MainActivity : Activity() {
             val value = sourceUrl.text.toString().trim()
             updater.saveUrl(value)
             background("指定来源更新") {
-                if (value.startsWith("https://")) updater.updateFromUrl(value, false)
-                else updater.installLocal(value, false)
+                when {
+                    value.startsWith("https://") -> updater.updateFromUrl(value, false)
+                    value.startsWith("http://") -> "安全策略禁止 HTTP 更新源，请使用 HTTPS 或本地 APK"
+                    else -> updater.installLocal(value, false)
+                }
             }
         })
         updateBody.addView(Ui.doc(this@MainActivity,
-            "更新只在点击时发生，不会自动下载。安装时应用会被系统杀掉，约 5 秒后自动重启；" +
-                "重启后点「更新日志」确认结果。"))
+            "更新只在点击时发生。Root 模式使用后台安装并尝试重启；无障碍模式下载校验后，" +
+                "点击下方安装按钮，在系统界面确认。安装后查看实际版本与更新日志，任务需重新启动。"))
+        updateBody.addView(Ui.btnFull(this@MainActivity, "选择本地 APK 文件", Ui.Kind.SECONDARY) {
+            if (Engine.isRunning || Engine.isStopping || Actions.busy || Busy.isBusy) {
+                toast("请先停止任务并等待当前操作完成")
+            } else runCatching {
+                startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "application/vnd.android.package-archive"
+                }, pickApkRequest)
+            }.onFailure { toast("无法打开系统文件选择器：${it.message}") }
+        })
+        installButton = Ui.btnFull(this@MainActivity, "安装已验证更新", Ui.Kind.PRIMARY) { installPrepared() }
+        discardInstallButton = Ui.btnFull(this@MainActivity, "丢弃待安装文件", Ui.Kind.GHOST) {
+            background("丢弃待安装文件") { updater.discardPending(); "已丢弃待安装文件" }
+        }
+        updateBody.addView(installButton)
+        updateBody.addView(discardInstallButton)
         addView(Ui.card(this@MainActivity, "软件更新", updateBody,
             Ui.text(this@MainActivity, "v${updater.currentVersionName()}", 12f, Ui.TEXT_FAINT)))
 
@@ -552,13 +722,17 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------ 定时刷新
 
     private fun refresh() {
+        inputStatus.text = InputController.status(this)
+        installButton.visibility = if (updater.hasPendingInstall()) View.VISIBLE else View.GONE
+        discardInstallButton.visibility = installButton.visibility
+        syncExternalSettings()
         val busy = Busy.current
         val armed = OverlayService.isTargetForeground(this)
 
         if (busy != null) {
             statusDot.setTextColor(Ui.WARN)
             statusText.text = "⏳ $busy"
-            metrics.text = "已用 ${Busy.elapsedMs() / 1000} 秒 · 完成后结果写入日志"
+            metrics.text = getString(R.string.task_status_label, busy, Busy.elapsedMs() / 1000)
         } else {
             statusDot.setTextColor(Ui.statusColor(Engine.isRunning, Engine.state == Engine.State.ERROR, armed))
             statusText.text = Engine.stateText()
@@ -578,8 +752,13 @@ class MainActivity : Activity() {
         )
         val now = SystemClock.elapsedRealtime()
         val skillTime = if (Engine.nextBuffDueAt <= 0) "—" else Ui.mmss(Engine.nextBuffDueAt - now, Engine.isRunning)
-        countdown.text = "下次补技能  $skillTime      下次走位  ${Engine.countdown(Engine.nextWalkDueAt)}\n" +
-            "已执行  技能 ${Engine.buffCastCount} 次 · 走位 ${Engine.walkCount} 次"
+        countdown.text = getString(
+            R.string.countdown_label,
+            skillTime,
+            Engine.countdown(Engine.nextWalkDueAt),
+            Engine.buffCastCount,
+            Engine.walkCount
+        )
         readiness.text = checklistText()
         markCount.text = annotationCount()
         startButton.text = when {
@@ -615,12 +794,88 @@ class MainActivity : Activity() {
             }
         }
         val problem = Picks.geometryProblem(this, Picks.required(this))
-        return (if (problem == null) lines else listOf("⚠ $problem") + lines).joinToString("\n")
+        // 闸门关闭要排在最前面：这时清单全是 ✓ 也没用 —— 启动会被挡住，
+        // 而且原因不在"标注"上，混在清单里会被当成又一个待标记项。
+        val block = Actions.gate.blockReason()
+        val head = when {
+            block != null -> listOf(
+                "🛑 已阻止自动注入（未确认松手）",
+                "　 上一次动作没能确认系统收到松手，触摸状态未知。",
+                "　 请在游戏里确认角色不再移动/按键未被按住，然后点这里解除阻止。"
+            )
+            problem != null -> listOf("⚠ $problem")
+            else -> emptyList()
+        }
+        return (listOf(InputController.status(this)) +
+            listOfNotNull(InputController.readiness(this)) + head + lines).joinToString("\n")
+    }
+
+    /**
+     * 解除注入阻止。
+     *
+     * 只在闸门关闭时有效 —— 这是**唯一**的清锁入口，必须由人确认"设备上的触摸已经复位"，
+     * 而不是由程序猜。所以没有"自动重试若干次后自动解锁"这种设计。
+     */
+    private fun clearInjectBlock() {
+        if (!Actions.gate.locked) return
+        if (!Actions.confirmTouchReset()) {
+            toast("请等待当前动作完成收尾后再确认")
+            return
+        }
+        LogBus.emit("✅ 已解除注入阻止：确认触摸状态已复位，可以重新启动任务")
+        toast("已解除阻止，可以重新启动任务")
+        refresh()
     }
 
     private fun annotationCount(): String {
         val list = Picks.checklist(this)
         return "${list.count { Picks.get(this, it.first) != null }}/${list.size} 项"
+    }
+
+    private fun installPrepared() {
+        if (Engine.isRunning || Engine.isStopping || Actions.busy || Busy.isBusy || OverlayService.picking) {
+            toast("请先停止任务并完成当前操作")
+            return
+        }
+        if (!packageManager.canRequestPackageInstalls()) {
+            runCatching { startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                android.net.Uri.parse("package:$packageName"))) }
+                .onFailure { toast("请在系统设置中允许本应用安装未知应用") }
+            toast("允许后返回，再点击「安装已验证更新」")
+            return
+        }
+        var preparedUri: android.net.Uri? = null
+        background("校验待安装更新", onComplete = {
+            preparedUri?.let { uri ->
+                if (resumed && !Engine.isRunning && !Engine.isStopping && !Actions.busy && !Busy.isBusy && !OverlayService.picking) {
+                    runCatching {
+                        startActivityForResult(Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+                            setDataAndType(uri, "application/vnd.android.package-archive")
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            clipData = ClipData.newRawUri("APK", uri)
+                            putExtra(Intent.EXTRA_RETURN_RESULT, true)
+                        }, installRequest)
+                        updater.recordSystemInstall("已打开系统安装界面，等待用户确认；尚未确认安装成功")
+                    }.onFailure { updater.recordSystemInstall("无法打开系统安装界面：${it.message}") }
+                } else LogBus.emit("更新文件已就绪，请返回主界面并停止任务后继续安装")
+            }
+        }) {
+            preparedUri = updater.pendingInstallUri()
+            "待安装 APK 复核通过"
+        }
+    }
+
+    @Deprecated("Android Activity result API")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == pickApkRequest && resultCode == RESULT_OK) {
+            val uri = data?.data ?: return
+            background("读取本地 APK") { updater.installDocument(uri) }
+        } else if (requestCode == installRequest) {
+            updater.recordSystemInstall(if (resultCode == RESULT_OK)
+                "系统安装器返回完成，请核对实际版本" else "系统安装未确认完成，可能已取消或失败，可重试")
+            runCatching { updater.reconcilePending() }.onFailure { LogBus.emit("更新结果检查失败：${it.message}") }
+        }
     }
 
     // ------------------------------------------------------------ 动作
@@ -648,8 +903,8 @@ class MainActivity : Activity() {
      * 三段式反馈：底部操作条立刻变成"⏳ 名称 + 已用秒数"（[Busy]），完成后把**带时间戳**的
      * 结果写进日志页。改造前这里只有一句 Toast，用户根本不知道跑完没有。
      */
-    private fun background(name: String, work: () -> String) {
-        if (Engine.isRunning || Engine.isStopping || Actions.busy || Busy.isBusy) {
+    private fun background(name: String, onComplete: (() -> Unit)? = null, work: () -> String) {
+        if (Engine.isRunning || Engine.isStopping || Actions.busy || Busy.isBusy || OverlayService.picking) {
             toast("请先停止任务，并等待当前操作完成")
             return
         }
@@ -663,7 +918,7 @@ class MainActivity : Activity() {
                 Busy.end()
             }
             LogBus.emitStamped(result)
-            ui.post { refresh() }
+            ui.post { if (!isDestroyed) { refresh(); onComplete?.invoke() } }
         }.apply { isDaemon = true; start() }
     }
 

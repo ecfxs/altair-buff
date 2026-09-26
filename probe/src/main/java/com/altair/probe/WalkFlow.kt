@@ -32,7 +32,7 @@ object WalkFlow {
             prefs()?.edit()?.putBoolean("enabled", v)?.apply()
         }
 
-    /** 单程时长 D（毫秒）。一次走位总时长 ≈ 4D。 */
+    /** 单程时长 D（毫秒）。三段按压 = D + 2D + D = 4D；仅跳跃分支另等 1 秒。 */
     var legMs: Long
         get() = prefs()?.getLong("legMs", 600L)?.coerceIn(100L, 10_000L) ?: 600L
         set(v) {
@@ -64,12 +64,13 @@ object WalkFlow {
             prefs()?.edit()?.putInt("jumpPressMs", v.coerceIn(30, 600))?.apply()
         }
 
-    fun strollAndJump(log: (String) -> Unit): Pair<Boolean, String> = Actions.run("走位与跳跃") { token ->
+    fun strollAndJump(log: (String) -> Unit): RunResult = Actions.run("走位与跳跃") { token ->
         token.check()
         val c = checkNotNull(ctx) { "未初始化" }
-        val geometry = Picks.requireGeometry(c, listOf(Picks.JOYSTICK))
-        val joy = Picks.joystick(c)
         val jump = Picks.get(c, Picks.JUMP)
+        val geometry = Picks.requireGeometry(c,
+            listOf(Picks.JOYSTICK) + if (jump != null) listOf(Picks.JUMP) else emptyList())
+        val joy = Picks.joystick(c)
         val cx = geometry.x(joy.first)
         val cy = geometry.y(joy.second)
         val offset = (geometry.width * pushPct / 100).coerceAtLeast(1)
@@ -79,26 +80,21 @@ object WalkFlow {
         val press = jumpPressMs
 
         // 跳跃是**可选**项：没标记就走完三段收工，并在日志里说明，而不是把整次走位判失败。
-        val args: List<String>
-        val budgetMs: Long
-        val inject: List<Int>
-        if (jump == null) {
+        // 预算与坐标校验都在 [WalkPlan] 里（纯计算，无 Android 依赖，可由回归测试直接覆盖）——
+        // 那里修正了"实际 4D、预算只给 3D"的老问题，也把跳跃坐标一并纳入本轮校验。
+        val plan: WalkPlan.Plan = if (jump == null) {
             log("左 ${d}ms → 右 ${d * 2}ms → 左 ${d}ms → 松手（跳跃未标记，本次不跳）")
-            args = listOf("walk3", "$cx", "$cy", "${cx - offset}", "${cx + offset}", "$d")
-            budgetMs = d * 3 + 500
-            inject = listOf(cx - offset - 48, cy - 48, cx + offset + 48, cy + 48)
+            WalkPlan.walkOnly(cx, cy, cx - offset, cx + offset, d, geometry.width, geometry.height)
         } else {
             val jx = geometry.x(jump.first)
             val jy = geometry.y(jump.second)
             log("左 ${d}ms → 右 ${d * 2}ms → 左 ${d}ms → 松手等待 1 秒 → 跳一次（${press}ms）")
-            args = listOf("walk", "$cx", "$cy", "${cx - offset}", "${cx + offset}",
-                "$jx", "$jy", "$d", "$press")
-            budgetMs = d * 4 + 1500 + press
-            inject = listOf(minOf(cx - offset, jx) - 48, minOf(cy, jy) - 48,
-                maxOf(cx + offset, jx) + 48, maxOf(cy, jy) + 48)
+            WalkPlan.walkWithJump(cx, cy, cx - offset, cx + offset, jx, jy, d, press.toLong(),
+                geometry.width, geometry.height)
         }
-        InjectShield.aroundWalk(inject[0], inject[1], inject[2], inject[3]) {
-            ShellCore.probe.perform(args, budgetMs, token, geometry)
+        val shield = plan.shield(geometry.width, geometry.height)
+        InjectShield.aroundWalk(shield[0], shield[1], shield[2], shield[3]) {
+            InputController.perform(c, plan.action, plan.budgetMs, token, geometry)
         }
     }
 }
