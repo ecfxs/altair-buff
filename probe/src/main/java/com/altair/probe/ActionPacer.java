@@ -30,18 +30,44 @@ public final class ActionPacer {
     /** 原地走位（含收尾的跳跃）。 */
     public static final int WALK = 1;
 
-    private final long sameKindGapMs;
-    private final long switchKindGapMs;
+    private long sameKindGapMs;
+    private long switchKindGapMs;
 
     private long lastEndAt = Long.MIN_VALUE;
     private int lastKind = -1;
 
     public ActionPacer(long sameKindGapMs, long switchKindGapMs) {
-        if (sameKindGapMs < 0 || switchKindGapMs < 0) {
-            throw new IllegalArgumentException("间隔不能为负");
-        }
-        this.sameKindGapMs = sameKindGapMs;
-        this.switchKindGapMs = switchKindGapMs;
+        setSameKindGapMs(sameKindGapMs);
+        setSwitchKindGapMs(switchKindGapMs);
+    }
+
+    /**
+     * 改同类间隔（补 BUFF → 补 BUFF）。
+     *
+     * 做成可变的，是为了让设置页改完**不必重启任务**就生效：这个值允许在挂机途中调，
+     * 而重建一个 ActionPacer 会把"上一次动作什么时候结束"一起丢掉 ——
+     * 那样下一次动作就可能紧贴上来，恰恰是这里要防的东西。
+     */
+    public void setSameKindGapMs(long ms) {
+        if (ms < 0) throw new IllegalArgumentException("间隔不能为负");
+        this.sameKindGapMs = ms;
+    }
+
+    /** 改换类间隔（补 BUFF ↔ 走位）。 */
+    public void setSwitchKindGapMs(long ms) {
+        if (ms < 0) throw new IllegalArgumentException("间隔不能为负");
+        this.switchKindGapMs = ms;
+    }
+
+    /**
+     * 「补 BUFF ↔ 走位」该等多久 —— 取 `max(下限, 用户设的补BUFF间隔)`。
+     *
+     * 为什么跟着补 BUFF 间隔走：用户把它调大，说明他那款游戏的施法动画就是长，
+     * 那么"补 BUFF → 走位"同样需要那么长。走位第一件事是按住摇杆，被吞掉时
+     * **人一步不走却报「走位完成」**，比技能没上更难发现，所以这个值不能小于补 BUFF 间隔。
+     */
+    public static long switchGapFor(long buffGapMs, long minSwitchGapMs) {
+        return Math.max(minSwitchGapMs, buffGapMs);
     }
 
     /**

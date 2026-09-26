@@ -69,6 +69,7 @@ class MainActivity : Activity() {
     private val skillRows = mutableListOf<Pair<CheckBox, EditText>>()
     private lateinit var leg: EditText
     private lateinit var interval: EditText
+    private lateinit var buffGap: EditText
     private lateinit var push: EditText
     private lateinit var jump: EditText
     private lateinit var target: EditText
@@ -313,6 +314,17 @@ class MainActivity : Activity() {
                 skillRows.add(check to edit)
                 skillBody.addView(Ui.checkRow(this@MainActivity, check, edit))
             }
+            // 补 BUFF 间隔：技能点击不是"发出去就到"的，游戏要放完上一个技能的施法动画
+            // 才会接受下一次输入 —— 太短的话后一次点击会被吞掉，而日志上一切正常。
+            buffGap = number(Engine.buffGapMs)
+            skillBody.addView(View(this@MainActivity).apply {
+                layoutParams = LinearLayout.LayoutParams(-1, dp(6))
+            })
+            skillBody.addView(Ui.labeledRow(this@MainActivity, "补BUFF间隔", buffGap, "毫秒",
+                labelWidthDp = 104))
+            skillBody.addView(Ui.doc(this@MainActivity,
+                "两次补技能之间的等待。游戏放不完施法动画就会吞掉下一次点击，而日志上看不出异常 ——" +
+                    "技能图标没点亮就把它调大。范围 ${Engine.MIN_BUFF_GAP_MS}–${Engine.MAX_BUFF_GAP_MS} 毫秒。"))
             addView(Ui.card(this@MainActivity, "技能间隔", skillBody))
 
             val walkBody = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
@@ -375,6 +387,7 @@ class MainActivity : Activity() {
         try {
             val walkOn = walkToggle.isChecked
             val seconds = skillRows.map { (_, edit) -> validated(edit, 1, 86_400).toInt() }
+            val gapValue = validated(buffGap, Engine.MIN_BUFF_GAP_MS, Engine.MAX_BUFF_GAP_MS)
             val intervalValue = validated(interval, 1, 1440)
             val legValue = validated(leg, 100, 10_000)
             val pushValue = validated(push, 1, 30).toInt()
@@ -396,10 +409,14 @@ class MainActivity : Activity() {
             WalkFlow.legMs = legValue
             WalkFlow.pushPct = pushValue
             WalkFlow.jumpPressMs = jumpValue
+            Engine.buffGapMs = gapValue
             OverlayService.setTargetPkgOf(this, pkg)
             LogBus.emitStamped(
-                if (walkOn) "设置已保存：技能按填写秒数执行；走位每 $intervalValue 分钟，单程 ${legValue}ms"
-                else "设置已保存：技能按填写秒数执行；原地走位已关闭（不再走位）"
+                if (walkOn)
+                    "设置已保存：技能按填写秒数执行、之间等 ${gapValue}ms；" +
+                        "走位每 $intervalValue 分钟，单程 ${legValue}ms"
+                else
+                    "设置已保存：技能按填写秒数执行、之间等 ${gapValue}ms；原地走位已关闭"
             )
             toast(if (walkOn) "设置已保存" else "设置已保存 · 走位已关闭")
             refresh()

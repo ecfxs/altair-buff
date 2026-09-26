@@ -301,6 +301,34 @@ public final class AutomationRegression {
         check(wider.sameKindGapMs() == 1000 && wider.switchKindGapMs() == 1500, "间隔可读");
     }
 
+    /**
+     * 补 BUFF 间隔是用户在设置页填的，改完**不必重启任务**就该生效，
+     * 而且不能因为"改了数值"把"上一次动作何时结束"一起丢掉 —— 那会让下一次动作紧贴上来。
+     */
+    static void pacingConfigurable() {
+        ActionPacer pacer = new ActionPacer(1500, 1500);
+        pacer.done(ActionPacer.BUFF, 10_000);
+        check(pacer.delayBefore(ActionPacer.BUFF, 10_000) == 1500, "默认 1500ms 生效");
+
+        // 用户在挂机途中把间隔调大到 3000：数值立刻生效，已记录的状态要保留
+        pacer.setSameKindGapMs(3000);
+        check(pacer.sameKindGapMs() == 3000, "新数值已生效");
+        check(pacer.delayBefore(ActionPacer.BUFF, 10_000) == 3000,
+            "改大后立刻按新值等待（而不是重头开始）");
+        check(pacer.delayBefore(ActionPacer.BUFF, 11_500) == 1500,
+            "仍按上一次结束时刻算差额，说明状态没被丢掉");
+
+        // 换类间隔跟着补 BUFF 间隔走，但不低于下限
+        check(ActionPacer.switchGapFor(1500, 1000) == 1500, "补 BUFF 间隔 1500 → 换类也 1500");
+        check(ActionPacer.switchGapFor(3000, 1000) == 3000, "调大到 3000 → 换类跟着上去");
+        check(ActionPacer.switchGapFor(300, 1000) == 1000, "调小到 300 → 换类守住 1000 下限");
+
+        try {
+            pacer.setSameKindGapMs(-1);
+            throw new AssertionError("负间隔应当被拒");
+        } catch (IllegalArgumentException expected) { }
+    }
+
     static void scheduling() {
         Schedule s = new Schedule();
         s.configure(280_000, 1000);
@@ -393,12 +421,12 @@ public final class AutomationRegression {
         walkWithoutJump(); walkOnlyCancellation(); injectGate();
         injectionRetry(); noReleaseWithoutPress(); jumpFailureIsNotFatal();
         releaseFailureDoesNotMask();
-        screenMatch(); actionPacing();
+        screenMatch(); actionPacing(); pacingConfigurable();
         scheduling(); actions(); shell();
         System.out.println(
             "PASS: 1:2:1 时序、1秒后单次跳跃、可选跳跃只走三段、按压设置、8+6 个取消阶段、" +
                 "失败松手、闸门两档与失败禁止注入、屏幕记录三选一、注入重试、未按下不松手、" +
-                "跳跃失败不致命、动作间隔两类、独立排期、互斥重启、命令退出码/超时/中断/转义"
+                "跳跃失败不致命、动作间隔两类且可调、独立排期、互斥重启、命令退出码/超时/中断/转义"
         );
     }
 }

@@ -23,23 +23,37 @@ object Engine {
     private var ctx: Context? = null
     const val DEFAULT_DUR_SEC = 280
 
+    /** 两次补 BUFF 之间的等待的默认值（毫秒）。设置页可改。 */
+    const val DEFAULT_BUFF_GAP_MS = 1500L
+
+    /** 可填范围。下限不是 0：再短就等于没有间隔，后一次点击会被游戏吞掉。 */
+    const val MIN_BUFF_GAP_MS = 100L
+    const val MAX_BUFF_GAP_MS = 10_000L
+
+    /**
+     * 补 BUFF 与走位之间的等待下限（毫秒）。
+     *
+     * 实际取值是 `max(它, 补BUFF间隔)` —— 用户把补 BUFF 间隔调大，说明他那款游戏的施法动画
+     * 就是长，那么"补 BUFF → 走位"同样需要那么长，不能还停在 1 秒上。
+     */
+    private const val SEQUENCE_GAP_MIN_MS = 1000L
+
+    private fun prefs() = ctx?.getSharedPreferences("buff", Context.MODE_PRIVATE)
+
     /**
      * 两次补 BUFF 之间的等待。
      *
      * 技能点击不是"发出去就到"的：游戏要放完上一个技能的施法动画才会接受下一次输入。
      * 间隔太短的话后一次点击会被游戏**吞掉**，而注入层看到的是"注入成功" ——
      * 于是日志上一切正常、游戏里只上了一个 BUFF，属于最难查的那类失败。
+     * 所以这个值必须让用户能按自己那款游戏调。
      */
-    private const val BUFF_GAP_MS = 1000L
-
-    /**
-     * 补 BUFF 与走位之间的等待（两个方向都要）。
-     *
-     * 走位第一件事就是按住摇杆。如果此刻上个技能的施法动画还在放，摇杆的 DOWN 会被吞 ——
-     * **人一步没走却报「走位完成」**；反过来，走位结尾是跳一下，紧接着补 BUFF 同样会撞在
-     * 跳跃动作上。所以两类动作之间必须留出一段干净的间隔，而不能只靠"上一步正好睡过"。
-     */
-    private const val SEQUENCE_GAP_MS = 1000L
+    var buffGapMs: Long
+        get() = prefs()?.getLong("buffGapMs", DEFAULT_BUFF_GAP_MS)
+            ?.coerceIn(MIN_BUFF_GAP_MS, MAX_BUFF_GAP_MS) ?: DEFAULT_BUFF_GAP_MS
+        set(v) {
+            prefs()?.edit()?.putLong("buffGapMs", v.coerceIn(MIN_BUFF_GAP_MS, MAX_BUFF_GAP_MS))?.apply()
+        }
     val isRunning: Boolean get() = running
     val isStopping: Boolean get() = !running && worker != null
     data class BuffSlot(val idx: Int, val enabled: Boolean, val durSec: Int)
@@ -145,7 +159,7 @@ object Engine {
         val walk = Schedule()
         // 动作之间的间隔规则集中在这里：补 BUFF 之间等施法动画，补 BUFF 与走位之间留得更足。
         // 具体数值与理由见 [BUFF_GAP_MS] / [SEQUENCE_GAP_MS]。
-        val pacer = ActionPacer(BUFF_GAP_MS, SEQUENCE_GAP_MS)
+        val pacer = ActionPacer(buffGapMs, ActionPacer.switchGapFor(buffGapMs, SEQUENCE_GAP_MIN_MS))
         try {
             while (running) {
                 val now = SystemClock.elapsedRealtime()
@@ -154,6 +168,11 @@ object Engine {
                 // 走位开关关掉时把周期配成 0：Schedule 对周期 0 一律 !ready、dueAt 也是 0，
                 // 于是既不排期也不显示倒计时，整条走位路径都不会被走到。
                 walk.configure(if (WalkFlow.enabled) WalkFlow.intervalMs else 0L, now)
+                // 每轮把用户设置读进来：改完间隔不必重启任务，下一次动作就按新值走。
+                // pacer 本身要留住（它记着"上一次动作何时结束"），所以只改数值不重建。
+                val gap = buffGapMs
+                pacer.setSameKindGapMs(gap)
+                pacer.setSwitchKindGapMs(ActionPacer.switchGapFor(gap, SEQUENCE_GAP_MIN_MS))
                 nextBuffDueAt = skills.map { it.dueAt() }.filter { it > 0 }.minOrNull() ?: 0
                 nextWalkDueAt = walk.dueAt()
                 if (Actions.busy || (!walk.ready(now) && skills.none { it.ready(now) })) {
