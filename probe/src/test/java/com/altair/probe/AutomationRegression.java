@@ -311,6 +311,9 @@ public final class AutomationRegression {
         check(s.dueAt() == 601_000, "修改间隔从上次成功重新排期");
         s.configure(0, 3000);
         check(!s.ready(Long.MAX_VALUE), "关闭技能后不执行");
+        // 原地走位开关关掉时靠这一条：引擎把走位周期配成 0，界面读到 dueAt()==0 就显示「—」，
+        // 而不是把 0 当成"立刻就要走"、倒计时成 00:00。
+        check(s.dueAt() == 0, "周期 0 时 dueAt 必须为 0（界面据此显示「—」）");
         s.configure(10_000, 4000);
         check(s.ready(4000), "新增启用的技能必须得到排期");
         s.failure(4000);

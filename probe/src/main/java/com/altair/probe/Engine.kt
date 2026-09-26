@@ -151,7 +151,9 @@ object Engine {
                 val now = SystemClock.elapsedRealtime()
                 val config = buffConfig()
                 config.forEach { skills[it.idx].configure(if (it.enabled) slotPeriodMs(it.durSec) else 0L, now) }
-                walk.configure(WalkFlow.intervalMs, now)
+                // 走位开关关掉时把周期配成 0：Schedule 对周期 0 一律 !ready、dueAt 也是 0，
+                // 于是既不排期也不显示倒计时，整条走位路径都不会被走到。
+                walk.configure(if (WalkFlow.enabled) WalkFlow.intervalMs else 0L, now)
                 nextBuffDueAt = skills.map { it.dueAt() }.filter { it > 0 }.minOrNull() ?: 0
                 nextWalkDueAt = walk.dueAt()
                 if (Actions.busy || (!walk.ready(now) && skills.none { it.ready(now) })) {
@@ -192,11 +194,11 @@ object Engine {
                     failStreak = skills.maxOf { it.failures }
                 }
 
-                // ---- 走位 ----
+                // ---- 走位（开关关掉时 walk 周期为 0，这里永远不会进来）----
                 checkRunning()
                 if (walk.ready(SystemClock.elapsedRealtime())) {
                     // 与上一次补 BUFF 之间留足间隔：摇杆的 DOWN 撞在施法动画上会被吞，
-                    // 就会出现"人没走、却报走位完成"。反向（走位→补 BUFF）同样由 pacer 兜住。
+                    // 出现"人没走、却报走位完成"。反向（走位→补 BUFF）同样由 pacer 兜住。
                     pacer.await(ActionPacer.WALK)
                     state = State.CASTING
                     val result = WalkFlow.strollAndJump { LogBus.emit(it) }

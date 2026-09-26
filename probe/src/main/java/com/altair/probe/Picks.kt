@@ -114,13 +114,17 @@ object Picks {
     }
 
     /**
-     * 启动前**必须**标记的槽位：启用的技能 + 轮盘中心。
+     * 启动前**必须**标记的槽位：启用的技能 + （走位开启时的）轮盘中心。
      *
-     * ★ 跳跃**不在**其中。设计文档 2.2 明确：跳跃只影响走位结尾跳不跳，
-     * 漏标它不该把整个任务拦在启动之外（那会让"能跑的"功能因为"锦上添花"的一项全废掉）。
-     * 未标记时 [WalkFlow] 会走完三段并写日志说明这次没跳。
+     * ★ 两个"不必须"是有理由的，别再把它们塞回来：
+     * - 跳跃只影响走位结尾跳不跳，漏标它不该把整个任务拦在启动之外；
+     * - 轮盘只有走位用得上。**关掉走位还要求标轮盘**，等于逼用户去标一个永远不会被点的
+     *   坐标 —— 用户会把"启动被拒"记成 bug。
      */
-    fun required(ctx: Context): List<String> = enabledSkills(ctx) + JOYSTICK
+    fun required(ctx: Context): List<String> {
+        Engine.init(ctx)
+        return enabledSkills(ctx) + if (WalkFlow.enabled) listOf(JOYSTICK) else emptyList()
+    }
 
     /**
      * 界面清单：每项 = (槽位, 是否必需)。

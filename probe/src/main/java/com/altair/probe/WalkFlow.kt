@@ -17,6 +17,21 @@ object WalkFlow {
 
     // ------------------------------------------------------------ 参数
 
+    /**
+     * 原地走位总开关。默认**开**（沿用一直以来的行为，不给老用户突然少一项功能）。
+     *
+     * 关闭时引擎把走位周期配成 0，于是完全不排期、不碰摇杆 —— 只补 BUFF。
+     * 轮盘中心也随之不再是必需标记（[Picks.required] 会跟着这个开关变）：
+     * 不走位就不需要摇杆，没道理还拦着不让启动。
+     *
+     * 「试走位一次」不受它影响：那是用户主动点的手动验证，本来就该随时能用。
+     */
+    var enabled: Boolean
+        get() = prefs()?.getBoolean("enabled", true) ?: true
+        set(v) {
+            prefs()?.edit()?.putBoolean("enabled", v)?.apply()
+        }
+
     /** 单程时长 D（毫秒）。一次走位总时长 ≈ 4D。 */
     var legMs: Long
         get() = prefs()?.getLong("legMs", 600L)?.coerceIn(100L, 10_000L) ?: 600L

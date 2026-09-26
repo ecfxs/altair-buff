@@ -173,6 +173,9 @@ class OverlayService : Service() {
     private var cancelPickBtn: LinearLayout? = null
     private var marksBtn: TextView? = null
 
+    /** 工具区里的「走位:开/关」。 */
+    private var walkBtn: TextView? = null
+
     /** 标注按钮：槽位 → 按钮。用来刷新"已标/未标"的状态前缀。 */
     private val slotBtns = LinkedHashMap<String, TextView>()
 
@@ -396,12 +399,20 @@ class OverlayService : Service() {
      */
     private fun buildStatus(): String {
         val armed = foregroundPkg == targetPkg
+        val now = android.os.SystemClock.elapsedRealtime()
         return when {
-            Engine.isRunning ->
-                "补 " + Ui.mmss(Engine.nextBuffDueAt - android.os.SystemClock.elapsedRealtime(), true) +
-                    " · 走 " + Ui.mmss(Engine.nextWalkDueAt - android.os.SystemClock.elapsedRealtime(), true) +
+            Engine.isRunning -> {
+                // 先各自算好再拼，别把 if 表达式塞进 `+` 链中间 ——
+                // `a + if (c) x else y + z` 会把后面的 z 全算进 else 分支里去。
+                val walkPart =
+                    if (WalkFlow.enabled) "走 " + Ui.mmss(Engine.nextWalkDueAt - now, true)
+                    else "走位已关"
+                val failPart = if (Engine.failStreak > 0) " · 连败${Engine.failStreak}" else ""
+                "补 " + Ui.mmss(Engine.nextBuffDueAt - now, true) +
+                    " · $walkPart" +
                     " · 补${Engine.buffCastCount}/走${Engine.walkCount}" +
-                    if (Engine.failStreak > 0) " · 连败${Engine.failStreak}" else ""
+                    failPart
+            }
 
             Engine.state == Engine.State.ERROR && Engine.lastError.isNotBlank() ->
                 "⛔ " + Engine.lastError.take(60)
@@ -466,6 +477,10 @@ class OverlayService : Service() {
         }
         marksBtn?.let { b ->
             val want = marksLabel()
+            if (b.text != want) b.text = want
+        }
+        walkBtn?.let { b ->
+            val want = walkLabel()
             if (b.text != want) b.text = want
         }
         // 只在采点进行中才显示「取消标注」—— 平时它只会误导。
@@ -945,8 +960,12 @@ class OverlayService : Service() {
         val marks = overlayBtn(marksLabel(), fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
             heightDp = PANEL_GRID_H, compact = true) { toggleMarks() }
         marksBtn = marks
+        val walkToggleBtn = overlayBtn(walkLabel(), fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
+            heightDp = PANEL_GRID_H, compact = true) { toggleWalk() }
+        walkBtn = walkToggleBtn
         toolBody.addView(compactGrid(listOf(
             marks,
+            walkToggleBtn,
             overlayBtn("试走位一次", fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
                 heightDp = PANEL_GRID_H, compact = true) { testStroll() },
             overlayBtn("复位窗口", fill = Ui.PANEL_CTRL, border = Ui.PANEL_BORDER,
@@ -1017,11 +1036,34 @@ class OverlayService : Service() {
         annoHead = null
         annoCount = null
         marksBtn = null
+        walkBtn = null
         cancelPickBtn = null
         slotBtns.clear()
     }
 
     private fun marksLabel() = if (marksOnOf(this)) "回显:开" else "回显:关"
+
+    /** 走位总开关的按钮文案。与主界面设置页里那个复选框是同一份状态。 */
+    private fun walkLabel() = if (WalkFlow.enabled) "走位:开" else "走位:关"
+
+    /**
+     * 面板上直接开关原地走位。
+     *
+     * 为什么值得在面板上再放一个入口：走位是**会自己动角色**的动作，挂机到一半想让它
+     * 别再走（比如手动操作一会儿），从面板一秒就能关掉，不必切回主界面翻设置。
+     * 关掉后 [Picks.required] 也立刻不再要求轮盘中心。
+     */
+    private fun toggleWalk() {
+        val on = !WalkFlow.enabled
+        WalkFlow.enabled = on
+        walkBtn?.text = walkLabel()
+        LogBus.emit(
+            if (on) "原地走位：已开启（按设置间隔自动走位）"
+            else "原地走位：已关闭（只补技能，不再碰摇杆）"
+        )
+        flashStatus(if (on) "走位已开启" else "走位已关闭")
+        ui.post { refreshStatus(true) }
+    }
 
     /**
      * 高度兜底：横屏可用高度只有 720px，展开后的面板很容易顶出屏幕。

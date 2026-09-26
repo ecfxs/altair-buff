@@ -73,6 +73,10 @@ class MainActivity : Activity() {
     private lateinit var jump: EditText
     private lateinit var target: EditText
 
+    /** 走位总开关 + 它下方的参数行（关闭时这些行变灰）。 */
+    private lateinit var walkToggle: CheckBox
+    private val walkInputs = mutableListOf<View>()
+
     // ---- 更多页 ----
     private lateinit var logs: TextView
     private lateinit var logScroll: ScrollView
@@ -312,16 +316,26 @@ class MainActivity : Activity() {
             addView(Ui.card(this@MainActivity, "技能间隔", skillBody))
 
             val walkBody = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+            walkToggle = Ui.check(this@MainActivity, "启用原地走位", WalkFlow.enabled)
+            walkBody.addView(walkToggle)
+            walkBody.addView(Ui.doc(this@MainActivity,
+                "开启后按下面的间隔自动走；关闭后完全不碰摇杆，只补技能，轮盘中心也不必标记。"))
             interval = number(WalkFlow.intervalMin)
             leg = number(WalkFlow.legMs)
             push = number(WalkFlow.pushPct.toLong())
             jump = number(WalkFlow.jumpPressMs.toLong())
-            walkBody.addView(Ui.labeledRow(this@MainActivity, "执行间隔", interval, "分钟"))
-            walkBody.addView(Ui.labeledRow(this@MainActivity, "单程时长 D", leg, "毫秒"))
-            walkBody.addView(Ui.labeledRow(this@MainActivity, "推杆幅度", push, "% 屏宽"))
-            walkBody.addView(Ui.labeledRow(this@MainActivity, "跳跃按压", jump, "毫秒"))
+            listOf(
+                Ui.labeledRow(this@MainActivity, "执行间隔", interval, "分钟"),
+                Ui.labeledRow(this@MainActivity, "单程时长 D", leg, "毫秒"),
+                Ui.labeledRow(this@MainActivity, "推杆幅度", push, "% 屏宽"),
+                Ui.labeledRow(this@MainActivity, "跳跃按压", jump, "毫秒")
+            ).forEach { row -> walkBody.addView(row); walkInputs.add(row) }
             walkBody.addView(Ui.doc(this@MainActivity,
                 "回位后固定等待 1 秒再跳。推杆幅度越大走得越远，走过头就调小。"))
+            // 开关只影响观感与保存结果；真正的判定在 WalkFlow/Engine —— 关掉后引擎直接把
+            // 走位周期配成 0，根本不排期。
+            walkToggle.setOnCheckedChangeListener { _, on -> applyWalkLook(on) }
+            applyWalkLook(WalkFlow.enabled)
             addView(Ui.card(this@MainActivity, "原地走位", walkBody))
 
             val targetBody = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
@@ -341,6 +355,11 @@ class MainActivity : Activity() {
 
     private fun number(value: Long) = Ui.input(this, value.toString(), numeric = true)
 
+    /** 走位关闭时把参数行压暗：让"这些设置现在不起作用"一眼可见。 */
+    private fun applyWalkLook(on: Boolean) {
+        walkInputs.forEach { it.alpha = if (on) 1f else 0.35f }
+    }
+
     private fun validated(edit: EditText, min: Long, max: Long): Long {
         val value = edit.text.toString().toLongOrNull()
         if (value == null || value !in min..max) {
@@ -354,6 +373,7 @@ class MainActivity : Activity() {
 
     private fun saveSettings() {
         try {
+            val walkOn = walkToggle.isChecked
             val seconds = skillRows.map { (_, edit) -> validated(edit, 1, 86_400).toInt() }
             val intervalValue = validated(interval, 1, 1440)
             val legValue = validated(leg, 100, 10_000)
@@ -363,21 +383,25 @@ class MainActivity : Activity() {
             require(Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+").matches(pkg)) {
                 "请输入有效游戏包名"
             }
+            // 走位开关影响"必需标记"，所以它变了也要停任务重新校验。
+            if (walkOn != WalkFlow.enabled) Engine.stop("走位开关已更改")
             if (pkg != OverlayService.targetPkgOf(this)) Engine.stop("目标游戏已更改")
             getSharedPreferences("buff", MODE_PRIVATE).edit().apply {
                 skillRows.forEachIndexed { i, (check, _) ->
                     putBoolean("enabled$i", check.isChecked); putInt("durSec$i", seconds[i])
                 }
             }.apply()
+            WalkFlow.enabled = walkOn
             WalkFlow.intervalMin = intervalValue
             WalkFlow.legMs = legValue
             WalkFlow.pushPct = pushValue
             WalkFlow.jumpPressMs = jumpValue
             OverlayService.setTargetPkgOf(this, pkg)
             LogBus.emitStamped(
-                "设置已保存：技能按填写秒数执行；走位每 $intervalValue 分钟，单程 ${legValue}ms"
+                if (walkOn) "设置已保存：技能按填写秒数执行；走位每 $intervalValue 分钟，单程 ${legValue}ms"
+                else "设置已保存：技能按填写秒数执行；原地走位已关闭（不再走位）"
             )
-            toast("设置已保存")
+            toast(if (walkOn) "设置已保存" else "设置已保存 · 走位已关闭")
             refresh()
         } catch (e: IllegalArgumentException) {
             toast(e.message ?: "参数无效")
@@ -523,7 +547,7 @@ class MainActivity : Activity() {
             statusText.text = Engine.stateText()
             val now = SystemClock.elapsedRealtime()
             metrics.text = if (Engine.isRunning) {
-                "补 ${Ui.mmss(Engine.nextBuffDueAt - now, true)} · 走 ${Ui.mmss(Engine.nextWalkDueAt - now, true)}" +
+                "补 ${Ui.mmss(Engine.nextBuffDueAt - now, true)} · ${walkBrief()}" +
                     " · 技能 ${Engine.buffCastCount} / 走位 ${Engine.walkCount}" +
                     if (Engine.failStreak > 0) " · 连败 ${Engine.failStreak}" else ""
             } else {
@@ -541,16 +565,19 @@ class MainActivity : Activity() {
             "已执行  技能 ${Engine.buffCastCount} 次 · 走位 ${Engine.walkCount} 次"
         readiness.text = checklistText()
         markCount.text = annotationCount()
-
-        val active = Engine.isRunning || Actions.busy
         startButton.text = when {
             Engine.isStopping -> "正在停止…"
-            active -> "停止任务"
+            Engine.isRunning || Actions.busy -> "停止任务"
             else -> "启动任务"
         }
         startButton.isEnabled = !Engine.isStopping
-        Ui.paint(startButton, if (active) Ui.Kind.DANGER else Ui.Kind.PRIMARY)
+        Ui.paint(startButton, if (Engine.isRunning || Actions.busy) Ui.Kind.DANGER else Ui.Kind.PRIMARY)
     }
+
+    /** 走位开启时给倒计时，关闭时明说"已关闭" —— 显示 `00:00` 会让人以为马上要走。 */
+    private fun walkBrief(): String =
+        if (!WalkFlow.enabled) "走位 已关闭"
+        else "走 ${Ui.mmss(Engine.nextWalkDueAt - SystemClock.elapsedRealtime(), true)}"
 
     /**
      * 清单：必需项缺了标出来，可选项（跳跃）单独说明。
@@ -564,7 +591,10 @@ class MainActivity : Activity() {
             when {
                 ok -> "✓ ${Picks.label(slot)}"
                 need -> "○ ${Picks.label(slot)}    未标记（必需）"
-                else -> "○ ${Picks.label(slot)}    未标记（可选，走位不跳）"
+                // 未标记的非必需项要说清"为什么可以不标"，否则用户分不清是漏了还是不需要
+                slot == Picks.JOYSTICK -> "—  ${Picks.label(slot)}    不需要（走位已关闭）"
+                slot == Picks.JUMP -> "○ ${Picks.label(slot)}    未标记（可选，走位不跳）"
+                else -> "○ ${Picks.label(slot)}    未标记（可选）"
             }
         }
         val problem = Picks.geometryProblem(this, Picks.required(this))
